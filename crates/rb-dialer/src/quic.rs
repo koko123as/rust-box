@@ -16,10 +16,12 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, TransportConfig, UdpPoller, VarInt};
 use rb_adapter::{Host, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE};
 use rb_config::QuicOptions;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const PACKET_QUEUE_CAPACITY: usize = 256;
+type IncomingDatagram = io::Result<(Vec<u8>, SocketAddr)>;
 
 /// Connects Quinn over a packet connection already created by the project
 /// dialer. The returned endpoint owns the adapter and its I/O tasks.
@@ -63,6 +65,23 @@ pub fn server_config(tls: Arc<rustls::ServerConfig>, options: &QuicOptions) -> i
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config(options)?));
     Ok(config)
+}
+
+/// Creates a server endpoint over the listener's UDP socket. Unlike the
+/// client adapter, this socket preserves each peer address for multi-client
+/// QUIC inbounds.
+pub fn server_endpoint(
+    socket: UdpSocket,
+    tls: Arc<rustls::ServerConfig>,
+    options: &QuicOptions,
+) -> io::Result<Endpoint> {
+    let config = server_config(tls, options)?;
+    Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        Some(config),
+        QuicServerSocket::new(socket)?,
+        Arc::new(quinn::TokioRuntime),
+    )
 }
 
 /// Builds the Quinn transport parameters corresponding to sing-box's shared
@@ -192,11 +211,141 @@ impl Drop for QuicPacketSocket {
     }
 }
 
+struct QuicServerSocket {
+    incoming: Mutex<mpsc::Receiver<IncomingDatagram>>,
+    outgoing: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    writable: Arc<WritableRegistry>,
+    local_addr: SocketAddr,
+    _reader: JoinHandle<()>,
+    _writer: JoinHandle<()>,
+}
+
+impl fmt::Debug for QuicServerSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicServerSocket").field("local_addr", &self.local_addr).finish()
+    }
+}
+
+impl QuicServerSocket {
+    fn new(socket: UdpSocket) -> io::Result<Arc<Self>> {
+        let local_addr = socket.local_addr()?;
+        let socket = Arc::new(socket);
+        let (outgoing, mut outgoing_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(PACKET_QUEUE_CAPACITY);
+        let (incoming_tx, incoming) = mpsc::channel::<IncomingDatagram>(PACKET_QUEUE_CAPACITY);
+        let writable = Arc::new(WritableRegistry::default());
+
+        let reader_socket = socket.clone();
+        let reader_tx = incoming_tx.clone();
+        let reader = tokio::spawn(async move {
+            let mut buffer = vec![0; MAX_PACKET_SIZE];
+            loop {
+                let packet = match reader_socket.recv_from(&mut buffer).await {
+                    Ok((length, address)) => Ok((buffer[..length].to_vec(), address)),
+                    Err(error) => {
+                        let _ = reader_tx.send(Err(copy_error(&error))).await;
+                        break;
+                    }
+                };
+                if reader_tx.send(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let writer_socket = socket;
+        let writer_writable = writable.clone();
+        let writer_tx = incoming_tx;
+        let writer = tokio::spawn(async move {
+            while let Some((address, packet)) = outgoing_rx.recv().await {
+                writer_writable.wake_waiters();
+                if let Err(error) = writer_socket.send_to(&packet, address).await {
+                    let _ = writer_tx.send(Err(copy_error(&error))).await;
+                    break;
+                }
+            }
+        });
+
+        Ok(Arc::new(QuicServerSocket {
+            incoming: Mutex::new(incoming),
+            outgoing,
+            writable,
+            local_addr,
+            _reader: reader,
+            _writer: writer,
+        }))
+    }
+}
+
+impl Drop for QuicServerSocket {
+    fn drop(&mut self) {
+        self._reader.abort();
+        self._writer.abort();
+    }
+}
+
+impl AsyncUdpSocket for QuicServerSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        let waiter = Arc::new(Mutex::new(None));
+        self.writable.register(&waiter);
+        Box::pin(WritablePoller { outgoing: self.outgoing.clone(), waiter })
+    }
+
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        if transmit.segment_size.is_some_and(|size| size == 0 || transmit.contents.len() > size) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "QUIC UDP segmentation is not supported"));
+        }
+        match self.outgoing.try_send((transmit.destination, transmit.contents.to_vec())) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "QUIC UDP packet writer stopped"))
+            }
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut incoming = self.incoming.lock().unwrap();
+        match incoming.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "QUIC UDP packet reader stopped")))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
+            Poll::Ready(Some(Ok((packet, address)))) => {
+                let length = packet.len().min(bufs[0].len());
+                bufs[0][..length].copy_from_slice(&packet[..length]);
+                meta[0] = RecvMeta { addr: address, len: length, stride: length, ..RecvMeta::default() };
+                Poll::Ready(Ok(1))
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+}
+
 impl AsyncUdpSocket for QuicPacketSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         let waiter = Arc::new(Mutex::new(None));
         self.writable.register(&waiter);
-        Box::pin(WritablePoller { socket: self, waiter })
+        Box::pin(WritablePoller { outgoing: self.outgoing.clone(), waiter })
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
@@ -286,29 +435,29 @@ impl WritableRegistry {
     }
 }
 
-struct WritablePoller {
-    socket: Arc<QuicPacketSocket>,
+struct WritablePoller<T> {
+    outgoing: mpsc::Sender<T>,
     waiter: Arc<Mutex<Option<Waker>>>,
 }
 
-impl fmt::Debug for WritablePoller {
+impl<T> fmt::Debug for WritablePoller<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WritablePoller").finish_non_exhaustive()
     }
 }
 
-impl UdpPoller for WritablePoller {
+impl<T: Send + 'static> UdpPoller for WritablePoller<T> {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let mut waiter = this.waiter.lock().unwrap();
-        if this.socket.outgoing.capacity() > 0 {
+        if this.outgoing.capacity() > 0 {
             *waiter = None;
             return Poll::Ready(Ok(()));
         }
         if waiter.as_ref().is_none_or(|waker| !waker.will_wake(cx.waker())) {
             *waiter = Some(cx.waker().clone());
         }
-        if this.socket.outgoing.capacity() > 0 {
+        if this.outgoing.capacity() > 0 {
             *waiter = None;
             Poll::Ready(Ok(()))
         } else {
@@ -348,7 +497,7 @@ mod tests {
     use rb_adapter::{PacketConn, SharedPacketConn, Socksaddr};
     use tokio::sync::mpsc;
 
-    use super::{server_config, transport_config, QuicPacketSocket};
+    use super::{server_config, server_endpoint, transport_config, QuicPacketSocket, QuicServerSocket};
     use rb_config::{MemoryBytes, QuicOptions};
 
     fn server_tls_config() -> Arc<rustls::ServerConfig> {
@@ -394,6 +543,46 @@ mod tests {
         let invalid = QuicOptions { stream_receive_window: Some(MemoryBytes(u64::MAX)), ..Default::default() };
         let error = server_config(server_tls_config(), &invalid).unwrap_err();
         assert!(error.to_string().contains("stream_receive_window"));
+    }
+
+    #[tokio::test]
+    async fn server_endpoint_uses_the_bound_listener_socket() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let endpoint = server_endpoint(socket, server_tls_config(), &QuicOptions::default()).unwrap();
+        assert_eq!(endpoint.local_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn server_socket_preserves_peer_addresses_for_replies() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_address = socket.local_addr().unwrap();
+        let socket = QuicServerSocket::new(socket).unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_address = client.local_addr().unwrap();
+        client.send_to(b"quic request", server_address).await.unwrap();
+
+        let mut buffer = [0u8; 64];
+        let mut bufs = [IoSliceMut::new(&mut buffer)];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+        let received = std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta)).await.unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(&bufs[0][..12], b"quic request");
+        assert_eq!(meta[0].addr, client_address);
+
+        socket
+            .try_send(&Transmit {
+                destination: client_address,
+                ecn: None,
+                contents: b"quic reply",
+                segment_size: None,
+                src_ip: None,
+            })
+            .unwrap();
+        let mut reply = [0u8; 64];
+        let (length, source) = client.recv_from(&mut reply).await.unwrap();
+        assert_eq!(&reply[..length], b"quic reply");
+        assert_eq!(source, server_address);
     }
 
     struct MockPacketConn {
