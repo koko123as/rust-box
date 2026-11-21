@@ -39,17 +39,20 @@ async fn fake_server(v4: [u8; 4], v6: std::net::Ipv6Addr) -> (std::net::SocketAd
     (address, count)
 }
 
-fn router(json: String) -> Arc<DnsRouter> {
-    let options: rb_config::DnsOptions = serde_json::from_str(&json).unwrap();
+fn try_router(options: &rb_config::DnsOptions) -> Result<Arc<DnsRouter>, DnsError> {
     let certificates = rb_certificate::Store::new(None).unwrap();
     DnsRouter::new(
-        &options,
+        options,
         &Default::default(),
         &rb_adapter::OutboundRegistry::new(),
         &rb_rule::RuleSets::new(),
         &certificates,
     )
-    .unwrap()
+}
+
+fn router(json: String) -> Arc<DnsRouter> {
+    let options: rb_config::DnsOptions = serde_json::from_str(&json).unwrap();
+    try_router(&options).unwrap()
 }
 
 #[tokio::test]
@@ -300,6 +303,81 @@ async fn exchange_messages() {
     assert!(answer.answers().is_empty());
     assert_eq!(count.load(Ordering::SeqCst), before);
     assert!(dns.exchange(b"garbage", &options).await.is_err());
+}
+
+#[test]
+fn direct_dns_options_validate_evaluate_server_references() {
+    for (json, expected) in [
+        (r#"{"rules":[{"action":"evaluate"}]}"#, "dns.rules[0]: missing server field"),
+        (r#"{"rules":[{"action":"evaluate","server":"missing"}]}"#, "dns.rules[0]: DNS server not found: missing"),
+        (
+            r#"{"servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15"}],
+                "rules":[{"action":"evaluate","server":"fake"}]}"#,
+            "dns.rules[0]: evaluate action cannot use fakeip server: fake",
+        ),
+    ] {
+        let options: rb_config::DnsOptions = serde_json::from_str(json).unwrap();
+        let error = match try_router(&options) {
+            Ok(_) => panic!("invalid evaluate server reference was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(error, expected);
+    }
+}
+
+#[tokio::test]
+async fn evaluate_respond_preserves_tagged_response_and_isolates_requests() {
+    let (first, first_count) = fake_server([1, 2, 3, 4], "2001:db8::1".parse().unwrap()).await;
+    let (second, second_count) = fake_server([5, 6, 7, 8], "2001:db8::2".parse().unwrap()).await;
+    let dns = router(format!(
+        r#"{{"disable_cache":true,"servers":[
+            {{"type":"udp","tag":"first","server":"127.0.0.1","server_port":{}}},
+            {{"type":"udp","tag":"second","server":"127.0.0.1","server_port":{}}}],
+          "rules":[
+            {{"domain":"tag.test","action":"evaluate","server":"first","tag":"primary"}},
+            {{"domain":"tag.test","action":"evaluate","server":"second"}},
+            {{"domain":"tag.test","match_response":"primary","action":"respond"}},
+            {{"domain":"isolated.test","action":"respond"}}]}}"#,
+        first.port(),
+        second.port()
+    ));
+    let lookup_options = LookupOptions { strategy: DomainStrategy::Ipv4Only, ..Default::default() };
+    assert_eq!(dns.lookup("tag.test", &lookup_options).await.unwrap(), vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+    assert_eq!(first_count.load(Ordering::SeqCst), 1);
+    assert_eq!(second_count.load(Ordering::SeqCst), 1);
+
+    let answer = dns.exchange(&query("tag.test.", RecordType::A), &LookupOptions::default()).await.unwrap().unwrap();
+    let answer = Message::from_vec(&answer).unwrap();
+    assert_eq!(answer.id(), 0x4242);
+    assert_eq!(answer.response_code(), ResponseCode::NoError);
+    assert!(matches!(answer.answers()[0].data(), RData::A(a) if a.0 == std::net::Ipv4Addr::new(1, 2, 3, 4)));
+    assert_eq!(first_count.load(Ordering::SeqCst), 2);
+    assert_eq!(second_count.load(Ordering::SeqCst), 2);
+
+    let error = dns.lookup("isolated.test", &lookup_options).await.unwrap_err();
+    assert_eq!(error.to_string(), "respond action requires an evaluated response from a preceding evaluate action");
+    let error = dns.exchange(&query("isolated.test.", RecordType::A), &LookupOptions::default()).await.unwrap_err();
+    assert_eq!(error.to_string(), "respond action requires an evaluated response from a preceding evaluate action");
+}
+
+#[tokio::test]
+async fn evaluate_failure_and_missing_response_return_compatibility_error() {
+    let failed_evaluate = router(
+        r#"{"servers":[{"type":"local","tag":"local"}],
+            "rules":[{"domain":"failed.test","action":"evaluate","server":"local"},
+                     {"domain":"failed.test","action":"respond"}]}"#
+            .into(),
+    );
+    let error =
+        failed_evaluate.exchange(&query("failed.test.", RecordType::TXT), &LookupOptions::default()).await.unwrap_err();
+    assert_eq!(error.to_string(), "respond action requires an evaluated response from a preceding evaluate action");
+
+    let missing = router(r#"{"rules":[{"domain":"missing.test","action":"respond"}]}"#.into());
+    let options = LookupOptions { strategy: DomainStrategy::Ipv4Only, ..Default::default() };
+    let error = missing.lookup("missing.test", &options).await.unwrap_err();
+    assert_eq!(error.to_string(), "respond action requires an evaluated response from a preceding evaluate action");
+    let error = missing.exchange(&query("missing.test.", RecordType::A), &LookupOptions::default()).await.unwrap_err();
+    assert_eq!(error.to_string(), "respond action requires an evaluated response from a preceding evaluate action");
 }
 
 #[tokio::test]

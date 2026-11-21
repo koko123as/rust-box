@@ -261,6 +261,33 @@ fn strategy_allows(strategy: DomainStrategy, query_type: u16) -> bool {
 }
 
 impl DnsRouter {
+    fn validate_evaluate_servers(options: &DnsOptions) -> Result<(), DnsError> {
+        let server_tags: Vec<(String, bool)> = options
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| {
+                let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
+                (tag, matches!(server, DnsServer::FakeIp(_)))
+            })
+            .collect();
+        for (index, rule) in options.rules.iter().enumerate() {
+            let Some(DnsRuleAction::Evaluate { server, .. }) = rule.action() else { continue };
+            if server.is_empty() {
+                return Err(DnsError(format!("dns.rules[{index}]: missing server field")));
+            }
+            if !server_tags.iter().any(|(tag, _)| tag == server) {
+                return Err(DnsError(format!("dns.rules[{index}]: DNS server not found: {server}")));
+            }
+            if server_tags.iter().any(|(tag, fakeip)| tag == server && *fakeip) {
+                return Err(DnsError(format!(
+                    "dns.rules[{index}]: evaluate action cannot use fakeip server: {server}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `defaults` are the route-level dial defaults and `outbounds` the
     /// handle a server's `detour` dials through (filled once the outbounds
     /// are built). The rules are checked against the rule-sets as they are
@@ -273,6 +300,7 @@ impl DnsRouter {
         rule_sets: &RuleSets,
         certificates: &Arc<rb_certificate::Store>,
     ) -> Result<Arc<Self>, DnsError> {
+        Self::validate_evaluate_servers(options)?;
         let mut servers = HashMap::new();
         let mut first = None;
         let mut fakeip_count = 0;
