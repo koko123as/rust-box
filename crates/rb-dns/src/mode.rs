@@ -45,7 +45,22 @@ impl MetadataLookup<'_> {
 
 /// `dnsRuleActionHasStrategy`.
 fn action_has_strategy(action: Option<&DnsRuleAction>) -> bool {
-    matches!(action, Some(DnsRuleAction::Route { options, .. }) if options.strategy != DomainStrategy::AsIs)
+    matches!(
+        action,
+        Some(DnsRuleAction::Route { options, .. } | DnsRuleAction::Evaluate { options, .. })
+            if options.strategy != DomainStrategy::AsIs
+    )
+}
+
+fn action_disables_legacy_mode(action: Option<&DnsRuleAction>) -> bool {
+    match action {
+        Some(DnsRuleAction::Route { options, speculative, race, .. })
+        | Some(DnsRuleAction::Evaluate { options, speculative, race, .. }) => {
+            *race || *speculative || options.disable_optimistic_cache
+        }
+        Some(DnsRuleAction::Respond { race }) | Some(DnsRuleAction::Reject { race, .. }) => *race,
+        None => false,
+    }
 }
 
 /// `defaultRuleNeedsLegacyDNSModeFromAddressFilter`.
@@ -73,7 +88,7 @@ fn rule_flags(rule: &DnsRule, lookup: &MetadataLookup) -> Result<ModeFlags, Stri
     match rule {
         Rule::Default { matcher, action } => {
             let mut flags = ModeFlags {
-                disabled: disables_legacy(matcher),
+                disabled: disables_legacy(matcher) || action_disables_legacy_mode(action.as_ref()),
                 needed_from_strategy: action_has_strategy(action.as_ref()),
                 ..Default::default()
             };
@@ -88,8 +103,11 @@ fn rule_flags(rule: &DnsRule, lookup: &MetadataLookup) -> Result<ModeFlags, Stri
             Ok(flags)
         }
         Rule::Logical { rules, action, .. } => {
-            let mut flags =
-                ModeFlags { needed_from_strategy: action_has_strategy(action.as_ref()), ..Default::default() };
+            let mut flags = ModeFlags {
+                disabled: action_disables_legacy_mode(action.as_ref()),
+                needed_from_strategy: action_has_strategy(action.as_ref()),
+                ..Default::default()
+            };
             flags.needed = flags.needed_from_strategy;
             for (index, rule) in rules.iter().enumerate() {
                 flags.merge(rule_flags(rule, lookup).map_err(|error| format!("sub rule[{index}]: {error}"))?);
