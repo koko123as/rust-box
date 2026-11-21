@@ -1,6 +1,7 @@
-//! DNS transports: `udp` and `tcp` (sing-box `dns/transport/udp.go`,
-//! `tcp.go`) and `local`, the system resolver (sing-box
-//! `dns/transport/local`).
+//! DNS transports: `udp`, `tcp`, `hosts` and `local`, the system resolver.
+
+mod hosts;
+pub use hosts::HostsTransport;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -10,6 +11,7 @@ use std::time::Duration;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rb_adapter::Socksaddr;
+use rb_config::HostsDnsServer;
 use rb_dialer::Dialer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -26,6 +28,7 @@ pub enum Transport {
     Local,
     Udp(SocketAddr, Arc<dyn Dialer>),
     Tcp(SocketAddr, Arc<dyn Dialer>),
+    Hosts(Arc<HostsTransport>),
 }
 
 impl std::fmt::Debug for Transport {
@@ -34,6 +37,7 @@ impl std::fmt::Debug for Transport {
             Transport::Local => f.write_str("Local"),
             Transport::Udp(server, _) => write!(f, "Udp({server})"),
             Transport::Tcp(server, _) => write!(f, "Tcp({server})"),
+            Transport::Hosts(_) => f.write_str("Hosts"),
         }
     }
 }
@@ -98,9 +102,14 @@ fn next_id() -> u16 {
 }
 
 impl Transport {
+    pub(super) fn hosts(options: &HostsDnsServer) -> io::Result<Self> {
+        Ok(Transport::Hosts(Arc::new(HostsTransport::new(options)?)))
+    }
+
     pub async fn query(&self, domain: &str, query_type: u16, timeout: Duration) -> io::Result<Answer> {
         match self {
             Transport::Local => query_local(domain, query_type).await,
+            Transport::Hosts(hosts) => hosts.query(domain, query_type),
             Transport::Udp(server, dialer) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
@@ -142,6 +151,7 @@ impl Transport {
         message[..2].copy_from_slice(&id.to_be_bytes());
         let mut response = match self {
             Transport::Local => return Ok(None),
+            Transport::Hosts(hosts) => return hosts.exchange(query).map(Some),
             Transport::Udp(server, dialer) => {
                 let socket = dialer.dial_udp(&Socksaddr::from(*server)).await?;
                 socket.write_packet(&message, &Socksaddr::from(*server)).await?;

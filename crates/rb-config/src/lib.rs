@@ -199,6 +199,8 @@ pub enum DnsServer {
     Udp(RemoteDnsServer),
     #[serde(rename = "tcp")]
     Tcp(RemoteDnsServer),
+    #[serde(rename = "hosts")]
+    Hosts(HostsDnsServer),
 }
 
 impl DnsServer {
@@ -206,6 +208,7 @@ impl DnsServer {
         match self {
             DnsServer::Local { tag } => tag,
             DnsServer::Udp(server) | DnsServer::Tcp(server) => &server.tag,
+            DnsServer::Hosts(server) => &server.tag,
         }
     }
 }
@@ -222,6 +225,18 @@ with_dial_fields! {
         #[serde(default)]
         pub server_port: u16,
     }
+}
+
+/// sing-box `HostsDNSServerOptions`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostsDnsServer {
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub path: Listable<String>,
+    #[serde(default)]
+    pub predefined: Option<std::collections::BTreeMap<String, Listable<IpAddr>>>,
 }
 
 /// Inbounds (sing-box `option.Inbound`).
@@ -1294,6 +1309,28 @@ mod tests {
         assert_eq!(options.dns.servers[1].tag(), "google");
         assert_eq!(options.route.rules.len(), 3);
         assert_eq!(options.dns.strategy, DomainStrategy::PreferIpv4);
+    }
+
+    #[test]
+    fn hosts_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"hosts","tag":"hosts","path":["/etc/hosts","$HOME/.hosts"],
+                "predefined":{"localhost":"127.0.0.1","dual":["127.0.0.1","::1"]}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[0].tag(), "hosts");
+        let DnsServer::Hosts(hosts) = &options.dns.servers[0] else { panic!() };
+        assert_eq!(hosts.path.0, vec!["/etc/hosts", "$HOME/.hosts"]);
+        let predefined = hosts.predefined.as_ref().unwrap();
+        assert_eq!(predefined["localhost"].0, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(predefined["dual"].0, vec!["127.0.0.1".parse::<IpAddr>().unwrap(), "::1".parse().unwrap()]);
+
+        let error = parse(r#"{"dns":{"servers":[{"type":"hosts","unknown":true}]}}"#).unwrap_err().to_string();
+        assert!(error.contains("dns.servers[0]") && error.contains("unknown field"), "{error}");
+        let error = parse(r#"{"dns":{"servers":[{"type":"hosts","predefined":{"bad":"not-an-ip"}}]}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dns.servers[0].predefined.bad"), "{error}");
     }
 
     #[test]

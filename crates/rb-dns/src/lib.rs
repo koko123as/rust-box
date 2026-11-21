@@ -23,7 +23,7 @@ use rb_config::{DnsOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, R
 use rb_dialer::NetworkDefaults;
 use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
 
-pub use transport::{Answer, Transport, QTYPE_A, QTYPE_AAAA};
+pub use transport::{Answer, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
 
 /// sing-box `C.DNSTimeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -175,6 +175,9 @@ impl DnsRouter {
                 }
                 DnsServer::Tcp(remote) => {
                     Transport::Tcp((remote.server, port_or_default(remote.server_port)).into(), dialer(remote)?)
+                }
+                DnsServer::Hosts(hosts) => {
+                    Transport::hosts(hosts).map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?
                 }
             };
             first.get_or_insert_with(|| tag.clone());

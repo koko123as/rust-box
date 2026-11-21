@@ -5,6 +5,8 @@ use hickory_proto::rr::{RData, Record, RecordType};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::UdpSocket;
 
+static HOSTS_TEST_IDS: AtomicUsize = AtomicUsize::new(0);
+
 /// A tiny DNS server answering every A query with `v4`, AAAA with `v6`, and
 /// `nx.test` with NXDOMAIN. Returns its address and a query counter.
 async fn fake_server(v4: [u8; 4], v6: std::net::Ipv6Addr) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
@@ -145,4 +147,63 @@ async fn exchange_messages() {
     assert!(answer.answers().is_empty());
     assert_eq!(count.load(Ordering::SeqCst), before);
     assert!(dns.exchange(b"garbage", &options).await.is_err());
+}
+
+#[tokio::test]
+async fn hosts_predefined_path_order_and_dns_responses() {
+    let id = HOSTS_TEST_IDS.fetch_add(1, Ordering::Relaxed);
+    let first = std::env::temp_dir().join(format!("rust-box-hosts-{}-{id}-first", std::process::id()));
+    let second = std::env::temp_dir().join(format!("rust-box-hosts-{}-{id}-second", std::process::id()));
+    std::fs::write(&first, "1.1.1.1 file.test first-only.test pre.test\n").unwrap();
+    std::fs::write(&second, "3.3.3.3 file.test second-only.test pre.test\n").unwrap();
+    let config = serde_json::json!({
+        "servers": [{
+            "type": "hosts",
+            "tag": "hosts",
+            "path": [first.to_string_lossy(), second.to_string_lossy()],
+            "predefined": {"pre.test": ["9.9.9.9", "2001:db8::9"]}
+        }],
+        "final": "hosts"
+    })
+    .to_string();
+    let dns = router(config);
+    let options = LookupOptions::default();
+
+    assert_eq!(
+        dns.lookup("pre.test", &options).await.unwrap(),
+        vec!["9.9.9.9".parse::<IpAddr>().unwrap(), "2001:db8::9".parse().unwrap()]
+    );
+    assert_eq!(dns.lookup("file.test", &options).await.unwrap(), vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+    assert_eq!(dns.lookup("first-only.test", &options).await.unwrap(), vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+    assert_eq!(dns.lookup("second-only.test", &options).await.unwrap(), vec!["3.3.3.3".parse::<IpAddr>().unwrap()]);
+
+    let answer = dns.exchange(&query("pre.test.", RecordType::A), &options).await.unwrap().unwrap();
+    let answer = Message::from_vec(&answer).unwrap();
+    assert_eq!(answer.response_code(), ResponseCode::NoError);
+    assert_eq!(answer.answers().len(), 1);
+    assert_eq!(answer.answers()[0].ttl(), 600);
+    assert!(
+        matches!(answer.answers()[0].data(), RData::A(address) if address.0 == std::net::Ipv4Addr::new(9, 9, 9, 9))
+    );
+
+    let answer = dns.exchange(&query("pre.test.", RecordType::AAAA), &options).await.unwrap().unwrap();
+    let answer = Message::from_vec(&answer).unwrap();
+    assert_eq!(answer.answers().len(), 1);
+    assert_eq!(answer.answers()[0].ttl(), 600);
+    assert!(
+        matches!(answer.answers()[0].data(), RData::AAAA(address) if address.0 == "2001:db8::9".parse::<std::net::Ipv6Addr>().unwrap())
+    );
+
+    let answer = dns.exchange(&query("file.test.", RecordType::AAAA), &options).await.unwrap().unwrap();
+    let answer = Message::from_vec(&answer).unwrap();
+    assert_eq!(answer.response_code(), ResponseCode::NoError);
+    assert!(answer.answers().is_empty());
+
+    for (name, query_type) in [("missing.test.", RecordType::A), ("pre.test.", RecordType::TXT)] {
+        let answer = dns.exchange(&query(name, query_type), &options).await.unwrap().unwrap();
+        assert_eq!(Message::from_vec(&answer).unwrap().response_code(), ResponseCode::NXDomain);
+    }
+    assert_eq!(dns.lookup("missing.test", &options).await.unwrap_err().kind(), io::ErrorKind::NotFound);
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(second).unwrap();
 }
