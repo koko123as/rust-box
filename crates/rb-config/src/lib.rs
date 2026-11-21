@@ -689,6 +689,15 @@ fn check_v2ray_transport(
             "`early_data_header_name` is not supported by rust-box yet".into(),
         )),
         V2RayTransportConfig::HttpUpgrade(_) => Ok(()),
+        V2RayTransportConfig::Http(options) => {
+            for (name, duration) in [("idle_timeout", options.idle_timeout.0), ("ping_timeout", options.ping_timeout.0)]
+            {
+                if !duration.is_zero() {
+                    return Err(field(format!("{path}.{name}"), format!("`{name}` is not supported by rust-box yet")));
+                }
+            }
+            Ok(())
+        }
         V2RayTransportConfig::Grpc(options) if allow_grpc => {
             for (name, duration) in [("idle_timeout", options.idle_timeout.0), ("ping_timeout", options.ping_timeout.0)]
             {
@@ -702,8 +711,8 @@ fn check_v2ray_transport(
     }
 }
 
-/// A V2Ray transport configuration. WebSocket and HTTPUpgrade are wired into
-/// the proxy protocols; other transport types are rejected with their path.
+/// A V2Ray transport configuration. Unsupported transport features are
+/// rejected with their configuration path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct V2RayTransportOptions {
     pub r#type: String,
@@ -2271,6 +2280,37 @@ mod tests {
         .unwrap();
         assert_eq!(options.inbounds.len(), 3);
         assert_eq!(options.outbounds.len(), 3);
+    }
+
+    #[test]
+    fn http_transport_is_accepted_and_rejects_unimplemented_timeouts() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"trojan","transport":{"type":"http","host":["a.test","b.test"],"path":"/edge","method":"POST","headers":{"X-Test":"inbound"}}},
+                  {"type":"vless","transport":{"type":"http"}},
+                  {"type":"vmess","transport":{"type":"http"}}],
+                "outbounds":[
+                  {"type":"trojan","transport":{"type":"http"}},
+                  {"type":"vless","transport":{"type":"http"}},
+                  {"type":"vmess","transport":{"type":"http"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.inbounds.len(), 3);
+        assert_eq!(options.outbounds.len(), 3);
+
+        for (config, expected) in [
+            (
+                r#"{"outbounds":[{"type":"vless","transport":{"type":"http","idle_timeout":"1s"}}]}"#,
+                "outbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"trojan","transport":{"type":"http","ping_timeout":"1s"}}]}"#,
+                "inbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
     }
 
     #[test]
