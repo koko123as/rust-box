@@ -11,6 +11,7 @@ pub mod dial;
 pub mod adguard;
 pub mod deprecated;
 pub mod query_types;
+pub mod quic;
 pub mod rule;
 pub mod rule_set;
 pub mod srs;
@@ -23,6 +24,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrategy};
+pub use quic::{
+    Hysteria2Inbound, Hysteria2Obfs, Hysteria2Outbound, Hysteria2User, MemoryBytes, QuicOptions, TuicInbound,
+    TuicOutbound, TuicUser,
+};
 pub use rule::{
     DnsMatchResponse, DnsRecordOptions, DnsResponseCode, DnsRouteActionOptions, DnsRule, DnsRuleAction, DnsRuleMatch,
     LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule, Rule, RuleAction, RuleMatch, SNIFFERS,
