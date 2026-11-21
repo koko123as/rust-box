@@ -199,6 +199,8 @@ pub enum DnsServer {
     Udp(RemoteDnsServer),
     #[serde(rename = "tcp")]
     Tcp(RemoteDnsServer),
+    #[serde(rename = "tls")]
+    Tls(Box<RemoteTlsDnsServer>),
     #[serde(rename = "hosts")]
     Hosts(HostsDnsServer),
 }
@@ -208,6 +210,7 @@ impl DnsServer {
         match self {
             DnsServer::Local { tag } => tag,
             DnsServer::Udp(server) | DnsServer::Tcp(server) => &server.tag,
+            DnsServer::Tls(server) => &server.tag,
             DnsServer::Hosts(server) => &server.tag,
         }
     }
@@ -215,7 +218,7 @@ impl DnsServer {
 
 with_dial_fields! {
     /// sing-box `RemoteDNSServerOptions` with its dial fields (the server
-    /// must be an IP address in rust-box).
+    /// for `udp` and `tcp` must be an IP address in rust-box).
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct RemoteDnsServer {
@@ -224,6 +227,21 @@ with_dial_fields! {
         pub server: IpAddr,
         #[serde(default)]
         pub server_port: u16,
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `RemoteTLSDNSServerOptions` (DNS over TLS).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RemoteTlsDnsServer {
+        #[serde(default)]
+        pub tag: String,
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
     }
 }
 
@@ -1214,8 +1232,21 @@ impl Options {
             self.check_dialer(&path, &direct.dialer_options(), &server_known)?;
         }
         for (index, server) in self.dns.servers.iter().enumerate() {
-            if let DnsServer::Udp(remote) | DnsServer::Tcp(remote) = server {
-                self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+            match server {
+                DnsServer::Udp(remote) | DnsServer::Tcp(remote) => {
+                    self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+                }
+                DnsServer::Tls(remote) => {
+                    self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+                    if let Some(tls) = &remote.tls {
+                        // sing-box forces TLS on for a `type: tls` DNS server,
+                        // even when `enabled` is absent or false.
+                        let mut tls = tls.clone();
+                        tls.enabled = true;
+                        tls.validate(&format!("dns.servers[{index}].tls"))?;
+                    }
+                }
+                _ => {}
             }
         }
         if !self.dns.r#final.is_empty() && !server_known(&self.dns.r#final) {
@@ -1495,6 +1526,35 @@ mod tests {
         assert_eq!(options.route.default_mark, FwMark(7));
         let DnsServer::Udp(remote) = &options.dns.servers[1] else { panic!() };
         assert_eq!(remote.dialer_options().detour, "d2");
+    }
+
+    #[test]
+    fn tls_dns_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"tls","tag":"dot","server":"dns.example","domain_resolver":"local",
+                 "tls":{"server_name":"dns.example","alpn":[]}}]}}"#,
+        )
+        .unwrap();
+        let DnsServer::Tls(server) = &options.dns.servers[1] else { panic!() };
+        assert_eq!(server.server, "dns.example");
+        assert_eq!(server.server_port, 0);
+        assert_eq!(server.dialer_options().domain_resolver.unwrap().server, "local");
+        assert_eq!(server.tls.as_ref().unwrap().server_name, "dns.example");
+        assert!(server.tls.as_ref().unwrap().alpn.is_empty());
+
+        let error = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"tls","server":"dns.example","domain_resolver":"local",
+                 "tls":{"utls":{"enabled":true}}}]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dns.servers[1].tls.utls: `utls` is not supported by rust-box yet"), "{error}");
+
+        let error =
+            parse(r#"{"dns":{"servers":[{"type":"tls","server":"1.1.1.1","unknown":true}]}}"#).unwrap_err().to_string();
+        assert!(error.contains("unknown field `unknown`"), "{error}");
     }
 
     #[test]

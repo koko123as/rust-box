@@ -90,9 +90,8 @@ impl RustBox {
             }
         }
         let rule_sets = Arc::new(rule_sets);
-        let dns_router = Arc::new(
-            DnsRouter::new(&options.dns, &defaults, &outbound_registry, &rule_sets).context("initialize DNS")?,
-        );
+        let dns_router = DnsRouter::new(&options.dns, &defaults, &outbound_registry, &rule_sets, &certificates)
+            .context("initialize DNS")?;
         {
             // Rule-set updates go through the DNS router's check.
             let dns = Arc::downgrade(&dns_router);

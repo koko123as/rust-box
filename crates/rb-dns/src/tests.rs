@@ -39,10 +39,17 @@ async fn fake_server(v4: [u8; 4], v6: std::net::Ipv6Addr) -> (std::net::SocketAd
     (address, count)
 }
 
-fn router(json: String) -> DnsRouter {
+fn router(json: String) -> Arc<DnsRouter> {
     let options: rb_config::DnsOptions = serde_json::from_str(&json).unwrap();
-    DnsRouter::new(&options, &Default::default(), &rb_adapter::OutboundRegistry::new(), &rb_rule::RuleSets::new())
-        .unwrap()
+    let certificates = rb_certificate::Store::new(None).unwrap();
+    DnsRouter::new(
+        &options,
+        &Default::default(),
+        &rb_adapter::OutboundRegistry::new(),
+        &rb_rule::RuleSets::new(),
+        &certificates,
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -83,6 +90,33 @@ async fn local_resolver() {
     let dns = router(r#"{}"#.into());
     let addresses = dns.lookup("localhost", &LookupOptions::default()).await.unwrap();
     assert!(addresses.iter().all(|address| address.is_loopback()), "{addresses:?}");
+}
+
+#[test]
+fn dot_server_defaults_to_853_and_requires_explicit_domain_resolver() {
+    let dns = router(
+        r#"{"servers":[{"type":"local","tag":"bootstrap"},
+            {"type":"tls","tag":"dot","server":"dns.example","domain_resolver":"bootstrap"}],
+            "final":"dot"}"#
+            .into(),
+    );
+    let Transport::Dot(dot) = dns.servers.get("dot").unwrap().as_ref() else { panic!() };
+    assert_eq!(dot.server(), &Socksaddr::from_host_port("dns.example", 853));
+
+    let options: rb_config::DnsOptions =
+        serde_json::from_str(r#"{"servers":[{"type":"tls","server":"dns.example"}]}"#).unwrap();
+    let certificates = rb_certificate::Store::new(None).unwrap();
+    let error = match DnsRouter::new(
+        &options,
+        &Default::default(),
+        &rb_adapter::OutboundRegistry::new(),
+        &rb_rule::RuleSets::new(),
+        &certificates,
+    ) {
+        Ok(_) => panic!("domain DoT server without a resolver must fail during construction"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("missing domain resolver for domain server address"), "{error}");
 }
 
 #[test]

@@ -12,18 +12,18 @@ mod mode;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{RData, Record};
-use rb_adapter::{apply_strategy, DnsResolver, LookupOptions, OutboundRegistry};
+use rb_adapter::{apply_strategy, DnsResolver, LookupOptions, OutboundRegistry, Socksaddr};
 use rb_config::{DnsOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
-use rb_dialer::NetworkDefaults;
+use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
 
-pub use transport::{Answer, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
+pub use transport::{Answer, DotTransport, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
 
 /// sing-box `C.DNSTimeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -112,6 +112,33 @@ pub struct DnsRouter {
     cache: Option<Mutex<Cache>>,
 }
 
+#[derive(Default)]
+struct DnsResolverHandle {
+    router: RwLock<Option<Weak<DnsRouter>>>,
+}
+
+impl DnsResolverHandle {
+    fn router(&self) -> io::Result<Arc<DnsRouter>> {
+        self.router
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "DNS router is not initialized"))
+    }
+}
+
+#[async_trait]
+impl DnsResolver for DnsResolverHandle {
+    async fn lookup(&self, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>> {
+        self.router()?.lookup(domain, options).await
+    }
+
+    async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
+        self.router()?.exchange(query, options).await
+    }
+}
+
 #[derive(Debug)]
 pub struct DnsError(pub String);
 
@@ -159,9 +186,12 @@ impl DnsRouter {
         defaults: &NetworkDefaults,
         outbounds: &Arc<OutboundRegistry>,
         rule_sets: &RuleSets,
-    ) -> Result<Self, DnsError> {
+        certificates: &Arc<rb_certificate::Store>,
+    ) -> Result<Arc<Self>, DnsError> {
         let mut servers = HashMap::new();
         let mut first = None;
+        let dns_resolver = Arc::new(DnsResolverHandle::default());
+        let dns_resolver_trait: Arc<dyn DnsResolver> = dns_resolver.clone();
         for (index, server) in options.servers.iter().enumerate() {
             let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
             let dialer = |remote: &rb_config::RemoteDnsServer| {
@@ -175,6 +205,42 @@ impl DnsRouter {
                 }
                 DnsServer::Tcp(remote) => {
                     Transport::Tcp((remote.server, port_or_default(remote.server_port)).into(), dialer(remote)?)
+                }
+                DnsServer::Tls(remote) => {
+                    let address = Socksaddr::from_host_port(&remote.server, port_or_default_dot(remote.server_port));
+                    if remote.server.is_empty() {
+                        return Err(DnsError(format!("dns.servers[{index}]: invalid server address: {address}")));
+                    }
+                    let dial_options = remote.dialer_options();
+                    let has_resolver =
+                        dial_options.domain_resolver.as_ref().is_some_and(|resolver| !resolver.server.is_empty());
+                    if address.domain().is_some() && dial_options.detour.is_empty() && !has_resolver {
+                        return Err(DnsError(format!(
+                            "dns.servers[{index}]: missing domain resolver for domain server address"
+                        )));
+                    }
+                    let environment = DialerEnv {
+                        defaults: defaults.clone(),
+                        outbounds: outbounds.clone(),
+                        dns: dns_resolver_trait.clone(),
+                        // sing-box DNS remote dialers use DirectResolver;
+                        // route.default_domain_resolver is deliberately not inherited.
+                        default_resolver: None,
+                    };
+                    let remote_dialer = rb_dialer::new_outbound_dialer(
+                        &dial_options,
+                        address.domain().is_some(),
+                        &environment,
+                        &format!("dns/transport/tls[{tag}]"),
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let mut tls = remote.tls.clone().unwrap_or_default();
+                    // sing-box forces TLS on and leaves ALPN empty by default.
+                    tls.enabled = true;
+                    let client = rb_tls::TlsClient::new(&tls, &remote.server, certificates)
+                        .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let tls_dialer = Arc::new(rb_tls::TlsDialer::new(remote_dialer, client));
+                    Transport::Dot(Arc::new(DotTransport::new(address, tls_dialer)))
                 }
                 DnsServer::Hosts(hosts) => {
                     Transport::hosts(hosts).map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?
@@ -204,7 +270,7 @@ impl DnsRouter {
                 disable_expire: options.disable_expire,
             })
         });
-        let router = DnsRouter {
+        let router = Arc::new(DnsRouter {
             servers,
             raw_rules: options.rules.clone(),
             rules: RwLock::new(Arc::new(DnsRules { rules: Vec::new(), legacy: false })),
@@ -213,7 +279,8 @@ impl DnsRouter {
             strategy: options.strategy,
             timeout,
             cache,
-        };
+        });
+        *dns_resolver.router.write().unwrap() = Some(Arc::downgrade(&router));
         let (rules, _) = router.build_rules(rule_sets)?;
         *router.rules.write().unwrap() = Arc::new(rules);
         Ok(router)
@@ -679,6 +746,14 @@ fn response(request: &Message, code: ResponseCode, answers: Vec<Record>) -> io::
 fn port_or_default(port: u16) -> u16 {
     if port == 0 {
         53
+    } else {
+        port
+    }
+}
+
+fn port_or_default_dot(port: u16) -> u16 {
+    if port == 0 {
+        853
     } else {
         port
     }
