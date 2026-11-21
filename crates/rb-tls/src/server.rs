@@ -180,6 +180,13 @@ impl TlsServer {
         self.inner.options.alpn.0.clone()
     }
 
+    /// Shares the current Rustls server configuration with QUIC transports.
+    /// The returned value is a snapshot; callers that need to observe later
+    /// certificate reloads should request it again for new connections.
+    pub fn rustls_config(&self) -> Arc<ServerConfig> {
+        self.inner.config.read().unwrap().clone()
+    }
+
     pub fn handshake_timeout(&self) -> Duration {
         self.inner.handshake_timeout
     }
