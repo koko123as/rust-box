@@ -664,11 +664,15 @@ fn check_proxy_outbound(
     {
         return Err(field(format!("{path}.multiplex.brutal"), "`brutal` is not supported by rust-box yet".into()));
     }
-    check_v2ray_transport(&format!("{path}.transport"), transport.as_ref())?;
+    check_v2ray_transport(&format!("{path}.transport"), transport.as_ref(), true)?;
     Ok(())
 }
 
-fn check_v2ray_transport(path: &str, transport: Option<&V2RayTransportOptions>) -> Result<(), ConfigError> {
+fn check_v2ray_transport(
+    path: &str,
+    transport: Option<&V2RayTransportOptions>,
+    allow_grpc: bool,
+) -> Result<(), ConfigError> {
     let field = |path: String, message: String| ConfigError::Field { path, message };
     let Some(transport) = transport else { return Ok(()) };
     match &transport.config {
@@ -685,6 +689,15 @@ fn check_v2ray_transport(path: &str, transport: Option<&V2RayTransportOptions>) 
             "`early_data_header_name` is not supported by rust-box yet".into(),
         )),
         V2RayTransportConfig::HttpUpgrade(_) => Ok(()),
+        V2RayTransportConfig::Grpc(options) if allow_grpc => {
+            for (name, duration) in [("idle_timeout", options.idle_timeout.0), ("ping_timeout", options.ping_timeout.0)]
+            {
+                if !duration.is_zero() {
+                    return Err(field(format!("{path}.{name}"), format!("`{name}` is not supported by rust-box yet")));
+                }
+            }
+            Ok(())
+        }
         _ => Err(field(path.to_string(), "`transport` is not supported by rust-box yet".into())),
     }
 }
@@ -1291,7 +1304,7 @@ impl Options {
                 Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
-            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport)?;
+            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, false)?;
             if let Inbound::Trojan(trojan) = inbound {
                 trojan.validate_fallback(&format!("inbounds[{index}]"))?;
             }
@@ -1360,6 +1373,14 @@ impl Options {
                 }
                 Outbound::Vless(vless) => {
                     check_proxy_outbound(&path, vless.tls.as_ref(), vless.multiplex.as_ref(), &vless.transport)?;
+                    if vless.flow == "xtls-rprx-vision"
+                        && vless.transport.as_ref().is_some_and(|t| matches!(&t.config, V2RayTransportConfig::Grpc(_)))
+                    {
+                        return Err(field(
+                            format!("{path}.transport"),
+                            "`transport` is not supported by rust-box yet with flow `xtls-rprx-vision`".into(),
+                        ));
+                    }
                     self.check_dialer(&path, &vless.dialer_options(), &server_known)?;
                 }
                 Outbound::Vmess(vmess) => {
@@ -2246,6 +2267,35 @@ mod tests {
         assert_eq!(options.outbounds.len(), 3);
     }
 
+    #[test]
+    fn grpc_transport_is_outbound_only_and_rejects_unsupported_keepalive() {
+        assert!(parse(r#"{"outbounds":[{"type":"trojan","transport":{"type":"grpc","service_name":"edge"}}]}"#).is_ok());
+        let error = parse(r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","ping_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(r#"{"inbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).unwrap_err().to_string();
+        assert!(error.contains("inbounds[0].transport: `transport` is not supported by rust-box yet"), "{error}");
+        let error = parse(r#"{"outbounds":[{"type":"vless","flow":"xtls-rprx-vision","transport":{"type":"grpc"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "outbounds[0].transport: `transport` is not supported by rust-box yet with flow `xtls-rprx-vision`"
+            ),
+            "{error}"
+        );
+    }
     #[test]
     fn v2ray_transport_options_are_typed_and_strict() {
         let websocket: V2RayTransportOptions = serde_json::from_str(

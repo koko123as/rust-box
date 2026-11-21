@@ -80,7 +80,11 @@ impl VlessOutbound {
             Some(tls) => Some(rb_tls::TlsClient::new(tls, &options.server, certificates)?),
             None => None,
         };
-        let tls = if transport.is_some() { tls.map(crate::v2ray::transport_tls_client) } else { tls };
+        let tls = if transport.is_some() {
+            tls.map(|tls| crate::v2ray::transport_tls_client(tls, transport.as_ref()))
+        } else {
+            tls
+        };
         let packet_encoding = match options.packet_encoding.as_deref() {
             None | Some("xudp") => PacketEncoding::Xudp,
             Some("") => PacketEncoding::None,
@@ -159,6 +163,16 @@ impl VlessOutbound {
                             .await?;
                         }
                     }
+                }
+                crate::v2ray::StreamTransport::Grpc(options) => {
+                    let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
+                    let stream = match conn {
+                        ServerConn::Tls(stream, _) => Box::new(*stream) as BoxStream,
+                        ServerConn::Plain(stream) => stream,
+                    };
+                    let stream =
+                        crate::v2ray::grpc_lite::client(stream, &self.server, tls_server_name, options).await?;
+                    return Ok(ServerConn::Plain(stream));
                 }
             }
         }

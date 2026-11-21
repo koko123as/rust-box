@@ -193,7 +193,11 @@ impl TrojanOutbound {
         if let Some(tls) = options.tls.as_ref().filter(|tls| tls.enabled) {
             let client = rb_tls::TlsClient::new(tls, &options.server, certificates)?;
             tls_server_name = Some(client.server_name().to_owned());
-            let client = if transport.is_some() { crate::v2ray::transport_tls_client(client) } else { client };
+            let client = if transport.is_some() {
+                crate::v2ray::transport_tls_client(client, transport.as_ref())
+            } else {
+                client
+            };
             dialer = Arc::new(rb_tls::TlsDialer::new(dialer, client));
         }
         let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;

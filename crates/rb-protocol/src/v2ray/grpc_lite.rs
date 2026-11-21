@@ -1,4 +1,8 @@
 //! gRPC-lite message framing over an asynchronous byte stream.
+use super::h2::H2Client;
+use http::{header, Request, StatusCode};
+use rb_adapter::Host;
+use rb_adapter::{BoxStream, Socksaddr};
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
@@ -271,11 +275,62 @@ fn encode_varint(mut value: u64, output: &mut [u8; 10]) -> usize {
     len + 1
 }
 
+/// Establish the sing-box-compatible gRPC-lite HTTP/2 client stream.
+pub(crate) async fn client(
+    stream: BoxStream,
+    server: &Socksaddr,
+    tls_server_name: Option<&str>,
+    options: &rb_config::V2RayGrpcOptions,
+) -> io::Result<BoxStream> {
+    let host =
+        tls_server_name.filter(|name| !name.is_empty()).map(str::to_owned).unwrap_or_else(|| match &server.host {
+            Host::Ip(ip) => ip.to_string(),
+            Host::Domain(domain) => domain.clone(),
+        });
+    let authority =
+        if host.contains(':') { format!("[{host}]:{}", server.port) } else { format!("{host}:{}", server.port) };
+    let uri = format!("https://{authority}/{}/Tun", escape_service_name(&options.service_name));
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/grpc")
+        .header(header::USER_AGENT, "grpc-go/1.48.0")
+        .header("te", "trailers")
+        .body(())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let client = H2Client::new(stream).await?;
+    let (response, body) = client.open(request).await?;
+    if response.status() != StatusCode::OK {
+        return Err(io::Error::other(format!("gRPC-lite server returned HTTP status {}", response.status())));
+    }
+    Ok(Box::new(GrpcLiteStream::new(body)))
+}
+
+fn escape_service_name(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'$' | b'&' | b'+' | b'=' | b':' | b'@')
+        {
+            result.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut result, "%{byte:02X}").expect("write to String");
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn service_name_escaping_matches_go_path_escape() {
+        assert_eq!(escape_service_name("a/b;c,d?e:f@g+h$i&j=k% l"), "a%2Fb%3Bc%2Cd%3Fe:f@g+h$i&j=k%25%20l");
+    }
 
     #[tokio::test]
     async fn reads_header_split_across_chunks() {

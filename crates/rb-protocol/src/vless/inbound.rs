@@ -337,6 +337,13 @@ impl VlessInbound {
                 }
                 conn
             }
+            (Some(crate::v2ray::StreamTransport::Grpc(_)), _) => {
+                error!(
+                    "{}: process connection from {source}: gRPC transport is not supported by rust-box yet",
+                    self.log_prefix()
+                );
+                return;
+            }
             (None, conn) => conn,
         };
         if let Err(error) = self.serve(conn, context).await {

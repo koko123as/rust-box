@@ -57,7 +57,11 @@ impl VmessOutbound {
             Some(tls) => Some(rb_tls::TlsClient::new(tls, &options.server, certificates)?),
             None => None,
         };
-        let tls = if transport.is_some() { tls.map(crate::v2ray::transport_tls_client) } else { tls };
+        let tls = if transport.is_some() {
+            tls.map(|tls| crate::v2ray::transport_tls_client(tls, transport.as_ref()))
+        } else {
+            tls
+        };
         let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
         let packet_encoding = match options.packet_encoding.as_str() {
             "" => VmessPacketEncoding::None,
