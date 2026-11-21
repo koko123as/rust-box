@@ -20,7 +20,7 @@ async-trait.workspace = true
 tracing.workspace = true
 base64.workspace = true
 sha2.workspace = true
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
+rcgen.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

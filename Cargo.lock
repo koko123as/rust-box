@@ -1222,6 +1222,7 @@ dependencies = [
  "rb-route",
  "rb-rule",
  "rb-rule-set",
+ "rcgen",
  "serde_json",
  "tempfile",
  "tokio",
