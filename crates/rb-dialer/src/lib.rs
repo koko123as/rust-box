@@ -22,6 +22,7 @@
 
 pub mod listener;
 pub mod parallel;
+pub mod resolve;
 pub mod sys;
 pub mod tfo;
 pub mod tls_fragment;
@@ -40,6 +41,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpStream, UdpSocket};
 
 pub use parallel::{dial_parallel, dial_serial, DEFAULT_FALLBACK_DELAY};
+pub use resolve::{lookup_options, new_outbound_dialer, resolve_options, DialerEnv, NatPacketConn, ResolveDialer};
 
 /// sing-box `C.TCPConnectTimeout`.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
