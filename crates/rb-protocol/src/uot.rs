@@ -157,3 +157,61 @@ impl PacketConn for UotPacketConn {
         writer.flush().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_round_trip() {
+        let request = Request { is_connect: true, destination: Socksaddr::from_host_port("example.com", 53) };
+        let encoded = request.encode().unwrap();
+        assert_eq!(encoded[..3], [1, 3, 11]);
+        assert_eq!(Request::read(&mut &encoded[..]).await.unwrap(), request);
+    }
+
+    #[tokio::test]
+    async fn packets_both_modes() {
+        for is_connect in [false, true] {
+            let destination = Socksaddr::from_host_port("1.2.3.4", 53);
+            let request = Request { is_connect, destination: destination.clone() };
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let client = UotPacketConn::client(Box::new(client), VERSION, request.clone()).await.unwrap();
+            let mut server: BoxStream = Box::new(server);
+            assert_eq!(Request::read(&mut server).await.unwrap(), request);
+            let server = UotPacketConn::new(server, request);
+            let other = Socksaddr::from_host_port("example.com", 443);
+            let target = if is_connect { destination.clone() } else { other.clone() };
+            client.write_packet(b"one", &target).await.unwrap();
+            client.write_packet(&[7u8; 3000], &target).await.unwrap();
+            let mut buffer = [0u8; 4096];
+            assert_eq!(server.read_packet(&mut buffer).await.unwrap(), (3, target.clone()));
+            assert_eq!(&buffer[..3], b"one");
+            assert_eq!(server.read_packet(&mut buffer).await.unwrap(), (3000, target.clone()));
+            server.write_packet(b"back", &target).await.unwrap();
+            assert_eq!(client.read_packet(&mut buffer).await.unwrap(), (4, target));
+        }
+        // Version 1 sends no request and always carries addresses.
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let request = Request { is_connect: true, destination: Socksaddr::from_host_port("1.2.3.4", 53) };
+        let client = UotPacketConn::client(Box::new(client), LEGACY_VERSION, request).await.unwrap();
+        let server = UotPacketConn::new(
+            Box::new(server),
+            Request { is_connect: false, destination: Socksaddr::from_host_port("0.0.0.0", 0) },
+        );
+        let target = Socksaddr::from_host_port("::1", 80);
+        client.write_packet(b"v1", &target).await.unwrap();
+        let mut buffer = [0u8; 16];
+        assert_eq!(server.read_packet(&mut buffer).await.unwrap(), (2, target));
+        let (bad, _) = tokio::io::duplex(16);
+        let error = UotPacketConn::client(
+            Box::new(bad),
+            3,
+            Request { is_connect: false, destination: Socksaddr::from_host_port("0.0.0.0", 0) },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "unknown protocol version: 3");
+    }
+}
