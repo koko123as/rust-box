@@ -50,13 +50,23 @@ fn action_has_strategy(action: Option<&DnsRuleAction>) -> bool {
 
 /// `defaultRuleNeedsLegacyDNSModeFromAddressFilter`.
 fn needs_legacy_from_address_filter(rule: &DnsRuleMatch) -> bool {
-    rule.rule_set_ip_cidr_accept_empty || rule.ip_accept_any || !rule.ip_cidr.is_empty() || rule.ip_is_private
+    rule.rule_set_ip_cidr_accept_empty
+        || (!rule.match_response.enabled && (rule.ip_accept_any || !rule.ip_cidr.is_empty() || rule.ip_is_private))
 }
 
-/// `defaultRuleDisablesLegacyDNSMode` (rust-box has no `match_response`,
-/// response fields, `evaluate` or `respond` yet).
+fn has_response_fields(rule: &DnsRuleMatch) -> bool {
+    rule.response_rcode.is_some()
+        || !rule.response_answer.is_empty()
+        || !rule.response_ns.is_empty()
+        || !rule.response_extra.is_empty()
+}
+
+/// `defaultRuleDisablesLegacyDNSMode`.
 fn disables_legacy(rule: &DnsRuleMatch) -> bool {
-    rule.ip_version.is_some_and(|version| version > 0) || !rule.query_type.is_empty()
+    rule.match_response.enabled
+        || has_response_fields(rule)
+        || rule.ip_version.is_some_and(|version| version > 0)
+        || !rule.query_type.is_empty()
 }
 
 fn rule_flags(rule: &DnsRule, lookup: &MetadataLookup) -> Result<ModeFlags, String> {
@@ -110,7 +120,12 @@ const RESPONSE_FIELDS_ERROR: &str = "Response Match Fields (ip_cidr, ip_is_priva
 fn validate_disabled_tree(rule: &DnsRule, lookup: &MetadataLookup) -> Result<(), String> {
     match rule {
         Rule::Default { matcher, .. } => {
-            if !matcher.ip_cidr.is_empty() || matcher.ip_is_private || matcher.ip_accept_any {
+            if (has_response_fields(matcher)
+                || !matcher.ip_cidr.is_empty()
+                || matcher.ip_is_private
+                || matcher.ip_accept_any)
+                && !matcher.match_response.enabled
+            {
                 return Err(RESPONSE_FIELDS_ERROR.into());
             }
             for tag in matcher.rule_set.iter() {

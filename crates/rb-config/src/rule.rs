@@ -119,7 +119,98 @@ pub struct DnsRuleMatch {
     #[serde(default)]
     pub ip_accept_any: bool,
     #[serde(default)]
+    pub match_response: DnsMatchResponse,
+    #[serde(default)]
+    pub response_rcode: Option<DnsResponseCode>,
+    #[serde(default)]
+    pub response_answer: Listable<DnsRecordOptions>,
+    #[serde(default)]
+    pub response_ns: Listable<DnsRecordOptions>,
+    #[serde(default)]
+    pub response_extra: Listable<DnsRecordOptions>,
+    #[serde(default)]
     pub invert: bool,
+}
+
+/// sing-box DNS `match_response`: false disables it, true selects the latest
+/// anonymous evaluate response, and a string selects an evaluated tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DnsMatchResponse {
+    pub enabled: bool,
+    pub tag: String,
+}
+
+impl<'de> Deserialize<'de> for DnsMatchResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(enabled) => Ok(Self { enabled, tag: String::new() }),
+            Value::String(tag) if tag.is_empty() => Err(de::Error::custom("empty match_response tag")),
+            Value::String(tag) => Ok(Self { enabled: true, tag }),
+            _ => Err(de::Error::custom("invalid match_response value")),
+        }
+    }
+}
+
+/// A DNS response code, accepted as either an integer or the IANA mnemonic
+/// used by sing-box (for example, `NOERROR` or `NXDOMAIN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsResponseCode(pub i32);
+
+impl<'de> Deserialize<'de> for DnsResponseCode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Number(number) => number
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .map(Self)
+                .ok_or_else(|| de::Error::custom("invalid DNS response code")),
+            Value::String(name) => {
+                rcode_from_name(&name).map(Self).ok_or_else(|| de::Error::custom(format!("unknown rcode: {name}")))
+            }
+            _ => Err(de::Error::custom("invalid DNS response code")),
+        }
+    }
+}
+
+fn rcode_from_name(name: &str) -> Option<i32> {
+    Some(match name {
+        "NOERROR" => 0,
+        "FORMERR" => 1,
+        "SERVFAIL" => 2,
+        "NXDOMAIN" => 3,
+        "NOTIMP" => 4,
+        "REFUSED" => 5,
+        "YXDOMAIN" => 6,
+        "YXRRSET" => 7,
+        "NXRRSET" => 8,
+        "NOTAUTH" => 9,
+        "NOTZONE" => 10,
+        "DSOTYPENI" => 11,
+        "BADVERS" | "BADSIG" => 16,
+        "BADKEY" => 17,
+        "BADTIME" => 18,
+        "BADMODE" => 19,
+        "BADNAME" => 20,
+        "BADALG" => 21,
+        "BADTRUNC" => 22,
+        "BADCOOKIE" => 23,
+        _ => return None,
+    })
+}
+
+/// A DNS resource-record matcher. The raw zone-format or base64 form is kept
+/// for the DNS rule compiler to validate and compare against response records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRecordOptions(pub String);
+
+impl<'de> Deserialize<'de> for DnsRecordOptions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.trim().is_empty() {
+            return Err(de::Error::custom("empty DNS record"));
+        }
+        Ok(Self(value))
+    }
 }
 
 /// sing-box `LogicalRule.mode`.
@@ -576,5 +667,36 @@ mod tests {
         let Rule::Default { matcher, action } = rule else { panic!() };
         assert_eq!(matcher.query_type.0.len(), 2);
         assert!(matches!(action, Some(DnsRuleAction::Route { ref server, .. }) if server == "local"));
+    }
+
+    #[test]
+    fn dns_response_match_fields() {
+        let rule: DnsRule = serde_json::from_str(
+            r#"{"domain":"example.com","match_response":true,"response_rcode":"NXDOMAIN",
+                "response_answer":["example.com. 60 IN A 192.0.2.1"],"action":"reject"}"#,
+        )
+        .unwrap();
+        let Rule::Default { matcher, .. } = rule else { panic!() };
+        assert_eq!(matcher.match_response, DnsMatchResponse { enabled: true, tag: String::new() });
+        assert_eq!(matcher.response_rcode, Some(DnsResponseCode(3)));
+        assert_eq!(matcher.response_answer.0[0].0, "example.com. 60 IN A 192.0.2.1");
+
+        let tagged: DnsRule = serde_json::from_str(r#"{"match_response":"lookup","action":"reject"}"#).unwrap();
+        let Rule::Default { matcher, .. } = tagged else { panic!() };
+        assert_eq!(matcher.match_response, DnsMatchResponse { enabled: true, tag: "lookup".into() });
+
+        let disabled: DnsRule = serde_json::from_str(r#"{"match_response":false,"action":"reject"}"#).unwrap();
+        let Rule::Default { matcher, .. } = disabled else { panic!() };
+        assert!(!matcher.match_response.enabled);
+
+        for (json, expected) in [
+            (r#"{"match_response":"","action":"reject"}"#, "empty match_response tag"),
+            (r#"{"match_response":1,"action":"reject"}"#, "invalid match_response value"),
+            (r#"{"response_rcode":"unknown","action":"reject"}"#, "unknown rcode"),
+            (r#"{"unexpected_response":true,"action":"reject"}"#, "unexpected_response"),
+        ] {
+            let error = serde_json::from_str::<DnsRule>(json).unwrap_err();
+            assert!(error.to_string().contains(expected), "{json}: {error}");
+        }
     }
 }
