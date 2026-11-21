@@ -24,7 +24,7 @@ use rb_adapter::{
     BoxStream, ConnectionRouter, Inbound, InboundContext, Network, Outbound, PacketConn, PrefixedStream, RouteError,
     SharedPacketConn, Socksaddr,
 };
-use rb_config::{TrojanInbound as InboundOptions, TrojanOutbound as OutboundOptions, V2RayWebSocketOptions};
+use rb_config::{TrojanInbound as InboundOptions, TrojanOutbound as OutboundOptions};
 use rb_dialer::listener::Listener;
 use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
 use sha2::{Digest, Sha224};
@@ -166,7 +166,8 @@ pub struct TrojanOutbound {
     dialer: Arc<dyn Dialer>,
     server: Socksaddr,
     key: [u8; KEY_LENGTH],
-    transport: Option<V2RayWebSocketOptions>,
+    transport: Option<crate::v2ray::StreamTransport>,
+    tls_server_name: Option<String>,
     networks: Vec<Network>,
     /// The sing-mux client when `multiplex` is enabled.
     mux: Option<rb_mux::Client>,
@@ -181,7 +182,8 @@ impl TrojanOutbound {
         certificates: &Arc<rb_certificate::Store>,
     ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
-        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
+        let mut tls_server_name = None;
         let mut dialer = new_outbound_dialer(
             &options.dialer_options(),
             server.domain().is_some(),
@@ -190,7 +192,8 @@ impl TrojanOutbound {
         )?;
         if let Some(tls) = options.tls.as_ref().filter(|tls| tls.enabled) {
             let client = rb_tls::TlsClient::new(tls, &options.server, certificates)?;
-            let client = if transport.is_some() { crate::v2ray::websocket_tls_client(client) } else { client };
+            tls_server_name = Some(client.server_name().to_owned());
+            let client = if transport.is_some() { crate::v2ray::transport_tls_client(client) } else { client };
             dialer = Arc::new(rb_tls::TlsDialer::new(dialer, client));
         }
         let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
@@ -206,6 +209,7 @@ impl TrojanOutbound {
             server,
             key: key(&options.password),
             transport,
+            tls_server_name,
             networks,
             mux: crate::multiplex::new_client(this, multiplex),
         }))
@@ -216,8 +220,9 @@ impl TrojanOutbound {
     /// multiplex client dials its sessions with this.
     pub async fn connect(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
         let mut stream = self.dialer.dial_tcp(&self.server).await?;
-        if let Some(options) = &self.transport {
-            stream = crate::v2ray::websocket::client(stream, &self.server, options).await?;
+        if let Some(transport) = &self.transport {
+            stream = crate::v2ray::transport_client(stream, &self.server, transport, self.tls_server_name.as_deref())
+                .await?;
         }
         let request =
             encode_request(&self.key, COMMAND_TCP, destination, &[]).map_err(|error| cause(error, "write request"))?;
@@ -230,8 +235,9 @@ impl TrojanOutbound {
     /// packet).
     pub async fn connect_packet(&self) -> io::Result<TrojanPacketConn> {
         let mut stream = self.dialer.dial_tcp(&self.server).await?;
-        if let Some(options) = &self.transport {
-            stream = crate::v2ray::websocket::client(stream, &self.server, options).await?;
+        if let Some(transport) = &self.transport {
+            stream = crate::v2ray::transport_client(stream, &self.server, transport, self.tls_server_name.as_deref())
+                .await?;
         }
         Ok(TrojanPacketConn::client(stream, self.key))
     }
@@ -280,7 +286,7 @@ pub struct TrojanInbound {
     names: Vec<String>,
     keys: HashMap<[u8; KEY_LENGTH], usize>,
     tls: Option<rb_tls::TlsServer>,
-    transport: Option<V2RayWebSocketOptions>,
+    transport: Option<crate::v2ray::StreamTransport>,
     /// Whether unauthenticated connections go to a fallback at all.
     fallback_enabled: bool,
     fallback: Option<Socksaddr>,
@@ -298,9 +304,9 @@ pub struct TrojanInbound {
 impl TrojanInbound {
     /// sing-box `trojan.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
-        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
-            Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
+            Some(tls) => Some(crate::v2ray::transport_tls_server(tls, transport.as_ref())?),
             None => None,
         };
         let fallback = options
@@ -373,10 +379,14 @@ impl TrojanInbound {
             None => (stream, None),
         };
         let stream = match &self.transport {
-            Some(options) => match crate::v2ray::websocket::server(stream, options).await {
+            Some(transport) => match crate::v2ray::transport_server(stream, transport).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    error!("{}: process connection from {source}: WebSocket handshake: {error}", self.log_prefix());
+                    error!(
+                        "{}: process connection from {source}: {} handshake: {error}",
+                        self.log_prefix(),
+                        transport.log_name()
+                    );
                     return;
                 }
             },

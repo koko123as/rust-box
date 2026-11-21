@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{BoxStream, ConnectionRouter, Inbound, InboundContext, Network, SharedPacketConn, Socksaddr};
-use rb_config::{V2RayWebSocketOptions, VmessInbound as InboundOptions};
+use rb_config::VmessInbound as InboundOptions;
 use rb_dialer::listener::Listener;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
@@ -27,7 +27,7 @@ pub struct VmessInbound {
     routing: Arc<Routing>,
     users: Arc<ServerUsers>,
     tls: Option<rb_tls::TlsServer>,
-    transport: Option<V2RayWebSocketOptions>,
+    transport: Option<crate::v2ray::StreamTransport>,
     detour: Option<String>,
     local_addr: OnceLock<SocketAddr>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -36,12 +36,12 @@ pub struct VmessInbound {
 impl VmessInbound {
     /// sing-box `vmess.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
-        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         let users: Vec<([u8; 16], i64)> =
             options.users.iter().map(|user| (parse_uuid(&user.uuid), user.alter_id)).collect();
         let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
-            Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
+            Some(tls) => Some(crate::v2ray::transport_tls_server(tls, transport.as_ref())?),
             None => None,
         };
         let listen = options.listen_options();
@@ -81,11 +81,15 @@ impl VmessInbound {
             },
             None => stream,
         };
-        if let Some(options) = &self.transport {
-            stream = match crate::v2ray::websocket::server(stream, options).await {
+        if let Some(transport) = &self.transport {
+            stream = match crate::v2ray::transport_server(stream, transport).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    error!("{}: process connection from {source}: WebSocket handshake: {error}", self.log_prefix());
+                    error!(
+                        "{}: process connection from {source}: {} handshake: {error}",
+                        self.log_prefix(),
+                        transport.log_name()
+                    );
                     return;
                 }
             };

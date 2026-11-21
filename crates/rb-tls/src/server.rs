@@ -166,6 +166,15 @@ impl TlsServer {
         })
     }
 
+    /// Supplies transport ALPN protocols only when none were configured.
+    pub fn new_with_default_alpn(options: &InboundTlsOptions, default_alpn: &[&str]) -> Result<Self, String> {
+        let mut options = options.clone();
+        if options.alpn.0.is_empty() {
+            options.alpn.0 = default_alpn.iter().map(|protocol| (*protocol).to_owned()).collect();
+        }
+        Self::new(&options)
+    }
+
     /// The ALPN protocols offered (sing-box `NextProtos`).
     pub fn alpn(&self) -> Vec<String> {
         self.inner.options.alpn.0.clone()

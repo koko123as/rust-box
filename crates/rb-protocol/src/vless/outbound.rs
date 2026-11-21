@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rb_adapter::{BoxStream, InboundContext, Network, Outbound, SharedPacketConn, Socksaddr};
-use rb_config::{V2RayWebSocketOptions, VlessOutbound as OutboundOptions};
+use rb_config::VlessOutbound as OutboundOptions;
 use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
 
 use super::packet::{PacketAddrConn, VlessPacketConn, XudpPacketConn, PACKET_ADDR_MAGIC};
@@ -34,7 +34,7 @@ pub struct VlessOutbound {
     tag: String,
     dialer: Arc<dyn Dialer>,
     tls: Option<rb_tls::TlsClient>,
-    transport: Option<V2RayWebSocketOptions>,
+    transport: Option<crate::v2ray::StreamTransport>,
     server: Socksaddr,
     uuid: [u8; 16],
     vision: bool,
@@ -69,7 +69,7 @@ impl VlessOutbound {
         certificates: &Arc<rb_certificate::Store>,
     ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
-        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let dialer = new_outbound_dialer(
             &options.dialer_options(),
             server.domain().is_some(),
@@ -80,7 +80,7 @@ impl VlessOutbound {
             Some(tls) => Some(rb_tls::TlsClient::new(tls, &options.server, certificates)?),
             None => None,
         };
-        let tls = if transport.is_some() { tls.map(crate::v2ray::websocket_tls_client) } else { tls };
+        let tls = if transport.is_some() { tls.map(crate::v2ray::transport_tls_client) } else { tls };
         let packet_encoding = match options.packet_encoding.as_deref() {
             None | Some("xudp") => PacketEncoding::Xudp,
             Some("") => PacketEncoding::None,
@@ -116,7 +116,7 @@ impl VlessOutbound {
 
     async fn dial_server(&self) -> io::Result<ServerConn> {
         let stream = self.dialer.dial_tcp(&self.server).await?;
-        let conn = match &self.tls {
+        let mut conn = match &self.tls {
             Some(tls) => {
                 // Vision needs the raw bytes past the current TLS record
                 // kept out of rustls.
@@ -131,9 +131,36 @@ impl VlessOutbound {
             }
             None => ServerConn::Plain(stream),
         };
-        if let Some(options) = &self.transport {
-            let stream = crate::v2ray::websocket::client(conn.boxed(), &self.server, options).await?;
-            return Ok(ServerConn::Plain(stream));
+        if let Some(transport) = &self.transport {
+            match transport {
+                crate::v2ray::StreamTransport::WebSocket(options) => {
+                    let stream = crate::v2ray::websocket::client(conn.boxed(), &self.server, options).await?;
+                    return Ok(ServerConn::Plain(stream));
+                }
+                crate::v2ray::StreamTransport::HttpUpgrade(options) => {
+                    let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
+                    match &mut conn {
+                        ServerConn::Tls(stream, _) => {
+                            crate::v2ray::httpupgrade::client_in_place(
+                                &mut *stream,
+                                &self.server,
+                                options,
+                                tls_server_name,
+                            )
+                            .await?;
+                        }
+                        ServerConn::Plain(stream) => {
+                            crate::v2ray::httpupgrade::client_in_place(
+                                &mut *stream,
+                                &self.server,
+                                options,
+                                tls_server_name,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
         }
         Ok(conn)
     }
@@ -156,11 +183,13 @@ impl VlessOutbound {
         let request = self.request(COMMAND_TCP, destination)?;
         if self.vision {
             let ServerConn::Tls(tls, gate) = conn else {
-                return Err(io::Error::other(if self.transport.is_some() {
-                    VISION_WITH_WEBSOCKET
-                } else {
-                    VISION_WITHOUT_TLS
-                }));
+                return Err(io::Error::other(
+                    if self.transport.as_ref().is_some_and(|transport| transport.is_websocket()) {
+                        VISION_WITH_WEBSOCKET
+                    } else {
+                        VISION_WITHOUT_TLS
+                    },
+                ));
             };
             let mut stream = VisionStream::new(VlessStream::client(*tls, request), self.uuid, gate);
             stream.kick().await?;
@@ -189,11 +218,13 @@ impl VlessOutbound {
                 })?;
                 let stream: BoxStream = if self.vision {
                     let ServerConn::Tls(tls, gate) = conn else {
-                        return Err(io::Error::other(if self.transport.is_some() {
-                            VISION_WITH_WEBSOCKET
-                        } else {
-                            VISION_WITHOUT_TLS
-                        }));
+                        return Err(io::Error::other(
+                            if self.transport.as_ref().is_some_and(|transport| transport.is_websocket()) {
+                                VISION_WITH_WEBSOCKET
+                            } else {
+                                VISION_WITHOUT_TLS
+                            },
+                        ));
                     };
                     let mut vless = VlessStream::client(*tls, request);
                     vless.write_header().await?;

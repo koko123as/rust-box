@@ -13,7 +13,7 @@ use rb_adapter::{
     BoxStream, CachedPacketConn, ConnectionRouter, Inbound, InboundContext, Network, RouteError, SharedPacketConn,
     Socksaddr, MAX_PACKET_SIZE,
 };
-use rb_config::{V2RayWebSocketOptions, VlessInbound as InboundOptions};
+use rb_config::VlessInbound as InboundOptions;
 use rb_dialer::listener::Listener;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -234,7 +234,7 @@ pub struct VlessInbound {
     users: HashMap<[u8; 16], usize>,
     flows: Vec<String>,
     tls: Option<rb_tls::TlsServer>,
-    transport: Option<V2RayWebSocketOptions>,
+    transport: Option<crate::v2ray::StreamTransport>,
     /// Whether TLS runs over a [`RecordStream`] (some user has Vision).
     record_stream: bool,
     detour: Option<String>,
@@ -245,7 +245,7 @@ pub struct VlessInbound {
 impl VlessInbound {
     /// sing-box `vless.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
-        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         // sing-vmess `UpdateUsers`: a later user with the same id wins.
         let mut users = HashMap::new();
@@ -253,7 +253,7 @@ impl VlessInbound {
             users.insert(protocol::parse_uuid(&user.uuid), index);
         }
         let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
-            Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
+            Some(tls) => Some(crate::v2ray::transport_tls_server(tls, transport.as_ref())?),
             None => None,
         };
         let listen = options.listen_options();
@@ -306,7 +306,7 @@ impl VlessInbound {
             None => ClientConn::Plain(stream),
         };
         let conn = match (&self.transport, conn) {
-            (Some(options), conn) => {
+            (Some(crate::v2ray::StreamTransport::WebSocket(options)), conn) => {
                 let stream = match crate::v2ray::websocket::server(conn.boxed(), options).await {
                     Ok(stream) => stream,
                     Err(error) => {
@@ -315,6 +315,27 @@ impl VlessInbound {
                     }
                 };
                 ClientConn::Transport(stream)
+            }
+            (Some(crate::v2ray::StreamTransport::HttpUpgrade(options)), conn) => {
+                let (conn, result) = match conn {
+                    ClientConn::Tls(mut stream, gate) => {
+                        let result = crate::v2ray::httpupgrade::server_in_place(&mut *stream, options).await;
+                        (ClientConn::Tls(stream, gate), result)
+                    }
+                    ClientConn::Plain(mut stream) => {
+                        let result = crate::v2ray::httpupgrade::server_in_place(&mut *stream, options).await;
+                        (ClientConn::Plain(stream), result)
+                    }
+                    ClientConn::Transport(mut stream) => {
+                        let result = crate::v2ray::httpupgrade::server_in_place(&mut *stream, options).await;
+                        (ClientConn::Transport(stream), result)
+                    }
+                };
+                if let Err(error) = result {
+                    error!("{}: process connection from {source}: HTTPUpgrade handshake: {error}", self.log_prefix());
+                    return;
+                }
+                conn
             }
             (None, conn) => conn,
         };

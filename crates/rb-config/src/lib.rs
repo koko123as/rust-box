@@ -648,7 +648,7 @@ with_dial_fields! {
 }
 
 /// The `tls`, `multiplex` and `transport` checks of the trojan, vless and
-/// vmess outbounds: non-WebSocket V2Ray transports are not implemented yet.
+/// vmess outbounds: WebSocket and HTTPUpgrade are supported transports.
 fn check_proxy_outbound(
     path: &str,
     tls: Option<&OutboundTlsOptions>,
@@ -684,12 +684,13 @@ fn check_v2ray_transport(path: &str, transport: Option<&V2RayTransportOptions>) 
             format!("{path}.early_data_header_name"),
             "`early_data_header_name` is not supported by rust-box yet".into(),
         )),
+        V2RayTransportConfig::HttpUpgrade(_) => Ok(()),
         _ => Err(field(path.to_string(), "`transport` is not supported by rust-box yet".into())),
     }
 }
 
-/// A V2Ray transport configuration. WebSocket is wired into the proxy
-/// protocols; other transport types are rejected with their field path.
+/// A V2Ray transport configuration. WebSocket and HTTPUpgrade are wired into
+/// the proxy protocols; other transport types are rejected with their path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct V2RayTransportOptions {
     pub r#type: String,
@@ -820,7 +821,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// WebSocket is supported; other V2Ray transport types are rejected.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -871,7 +872,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// WebSocket is supported; other V2Ray transport types are rejected.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -909,7 +910,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// WebSocket is supported; other V2Ray transport types are rejected.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -937,7 +938,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// WebSocket is supported; other V2Ray transport types are rejected.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
         /// `xudp` (the default when absent), `packetaddr`, or empty for
@@ -962,7 +963,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// WebSocket is supported; other V2Ray transport types are rejected.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -1016,7 +1017,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// WebSocket is supported; other V2Ray transport types are rejected.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -2128,12 +2129,8 @@ mod tests {
                 "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true,"protocol":"smux","brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
                 "outbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
-            ),
-            (
-                r#"{"outbounds":[{"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
-                "outbounds[0].transport: `transport` is not supported by rust-box yet",
             ),
             (
                 r#"{"outbounds":[{"type":"vmess","transport":{"type":"ws","max_early_data":1}}]}"#,
@@ -2230,6 +2227,23 @@ mod tests {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(needle), "{config}: {error}");
         }
+    }
+
+    #[test]
+    fn httpupgrade_transport_is_accepted_for_proxy_protocols() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"trojan","transport":{"type":"httpupgrade","host":"t.test"}},
+                  {"type":"vless","transport":{"type":"httpupgrade","path":"/v"}},
+                  {"type":"vmess","transport":{"type":"httpupgrade"}}],
+                "outbounds":[
+                  {"type":"trojan","transport":{"type":"httpupgrade"}},
+                  {"type":"vless","transport":{"type":"httpupgrade"}},
+                  {"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.inbounds.len(), 3);
+        assert_eq!(options.outbounds.len(), 3);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rb_adapter::{BoxStream, InboundContext, Network, Outbound, SharedPacketConn, Socksaddr};
-use rb_config::{V2RayWebSocketOptions, VmessOutbound as OutboundOptions};
+use rb_config::VmessOutbound as OutboundOptions;
 use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
 
 use super::protocol::{self, COMMAND_MUX, COMMAND_TCP, COMMAND_UDP};
@@ -28,7 +28,7 @@ pub struct VmessOutbound {
     tag: String,
     dialer: Arc<dyn Dialer>,
     tls: Option<rb_tls::TlsClient>,
-    transport: Option<V2RayWebSocketOptions>,
+    transport: Option<crate::v2ray::StreamTransport>,
     server: Socksaddr,
     client: ClientConfig,
     packet_encoding: VmessPacketEncoding,
@@ -46,7 +46,7 @@ impl VmessOutbound {
         certificates: &Arc<rb_certificate::Store>,
     ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
-        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let dialer = new_outbound_dialer(
             &options.dialer_options(),
             server.domain().is_some(),
@@ -57,7 +57,7 @@ impl VmessOutbound {
             Some(tls) => Some(rb_tls::TlsClient::new(tls, &options.server, certificates)?),
             None => None,
         };
-        let tls = if transport.is_some() { tls.map(crate::v2ray::websocket_tls_client) } else { tls };
+        let tls = if transport.is_some() { tls.map(crate::v2ray::transport_tls_client) } else { tls };
         let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
         let packet_encoding = match options.packet_encoding.as_str() {
             "" => VmessPacketEncoding::None,
@@ -102,8 +102,9 @@ impl VmessOutbound {
             Some(tls) => Box::new(tls.handshake(stream).await?),
             None => stream,
         };
-        if let Some(options) = &self.transport {
-            stream = crate::v2ray::websocket::client(stream, &self.server, options).await?;
+        if let Some(transport) = &self.transport {
+            let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
+            stream = crate::v2ray::transport_client(stream, &self.server, transport, tls_server_name).await?;
         }
         Ok(stream)
     }

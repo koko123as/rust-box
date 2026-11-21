@@ -13,7 +13,7 @@ use http::header::{CONNECTION, HOST, UPGRADE, USER_AGENT};
 use http::{HeaderName, HeaderValue};
 use rb_adapter::{BoxStream, PrefixedStream, Socksaddr};
 use rb_config::{V2RayHeaders, V2RayHttpUpgradeOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const HANDSHAKE_TIMEOUT: Duration = rb_tls::DEFAULT_HANDSHAKE_TIMEOUT;
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
@@ -60,6 +60,51 @@ async fn client_inner(
     Ok(Box::new(PrefixedStream::new(prefix, stream)))
 }
 
+/// Performs an HTTPUpgrade client handshake without replacing the stream
+/// object. Reading one byte at a time leaves following TLS plaintext in the
+/// TLS stream, which VLESS Vision must continue to access as a TLS stream.
+pub async fn client_in_place<S>(
+    stream: &mut S,
+    server: &Socksaddr,
+    options: &V2RayHttpUpgradeOptions,
+    tls_server_name: Option<&str>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, client_in_place_inner(stream, server, options, tls_server_name))
+        .await
+        .map_err(|_| handshake_timeout())?
+}
+
+async fn client_in_place_inner<S>(
+    stream: &mut S,
+    server: &Socksaddr,
+    options: &V2RayHttpUpgradeOptions,
+    tls_server_name: Option<&str>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let request = client_request(server, options, tls_server_name)?;
+    stream.write_all(&request).await?;
+    stream.flush().await?;
+    let head = read_http_head_in_place(stream).await?;
+    let response = parse_response(&head)?;
+    if response.status != 101
+        || !response.connection.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(b"upgrade"))
+        || !response.upgrade.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(b"websocket"))
+    {
+        let status = if response.reason.is_empty() {
+            response.status.to_string()
+        } else {
+            format!("{} {}", response.status, response.reason)
+        };
+        return Err(protocol_error(format!("unexpected status: {status}")));
+    }
+    Ok(())
+}
+
 /// Accepts a V2Ray HTTPUpgrade request and returns the unframed TCP stream.
 pub async fn server(stream: BoxStream, options: &V2RayHttpUpgradeOptions) -> io::Result<BoxStream> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, server_inner(stream, options)).await.map_err(|_| handshake_timeout())?
@@ -103,7 +148,69 @@ async fn server_inner(stream: BoxStream, options: &V2RayHttpUpgradeOptions) -> i
     Ok(Box::new(PrefixedStream::new(prefix, stream)))
 }
 
+/// Accepts an HTTPUpgrade request without replacing the stream object.
+pub async fn server_in_place<S>(stream: &mut S, options: &V2RayHttpUpgradeOptions) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, server_in_place_inner(stream, options))
+        .await
+        .map_err(|_| handshake_timeout())?
+}
+
+async fn server_in_place_inner<S>(stream: &mut S, options: &V2RayHttpUpgradeOptions) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let head = read_http_head_in_place(stream).await?;
+    let request = match parse_request(&head) {
+        Ok(request) => request,
+        Err(error) => return reject_in_place(stream, 400, format!("invalid request: {error}")).await,
+    };
+    let path = match decoded_path(&request.target) {
+        Ok(path) => path,
+        Err(error) => return reject_in_place(stream, 400, format!("invalid request path: {error}")).await,
+    };
+    if !options.host.is_empty() && request.host.as_deref() != Some(options.host.as_bytes()) {
+        return reject_in_place(stream, 400, format!("bad host: {}", display_header(request.host.as_deref()))).await;
+    }
+    if path != normalized_path(&options.path) {
+        return reject_in_place(stream, 404, format!("bad path: {path}")).await;
+    }
+    if request.method != "GET" {
+        return reject_in_place(stream, 404, format!("bad method: {}", request.method)).await;
+    }
+    if !request.connection.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(b"upgrade")) {
+        return reject_in_place(stream, 404, "not an upgrade request".into()).await;
+    }
+    if !request.upgrade.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(b"websocket")) {
+        return reject_in_place(stream, 404, "not a websocket request".into()).await;
+    }
+    if request.websocket_key.as_deref().is_some_and(|value| !value.is_empty()) {
+        return reject_in_place(stream, 404, "real websocket request received".into()).await;
+    }
+
+    let _configured_headers = &options.headers;
+    stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n").await?;
+    stream.flush().await
+}
+
 async fn reject(mut stream: BoxStream, status: u16, message: String) -> io::Result<BoxStream> {
+    let reason = match status {
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    let response = format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+    Err(protocol_error(message))
+}
+
+async fn reject_in_place<S>(stream: &mut S, status: u16, message: String) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     let reason = match status {
         400 => "Bad Request",
         404 => "Not Found",
@@ -301,6 +408,29 @@ async fn read_http_head(mut stream: BoxStream) -> io::Result<(Vec<u8>, Vec<u8>, 
     }
 }
 
+async fn read_http_head_in_place<S>(stream: &mut S) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    let mut buffer = Vec::with_capacity(READ_CHUNK_SIZE);
+    let mut byte = [0u8; 1];
+    loop {
+        if stream.read(&mut byte).await? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "HTTPUpgrade: connection closed during handshake",
+            ));
+        }
+        buffer.push(byte[0]);
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(protocol_error("HTTP headers too large"));
+        }
+        if buffer.ends_with(b"\r\n\r\n") {
+            return Ok(buffer);
+        }
+    }
+}
+
 fn header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|position| position + 4)
 }
@@ -444,6 +574,30 @@ mod tests {
         assert_eq!(response.connection.as_deref(), Some(b"upgrade".as_slice()));
         assert_eq!(response.upgrade.as_deref(), Some(b"websocket".as_slice()));
         assert_eq!(&server_task.await.unwrap(), b"\x81\x03hey");
+    }
+
+    #[tokio::test]
+    async fn in_place_handshakes_keep_the_stream_usable_in_both_directions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let options = V2RayHttpUpgradeOptions { path: "/proxy".into(), ..Default::default() };
+        let server_options = options.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_in_place(&mut stream, &server_options).await.unwrap();
+            stream.write_all(b"server").await.unwrap();
+            let mut payload = [0u8; 6];
+            stream.read_exact(&mut payload).await.unwrap();
+            payload
+        });
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        client_in_place(&mut stream, &Socksaddr::from(address), &options, None).await.unwrap();
+        stream.write_all(b"client").await.unwrap();
+        let mut payload = [0u8; 6];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"server");
+        assert_eq!(&server_task.await.unwrap(), b"client");
     }
 
     #[test]

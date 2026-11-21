@@ -42,6 +42,18 @@ fn server_options(pki: &TestPki) -> InboundTlsOptions {
     InboundTlsOptions { enabled: true, certificate: lines(&pki.cert), key: lines(&pki.key), ..Default::default() }
 }
 
+#[test]
+fn server_default_alpn_is_used_only_when_unconfigured() {
+    let pki = pki(&["example.test"]);
+    let mut options = server_options(&pki);
+    let defaulted = TlsServer::new_with_default_alpn(&options, &["http/1.1"]).unwrap();
+    assert_eq!(defaulted.alpn(), ["http/1.1"]);
+
+    options.alpn = Listable(vec!["h2".into()]);
+    let explicit = TlsServer::new_with_default_alpn(&options, &["http/1.1"]).unwrap();
+    assert_eq!(explicit.alpn(), ["h2"]);
+}
+
 fn client_options(pki: &TestPki) -> OutboundTlsOptions {
     OutboundTlsOptions { enabled: true, certificate: lines(&pki.ca), ..Default::default() }
 }
