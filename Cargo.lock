@@ -1068,6 +1068,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-rule-set"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flate2",
+ "httparse",
+ "rb-adapter",
+ "rb-certificate",
+ "rb-config",
+ "rb-dialer",
+ "rb-fswatch",
+ "rb-rule",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1126,12 +1148,16 @@ dependencies = [
  "anyhow",
  "clap",
  "rb-adapter",
+ "rb-certificate",
+ "rb-common",
  "rb-config",
  "rb-dialer",
  "rb-dns",
  "rb-protocol",
  "rb-route",
  "rb-rule",
+ "rb-rule-set",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1455,6 +1481,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]
