@@ -271,6 +271,17 @@ pub trait PacketConn: Send + Sync {
     /// the packet's length and address.
     async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)>;
     async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()>;
+
+    /// The local UDP socket address, when the underlying packet connection
+    /// exposes one.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// The connected UDP peer, when the packet connection has one.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 pub type SharedPacketConn = Arc<dyn PacketConn>;
@@ -302,6 +313,14 @@ impl PacketConn for CachedPacketConn {
 
     async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
         self.inner.write_packet(data, address).await
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
     }
 }
 

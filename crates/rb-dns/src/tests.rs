@@ -120,6 +120,35 @@ fn dot_server_defaults_to_853_and_requires_explicit_domain_resolver() {
 }
 
 #[test]
+fn doq_server_defaults_to_853_and_sets_default_alpn() {
+    let dns = router(
+        r#"{"servers":[{"type":"local","tag":"bootstrap"},
+            {"type":"quic","tag":"doq","server":"dns.example","domain_resolver":"bootstrap"}],
+            "final":"doq"}"#
+            .into(),
+    );
+    let Transport::Doq(doq) = dns.servers.get("doq").unwrap().as_ref() else { panic!() };
+    assert_eq!(doq.server(), &Socksaddr::from_host_port("dns.example", 853));
+    assert_eq!(doq.tls_server_name(), "dns.example");
+    assert_eq!(doq.tls_alpn(), vec!["doq"]);
+
+    let options: rb_config::DnsOptions =
+        serde_json::from_str(r#"{"servers":[{"type":"quic","server":"dns.example"}]}"#).unwrap();
+    let certificates = rb_certificate::Store::new(None).unwrap();
+    let error = match DnsRouter::new(
+        &options,
+        &Default::default(),
+        &rb_adapter::OutboundRegistry::new(),
+        &rb_rule::RuleSets::new(),
+        &certificates,
+    ) {
+        Ok(_) => panic!("domain DoQ server without a resolver must fail during construction"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("missing domain resolver for domain server address"), "{error}");
+}
+
+#[test]
 fn doh_server_defaults_and_uses_host_only_for_http_authority() {
     let dns = router(
         r#"{"servers":[{"type":"local","tag":"bootstrap"},

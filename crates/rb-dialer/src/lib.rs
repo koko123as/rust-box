@@ -443,6 +443,14 @@ impl PacketConn for UdpPacketConn {
         }
         self.socket.send_to(data, socket_address(target, self.dual_stack)).await.map(|_| ())
     }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.socket.local_addr().ok()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.connected
+    }
 }
 
 /// Dials through another outbound (sing-box `dialer.DetourDialer`). The

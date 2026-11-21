@@ -23,7 +23,7 @@ use rb_config::{DnsOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, R
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
 
-pub use transport::{Answer, DohTransport, DotTransport, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
+pub use transport::{Answer, DohTransport, DoqTransport, DotTransport, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
 
 /// sing-box `C.DNSTimeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -206,7 +206,7 @@ impl DnsRouter {
                 DnsServer::Tcp(remote) => {
                     Transport::Tcp((remote.server, port_or_default(remote.server_port)).into(), dialer(remote)?)
                 }
-                DnsServer::Tls(remote) => {
+                DnsServer::Tls(remote) | DnsServer::Quic(remote) => {
                     let address = Socksaddr::from_host_port(&remote.server, port_or_default_dot(remote.server_port));
                     if remote.server.is_empty() {
                         return Err(DnsError(format!("dns.servers[{index}]: invalid server address: {address}")));
@@ -231,16 +231,26 @@ impl DnsRouter {
                         &dial_options,
                         address.domain().is_some(),
                         &environment,
-                        &format!("dns/transport/tls[{tag}]"),
+                        &format!(
+                            "dns/transport/{}[{tag}]",
+                            if matches!(server, DnsServer::Quic(_)) { "quic" } else { "tls" }
+                        ),
                     )
                     .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
                     let mut tls = remote.tls.clone().unwrap_or_default();
                     // sing-box forces TLS on and leaves ALPN empty by default.
                     tls.enabled = true;
+                    if matches!(server, DnsServer::Quic(_)) && tls.alpn.is_empty() {
+                        tls.alpn.0 = vec!["doq".into()];
+                    }
                     let client = rb_tls::TlsClient::new(&tls, &remote.server, certificates)
                         .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
-                    let tls_dialer = Arc::new(rb_tls::TlsDialer::new(remote_dialer, client));
-                    Transport::Dot(Arc::new(DotTransport::new(address, tls_dialer)))
+                    if matches!(server, DnsServer::Quic(_)) {
+                        Transport::Doq(Arc::new(DoqTransport::new(address, remote_dialer, client)))
+                    } else {
+                        let tls_dialer = Arc::new(rb_tls::TlsDialer::new(remote_dialer, client));
+                        Transport::Dot(Arc::new(DotTransport::new(address, tls_dialer)))
+                    }
                 }
                 DnsServer::Https(remote) => {
                     let address = Socksaddr::from_host_port(&remote.server, port_or_default_https(remote.server_port));
