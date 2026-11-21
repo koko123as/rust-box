@@ -98,11 +98,13 @@ async fn run(inner: Option<bool>) -> (bool, bool, bool, bool) {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let stream: BoxStream = Box::new(RecordStream::new(Box::new(stream)));
+        let stream = RecordStream::new(Box::new(stream));
+        let gate = stream.gate();
+        let stream: BoxStream = Box::new(stream);
         let mut tls = server_tls.handshake(stream).await.unwrap();
         let request = protocol::read_request(&mut tls).await.unwrap();
         assert_eq!((request.command, request.flow.as_str()), (COMMAND_TCP, FLOW_VISION));
-        let mut vision = VisionStream::new(VlessStream::server(tls), request.uuid);
+        let mut vision = VisionStream::new(VlessStream::server(tls), request.uuid, gate);
         match inner {
             Some(_) => {
                 let acceptor = tokio_rustls::TlsAcceptor::from(inner_server);
@@ -132,7 +134,9 @@ async fn run(inner: Option<bool>) -> (bool, bool, bool, bool) {
         (vision.is_direct_write(), vision.is_direct_read())
     });
 
-    let stream: BoxStream = Box::new(RecordStream::new(Box::new(TcpStream::connect(address).await.unwrap())));
+    let stream = RecordStream::new(Box::new(TcpStream::connect(address).await.unwrap()));
+    let gate = stream.gate();
+    let stream: BoxStream = Box::new(stream);
     let tls = client_tls.handshake(stream).await.unwrap();
     let request = protocol::encode_request(&Request {
         uuid,
@@ -141,7 +145,7 @@ async fn run(inner: Option<bool>) -> (bool, bool, bool, bool) {
         flow: FLOW_VISION.into(),
     })
     .unwrap();
-    let mut vision = VisionStream::new(VlessStream::client(tls, request), uuid);
+    let mut vision = VisionStream::new(VlessStream::client(tls, request), uuid, gate);
     vision.kick().await.unwrap();
     let echoed = match inner {
         Some(_) => {

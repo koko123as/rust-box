@@ -32,6 +32,8 @@ pub struct H2Stream {
     send: SendStream<Bytes>,
     recv: Option<RecvStream>,
     buffered: Bytes,
+    /// Whether the end of the stream was sent.
+    ended: bool,
 }
 
 impl AsyncRead for H2Stream {
@@ -96,14 +98,21 @@ impl AsyncWrite for H2Stream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.send.send_data(Bytes::new(), true);
+        if !self.ended {
+            self.ended = true;
+            let _ = self.send.send_data(Bytes::new(), true);
+        }
         Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for H2Stream {
+    /// Closing ends the body, as Go's pipe `Close` does; h2 resets the
+    /// stream once every handle is gone and the queued data went out.
     fn drop(&mut self) {
-        self.send.send_reset(h2::Reason::CANCEL);
+        if !self.ended {
+            let _ = self.send.send_data(Bytes::new(), true);
+        }
     }
 }
 
@@ -156,7 +165,7 @@ impl H2Client {
             .body(())
             .map_err(io::Error::other)?;
         let (response, send) = send_request.send_request(request, false).map_err(h2_error)?;
-        Ok(H2Stream { response: Some(response), send, recv: None, buffered: Bytes::new() })
+        Ok(H2Stream { response: Some(response), send, recv: None, buffered: Bytes::new(), ended: false })
     }
 }
 
@@ -190,7 +199,13 @@ impl H2Server {
             while let Some(Ok((request, mut respond))) = connection.accept().await {
                 let response = http::Response::builder().status(http::StatusCode::OK).body(()).unwrap();
                 let Ok(send) = respond.send_response(response, false) else { continue };
-                let stream = H2Stream { response: None, send, recv: Some(request.into_body()), buffered: Bytes::new() };
+                let stream = H2Stream {
+                    response: None,
+                    send,
+                    recv: Some(request.into_body()),
+                    buffered: Bytes::new(),
+                    ended: false,
+                };
                 if streams.send(stream).await.is_err() {
                     break;
                 }

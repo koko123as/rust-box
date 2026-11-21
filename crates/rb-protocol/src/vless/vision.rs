@@ -15,14 +15,18 @@
 //! With rustls the decrypted rest is taken from the connection's plaintext
 //! buffer, and raw bytes past the current record never get into rustls:
 //! the outer TLS runs over a [`RecordStream`], which gives rustls at most
-//! one TLS record per read, and rustls asks for more only once its
-//! plaintext is consumed. So at the direct command the raw bytes that
-//! follow are still in the record stream, read next by the raw reads.
+//! one TLS record per read, and while Vision reads through the TLS its
+//! [`RecordGate`] lets one whole record through per read (rustls reads on
+//! past records it has not decrypted yet). So at the direct command the
+//! raw bytes that follow are still in the record stream, read next by the
+//! raw reads.
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, Read as _};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
@@ -53,6 +57,12 @@ pub trait TlsConn: AsyncRead + AsyncWrite + Unpin + Send {
     fn raw(&mut self) -> &mut BoxStream;
     /// The decrypted bytes the TLS connection holds and has not returned.
     fn take_plaintext(&mut self) -> io::Result<Vec<u8>>;
+    /// Whether the TLS connection holds decrypted bytes not returned yet.
+    fn has_plaintext(&mut self) -> bool;
+}
+
+fn has_plaintext(reader: rustls::Reader<'_>) -> bool {
+    matches!(reader.into_first_chunk(), Ok(chunk) if !chunk.is_empty())
 }
 
 fn drain_reader(mut reader: rustls::Reader<'_>) -> io::Result<Vec<u8>> {
@@ -78,6 +88,10 @@ impl TlsConn for rb_tls::TlsClientStream {
     fn take_plaintext(&mut self) -> io::Result<Vec<u8>> {
         drain_reader(self.get_mut().1.reader())
     }
+
+    fn has_plaintext(&mut self) -> bool {
+        has_plaintext(self.get_mut().1.reader())
+    }
 }
 
 impl TlsConn for rb_tls::TlsServerStream {
@@ -87,6 +101,10 @@ impl TlsConn for rb_tls::TlsServerStream {
 
     fn take_plaintext(&mut self) -> io::Result<Vec<u8>> {
         drain_reader(self.get_mut().1.reader())
+    }
+
+    fn has_plaintext(&mut self) -> bool {
+        has_plaintext(self.get_mut().1.reader())
     }
 }
 
@@ -99,20 +117,78 @@ enum Record {
     Body(usize),
 }
 
+#[derive(Default)]
+struct GateState {
+    /// Whether at most one whole record may go out now.
+    armed: AtomicBool,
+    /// Whether no record may go out now (the TLS still holds plaintext).
+    closed: AtomicBool,
+    /// Whether the record end went out while armed.
+    delivered: AtomicBool,
+}
+
+/// Limits a [`RecordStream`] while armed to one whole record, or to none
+/// when closed: a read past that returns pending (without a waker; the one
+/// who armed the gate reads again).
+#[derive(Clone, Default)]
+pub struct RecordGate(Arc<GateState>);
+
+impl RecordGate {
+    fn arm(&self, closed: bool) {
+        self.0.delivered.store(false, Ordering::SeqCst);
+        self.0.closed.store(closed, Ordering::SeqCst);
+        self.0.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarms the gate; whether a whole record went out while armed.
+    fn disarm(&self) -> bool {
+        self.0.armed.store(false, Ordering::SeqCst);
+        self.0.delivered.swap(false, Ordering::SeqCst)
+    }
+
+    fn blocked(&self) -> bool {
+        self.0.armed.load(Ordering::SeqCst)
+            && (self.0.closed.load(Ordering::SeqCst) || self.0.delivered.load(Ordering::SeqCst))
+    }
+
+    fn record_end(&self) {
+        if self.0.armed.load(Ordering::SeqCst) {
+            self.0.delivered.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// A stream that returns at most the rest of the current TLS record per
 /// read (writes pass through), so a TLS implementation over it never holds
-/// raw bytes of a later record. Bytes read from the socket past the
-/// current record stay here and come out on later reads, whoever reads.
+/// raw bytes of a later record it was not let read (see [`RecordGate`]).
+/// Bytes read from the socket past the current record stay here and come
+/// out on later reads, whoever reads.
 pub struct RecordStream {
     inner: BoxStream,
     buffer: Vec<u8>,
     offset: usize,
     record: Record,
+    gate: RecordGate,
 }
 
 impl RecordStream {
     pub fn new(inner: BoxStream) -> Self {
-        RecordStream { inner, buffer: Vec::new(), offset: 0, record: Record::Header { header: [0; 5], filled: 0 } }
+        RecordStream {
+            inner,
+            buffer: Vec::new(),
+            offset: 0,
+            record: Record::Header { header: [0; 5], filled: 0 },
+            gate: RecordGate::default(),
+        }
+    }
+
+    /// The gate a [`VisionStream`] over the TLS over this stream arms.
+    pub fn gate(&self) -> RecordGate {
+        self.gate.clone()
+    }
+
+    fn at_record_start(&self) -> bool {
+        matches!(self.record, Record::Header { filled: 0, .. })
     }
 
     /// How many buffered bytes the next read may return, advancing the
@@ -164,6 +240,9 @@ impl RecordStream {
 impl AsyncRead for RecordStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        if this.gate.blocked() {
+            return Poll::Pending;
+        }
         if this.offset >= this.buffer.len() {
             this.buffer.resize(16 * 1024 + 5, 0);
             this.offset = 0;
@@ -180,6 +259,9 @@ impl AsyncRead for RecordStream {
         let start = this.offset;
         buf.put_slice(&this.buffer[start..start + count]);
         this.offset += count;
+        if count > 0 && this.at_record_start() {
+            this.gate.record_end();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -236,6 +318,7 @@ fn reshape(data: &[u8]) -> Vec<Vec<u8>> {
 /// `VisionConn`), for either side.
 pub struct VisionStream<T> {
     inner: VlessStream<T>,
+    gate: RecordGate,
     uuid: [u8; 16],
     is_tls: bool,
     packets_to_filter: i32,
@@ -263,9 +346,11 @@ pub struct VisionStream<T> {
 }
 
 impl<T: TlsConn> VisionStream<T> {
-    pub fn new(inner: VlessStream<T>, uuid: [u8; 16]) -> Self {
+    /// `gate` is the one of the [`RecordStream`] under the TLS.
+    pub fn new(inner: VlessStream<T>, uuid: [u8; 16], gate: RecordGate) -> Self {
         VisionStream {
             inner,
+            gate,
             uuid,
             is_tls: false,
             packets_to_filter: 8,
@@ -584,7 +669,21 @@ impl<T: TlsConn> AsyncRead for VisionStream<T> {
                 this.chunk.resize(size, 0);
             }
             let mut read = ReadBuf::new(&mut this.chunk[..size]);
-            ready!(Pin::new(&mut this.inner).poll_read(cx, &mut read))?;
+            // One record at a time, and none while the TLS still holds
+            // plaintext (tokio-rustls fills the buffer from more records):
+            // the direct command may be in it, and raw bytes after it.
+            let holding = this.inner.get_mut().has_plaintext();
+            this.gate.arm(holding);
+            let result = Pin::new(&mut this.inner).poll_read(cx, &mut read);
+            let delivered = this.gate.disarm();
+            if result.is_pending() {
+                if delivered {
+                    // A record without plaintext for us; read the next.
+                    continue;
+                }
+                return Poll::Pending;
+            }
+            ready!(result)?;
             let count = read.filled().len();
             if count == 0 {
                 return Poll::Ready(Ok(()));

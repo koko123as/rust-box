@@ -148,10 +148,15 @@ async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
     let payload: Vec<u8> = (0..200_000u32).map(|index| (index % 253) as u8).collect();
     let (mut reader, mut writer) = stream.into_split();
     let data = payload.clone();
-    let writing = tokio::spawn(async move { writer.write_all(&data).await.unwrap() });
+    let writing = tokio::spawn(async move {
+        // Keep the write half open: dropping it half-closes the connection,
+        // which sing-box answers by closing a non-duplex outbound whole.
+        writer.write_all(&data).await.unwrap();
+        writer
+    });
     let mut echoed = vec![0u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(20), reader.read_exact(&mut echoed)).await.unwrap().unwrap();
-    writing.await.unwrap();
+    let _writer = writing.await.unwrap();
     assert!(echoed == payload, "TCP echo through {proxy}");
 }
 
@@ -291,10 +296,15 @@ async fn assert_tls_echo(proxy: SocketAddr, echo: SocketAddr, pki: &Pki) {
     let payload: Vec<u8> = (0..300_000u32).map(|index| (index % 249) as u8).collect();
     let (mut reader, mut writer) = tokio::io::split(stream);
     let data = payload.clone();
-    let writing = tokio::spawn(async move { writer.write_all(&data).await.unwrap() });
+    let writing = tokio::spawn(async move {
+        // Keep the write half open: dropping it half-closes the connection,
+        // which sing-box answers by closing a non-duplex outbound whole.
+        writer.write_all(&data).await.unwrap();
+        writer
+    });
     let mut echoed = vec![0u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(20), reader.read_exact(&mut echoed)).await.unwrap().unwrap();
-    writing.await.unwrap();
+    let _writer = writing.await.unwrap();
     assert!(echoed == payload, "TLS echo through {proxy}");
 }
 
@@ -436,6 +446,18 @@ async fn assert_fallback(server: SocketAddr, pki: &Pki, alpn: &[&str], expected_
     assert_eq!(&received[expected_banner.len()..], request);
 }
 
+/// sing-box `fallbackConnection`: with `fallback_for_alpn` set, an ALPN
+/// it has no entry for closes the connection (no default fallback).
+async fn assert_fallback_closed(server: SocketAddr, pki: &Pki, alpn: &[&str]) {
+    let stream = TcpStream::connect(server).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("example.test").unwrap();
+    let mut stream = tls_client(pki, alpn).connect(name, stream).await.unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n").await.unwrap();
+    let mut received = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut received)).await.unwrap();
+    assert!(received.is_empty(), "{received:?}");
+}
+
 fn fallback_inbound(port: u16, pki: &Pki, fallback: SocketAddr, h2: SocketAddr) -> Value {
     let mut tls = server_tls(pki);
     tls["alpn"] = json!(["h2", "http/1.1"]);
@@ -451,7 +473,7 @@ async fn rust_box_trojan_fallback() {
     let (fallback, h2) = (banner_echo(b"default:").await, banner_echo(b"h2:").await);
     let (_server, servers) = start(&server_config(fallback_inbound(0, &pki, fallback, h2))).await;
     assert_fallback(servers[0], &pki, &[], b"default:").await;
-    assert_fallback(servers[0], &pki, &["http/1.1"], b"default:").await;
+    assert_fallback_closed(servers[0], &pki, &["http/1.1"]).await;
     assert_fallback(servers[0], &pki, &["h2"], b"h2:").await;
     // Trojan itself still works next to the fallback.
     let (_client, clients) = start(&client_config(0, trojan_outbound(servers[0], Some(client_tls(&pki))))).await;
@@ -569,7 +591,7 @@ async fn interop_sing_box_trojan_fallback_behaves_the_same() {
         return;
     };
     assert_fallback(local(port), &pki, &[], b"default:").await;
-    assert_fallback(local(port), &pki, &["http/1.1"], b"default:").await;
+    assert_fallback_closed(local(port), &pki, &["http/1.1"]).await;
     assert_fallback(local(port), &pki, &["h2"], b"h2:").await;
 }
 

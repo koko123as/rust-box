@@ -124,10 +124,15 @@ pub async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
     let payload: Vec<u8> = (0..200_000u32).map(|index| (index % 253) as u8).collect();
     let (mut reader, mut writer) = stream.into_split();
     let data = payload.clone();
-    let writing = tokio::spawn(async move { writer.write_all(&data).await.unwrap() });
+    let writing = tokio::spawn(async move {
+        // Keep the write half open: dropping it half-closes the connection,
+        // which sing-box answers by closing a non-duplex outbound whole.
+        writer.write_all(&data).await.unwrap();
+        writer
+    });
     let mut echoed = vec![0u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(20), reader.read_exact(&mut echoed)).await.unwrap().unwrap();
-    writing.await.unwrap();
+    let _writer = writing.await.unwrap();
     assert!(echoed == payload, "TCP echo through {proxy}");
 }
 

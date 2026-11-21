@@ -385,7 +385,9 @@ mod tests {
             let mut chunk = [0u8; 256];
             let count = read.read(&mut chunk).await.unwrap();
             received.extend_from_slice(&chunk[..count]);
-            while let Some((frame, used)) = parse_xudp_frame(&received, &target).unwrap() {
+            // The second reply may arrive with the session's end frame.
+            while frames.len() < 2 {
+                let Some((frame, used)) = parse_xudp_frame(&received, &target).unwrap() else { break };
                 received.drain(..used);
                 frames.push(frame);
             }

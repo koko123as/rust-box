@@ -136,10 +136,15 @@ async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
     let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let (mut reader, mut writer) = stream.into_split();
     let sent = big.clone();
-    let write = tokio::spawn(async move { writer.write_all(&sent).await.unwrap() });
+    let write = tokio::spawn(async move {
+        // Keep the write half open: dropping it half-closes the connection,
+        // which sing-box answers by closing a non-duplex outbound whole.
+        writer.write_all(&sent).await.unwrap();
+        writer
+    });
     let mut echoed = vec![0u8; big.len()];
     tokio::time::timeout(Duration::from_secs(20), reader.read_exact(&mut echoed)).await.unwrap().unwrap();
-    write.await.unwrap();
+    let _writer = write.await.unwrap();
     assert!(echoed == big, "large echo differs");
 }
 

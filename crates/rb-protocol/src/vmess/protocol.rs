@@ -257,10 +257,7 @@ pub struct RequestHeader {
 impl RequestHeader {
     /// The header's length, as the AEAD length block carries it.
     pub fn len(&self) -> usize {
-        HEADER_FIXED_LEN
-            + self.destination.as_ref().map_or(0, |destination| 2 + address_len(destination))
-            + self.padding.len()
-            + 4
+        HEADER_FIXED_LEN + self.destination.as_ref().map_or(0, address_len) + self.padding.len() + 4
     }
 
     pub fn is_empty(&self) -> bool {

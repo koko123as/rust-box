@@ -11,7 +11,7 @@ use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
 
 use super::packet::{PacketAddrConn, VlessPacketConn, XudpPacketConn, PACKET_ADDR_MAGIC};
 use super::protocol::{self, Request, VlessStream, COMMAND_MUX, COMMAND_TCP, FLOW_VISION};
-use super::vision::{RecordStream, VisionStream};
+use super::vision::{RecordGate, RecordStream, VisionStream};
 
 /// How UDP goes (`packet_encoding`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,14 +43,15 @@ pub struct VlessOutbound {
 
 /// A connection to the server: TLS kept typed for Vision.
 enum ServerConn {
-    Tls(Box<rb_tls::TlsClientStream>),
+    /// With the gate of its record stream (Vision).
+    Tls(Box<rb_tls::TlsClientStream>, RecordGate),
     Plain(BoxStream),
 }
 
 impl ServerConn {
     fn boxed(self) -> BoxStream {
         match self {
-            ServerConn::Tls(stream) => stream,
+            ServerConn::Tls(stream, _) => stream,
             ServerConn::Plain(stream) => stream,
         }
     }
@@ -116,8 +117,14 @@ impl VlessOutbound {
             Some(tls) => {
                 // Vision needs the raw bytes past the current TLS record
                 // kept out of rustls.
-                let stream: BoxStream = if self.vision { Box::new(RecordStream::new(stream)) } else { stream };
-                Ok(ServerConn::Tls(Box::new(tls.handshake(stream).await?)))
+                let (stream, gate): (BoxStream, RecordGate) = if self.vision {
+                    let stream = RecordStream::new(stream);
+                    let gate = stream.gate();
+                    (Box::new(stream), gate)
+                } else {
+                    (stream, RecordGate::default())
+                };
+                Ok(ServerConn::Tls(Box::new(tls.handshake(stream).await?), gate))
             }
             None => Ok(ServerConn::Plain(stream)),
         }
@@ -140,8 +147,8 @@ impl VlessOutbound {
         let conn = self.dial_server().await?;
         let request = self.request(COMMAND_TCP, destination)?;
         if self.vision {
-            let ServerConn::Tls(tls) = conn else { return Err(io::Error::other(VISION_WITHOUT_TLS)) };
-            let mut stream = VisionStream::new(VlessStream::client(*tls, request), self.uuid);
+            let ServerConn::Tls(tls, gate) = conn else { return Err(io::Error::other(VISION_WITHOUT_TLS)) };
+            let mut stream = VisionStream::new(VlessStream::client(*tls, request), self.uuid, gate);
             stream.kick().await?;
             return Ok(Box::new(stream));
         }
@@ -167,10 +174,12 @@ impl VlessOutbound {
                     flow: if self.vision { FLOW_VISION.into() } else { String::new() },
                 })?;
                 let stream: BoxStream = if self.vision {
-                    let ServerConn::Tls(tls) = conn else { return Err(io::Error::other(VISION_WITHOUT_TLS)) };
+                    let ServerConn::Tls(tls, gate) = conn else {
+                        return Err(io::Error::other(VISION_WITHOUT_TLS));
+                    };
                     let mut vless = VlessStream::client(*tls, request);
                     vless.write_header().await?;
-                    Box::new(VisionStream::new(vless, self.uuid))
+                    Box::new(VisionStream::new(vless, self.uuid, gate))
                 } else {
                     let mut vless = VlessStream::client(conn.boxed(), request);
                     vless.write_header().await?;

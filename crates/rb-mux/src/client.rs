@@ -286,15 +286,36 @@ fn decode_message(data: &[u8]) -> String {
 impl AsyncWrite for ClientConn {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         let this = &mut *self;
+        // What is left of the request header.
         ready!(this.poll_drain(cx))?;
-        if let Some(mut request) = this.request.take() {
-            request.extend_from_slice(data);
-            this.out = request;
-            this.offset = 0;
-            if let Poll::Ready(Err(error)) = this.poll_drain(cx) {
-                return Poll::Ready(Err(error));
+        if let Some(request) = this.request.take() {
+            // The request goes with the first data (sing-mux
+            // `clientConn.Write`); only the data written counts.
+            let header = request.len();
+            let mut buffer = request;
+            buffer.extend_from_slice(data);
+            let mut offset = 0;
+            loop {
+                match Pin::new(&mut this.stream).poll_write(cx, &buffer[offset..]) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                    Poll::Ready(Ok(written)) => {
+                        offset += written;
+                        if offset == buffer.len() {
+                            return Poll::Ready(Ok(data.len()));
+                        }
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {
+                        if offset > header {
+                            return Poll::Ready(Ok(offset - header));
+                        }
+                        buffer.truncate(header);
+                        this.out = buffer;
+                        this.offset = offset;
+                        return Poll::Pending;
+                    }
+                }
             }
-            return Poll::Ready(Ok(data.len()));
         }
         Pin::new(&mut this.stream).poll_write(cx, data)
     }

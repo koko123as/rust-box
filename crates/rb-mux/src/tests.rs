@@ -53,35 +53,50 @@ impl MuxDialer for PipeDialer {
 
 #[tokio::test]
 async fn every_protocol() {
-    for protocol in ["smux", "yamux", "h2mux"] {
-        for padding in [false, true] {
-            let options = ClientOptions::new(protocol, 0, 0, 0, padding).unwrap();
-            let client = Arc::new(Client::new(Arc::new(PipeDialer(ServerOptions { padding })), options));
-            let payload: Vec<u8> = (0..70_000u32).map(|index| index as u8).collect();
-            let mut tasks = Vec::new();
-            for _ in 0..3 {
-                let (client, payload) = (client.clone(), payload.clone());
-                tasks.push(tokio::spawn(async move {
-                    let mut stream = client.dial_tcp(&Socksaddr::from_host_port("example.com", 80)).await.unwrap();
-                    stream.write_all(&payload).await.unwrap();
-                    let mut echoed = Vec::new();
-                    stream.read_to_end(&mut echoed).await.unwrap();
-                    assert!(echoed == payload);
-                }));
+    // sing-mux `selectSession`: with neither `max_connections` nor
+    // `max_streams` (`min_streams` defaults to 8 but only counts with
+    // `max_connections`), a busy session is never shared, so three open
+    // streams take three sessions; with `max_streams` 8 they share one.
+    for (max_streams, expected) in [(0, 3), (8, 1)] {
+        for protocol in ["smux", "yamux", "h2mux"] {
+            for padding in [false, true] {
+                let options = ClientOptions::new(protocol, 0, 0, max_streams, padding).unwrap();
+                let client = Arc::new(Client::new(Arc::new(PipeDialer(ServerOptions { padding })), options));
+                let payload: Vec<u8> = (0..70_000u32).map(|index| index as u8).collect();
+                let mut streams = Vec::new();
+                for _ in 0..3 {
+                    streams.push(client.dial_tcp(&Socksaddr::from_host_port("example.com", 80)).await.unwrap());
+                }
+                assert_eq!(client_sessions(&client).await, expected, "{protocol} {padding} {max_streams}");
+                let mut tasks = Vec::new();
+                for mut stream in streams {
+                    let payload = payload.clone();
+                    tasks.push(tokio::spawn(async move {
+                        // No flush: written data goes out like on a socket.
+                        stream.write_all(&payload).await.unwrap();
+                        let mut echoed = Vec::new();
+                        stream.read_to_end(&mut echoed).await.unwrap();
+                        assert!(echoed == payload);
+                    }));
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                // Every stream is closed: the UDP takes an idle session.
+                let conn = client.listen_packet(&Socksaddr::from_host_port("1.1.1.1", 53)).await.unwrap();
+                let target = Socksaddr::from_host_port("8.8.8.8", 53);
+                let mut buffer = [0u8; 64];
+                for round in 0..3u8 {
+                    conn.write_packet(&[round; 10], &target).await.unwrap();
+                    let (length, address) = conn.read_packet(&mut buffer).await.unwrap();
+                    assert_eq!(
+                        (&buffer[..length], address),
+                        (&[round; 10][..], target.clone()),
+                        "{protocol} {padding}"
+                    );
+                }
+                assert_eq!(client_sessions(&client).await, expected, "{protocol} {padding} {max_streams}");
             }
-            for task in tasks {
-                task.await.unwrap();
-            }
-            let conn = client.listen_packet(&Socksaddr::from_host_port("1.1.1.1", 53)).await.unwrap();
-            let target = Socksaddr::from_host_port("8.8.8.8", 53);
-            let mut buffer = [0u8; 64];
-            for round in 0..3u8 {
-                conn.write_packet(&[round; 10], &target).await.unwrap();
-                let (length, address) = conn.read_packet(&mut buffer).await.unwrap();
-                assert_eq!((&buffer[..length], address), (&[round; 10][..], target.clone()), "{protocol} {padding}");
-            }
-            // Every stream went over one session (min_streams 8).
-            assert_eq!(client_sessions(&client).await, 1, "{protocol}");
         }
     }
 }

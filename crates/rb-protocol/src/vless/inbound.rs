@@ -22,7 +22,7 @@ use super::mux::{self, MuxHandler};
 use super::outbound::VISION_WITHOUT_TLS;
 use super::packet::{PacketAddrConn, ServerPacketConn, PACKET_ADDR_MAGIC};
 use super::protocol::{self, VlessStream, COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, FLOW_VISION};
-use super::vision::{RecordStream, VisionStream};
+use super::vision::{RecordGate, RecordStream, VisionStream};
 use crate::uot::{self, Request as UotRequest, UotPacketConn};
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -210,14 +210,15 @@ impl MuxHandler for MuxSessions {
 
 /// A client connection after the inbound TLS: typed for Vision.
 enum ClientConn {
-    Tls(Box<rb_tls::TlsServerStream>),
+    /// With the gate of its record stream (Vision).
+    Tls(Box<rb_tls::TlsServerStream>, RecordGate),
     Plain(BoxStream),
 }
 
 impl ClientConn {
     fn boxed(self) -> BoxStream {
         match self {
-            ClientConn::Tls(stream) => stream,
+            ClientConn::Tls(stream, _) => stream,
             ClientConn::Plain(stream) => stream,
         }
     }
@@ -285,9 +286,15 @@ impl VlessInbound {
         let source = context.source;
         let conn = match &self.tls {
             Some(tls) => {
-                let stream: BoxStream = if self.record_stream { Box::new(RecordStream::new(stream)) } else { stream };
+                let (stream, gate): (BoxStream, RecordGate) = if self.record_stream {
+                    let stream = RecordStream::new(stream);
+                    let gate = stream.gate();
+                    (Box::new(stream), gate)
+                } else {
+                    (stream, RecordGate::default())
+                };
                 match tls.handshake(stream).await {
-                    Ok(stream) => ClientConn::Tls(Box::new(stream)),
+                    Ok(stream) => ClientConn::Tls(Box::new(stream), gate),
                     Err(error) => {
                         error!("{}: process connection from {source}: TLS handshake: {error}", self.log_prefix());
                         return;
@@ -304,7 +311,7 @@ impl VlessInbound {
     /// sing-vmess `Service.NewConnection`.
     async fn serve(&self, mut conn: ClientConn, context: InboundContext) -> io::Result<()> {
         let request = match &mut conn {
-            ClientConn::Tls(stream) => protocol::read_request(stream.as_mut()).await?,
+            ClientConn::Tls(stream, _) => protocol::read_request(stream.as_mut()).await?,
             ClientConn::Plain(stream) => protocol::read_request(stream).await?,
         };
         let Some(&user) = self.users.get(&request.uuid) else {
@@ -329,7 +336,9 @@ impl VlessInbound {
         }
         let stream: BoxStream = match user_flow {
             FLOW_VISION => match conn {
-                ClientConn::Tls(stream) => Box::new(VisionStream::new(VlessStream::server(*stream), request.uuid)),
+                ClientConn::Tls(stream, gate) => {
+                    Box::new(VisionStream::new(VlessStream::server(*stream), request.uuid, gate))
+                }
                 ClientConn::Plain(_) => return Err(io::Error::other(VISION_WITHOUT_TLS)),
             },
             "" => Box::new(VlessStream::server(conn.boxed())),
