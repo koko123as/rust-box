@@ -1,3 +1,4 @@
+pub mod httpupgrade;
 pub mod websocket;
 
 use rb_config::{V2RayTransportConfig, V2RayTransportOptions, V2RayWebSocketOptions};
