@@ -247,7 +247,7 @@ mod tests {
             data: vec![9],
         })
         .unwrap();
-        *bad.last_mut().unwrap() = 8;
+        bad[9] = 8;
         assert!(decode_udp(&bad).is_err());
         assert!(decode_connect(&[5, COMMAND_CONNECT, FAMILY_EMPTY]).is_err());
     }
