@@ -90,10 +90,7 @@ impl Transport {
             Transport::Udp(server) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
-                let bind: SocketAddr =
-                    if server.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
-                let socket = UdpSocket::bind(bind).await?;
-                socket.connect(server).await?;
+                let socket = udp_socket(*server).await?;
                 socket.send(&query).await?;
                 let mut buffer = vec![0u8; 65535];
                 loop {
@@ -117,7 +114,54 @@ impl Transport {
     }
 }
 
-async fn exchange_tcp(server: SocketAddr, query: &[u8], id: u16, timeout: Duration) -> io::Result<Answer> {
+impl Transport {
+    /// Forwards a raw query message and returns the raw response, with the
+    /// query's own id (sing-box `DNSTransport.Exchange`). `Ok(None)` for the
+    /// local resolver, which cannot forward messages.
+    pub async fn exchange(&self, query: &[u8], timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+        if query.len() < 12 {
+            return Err(invalid("DNS query too short"));
+        }
+        let original = [query[0], query[1]];
+        let id = next_id();
+        let mut message = query.to_vec();
+        message[..2].copy_from_slice(&id.to_be_bytes());
+        let mut response = match self {
+            Transport::Local => return Ok(None),
+            Transport::Udp(server) => {
+                let socket = udp_socket(*server).await?;
+                socket.send(&message).await?;
+                let mut buffer = vec![0u8; 65535];
+                loop {
+                    let size = socket.recv(&mut buffer).await?;
+                    if size < 12 || buffer[..2] != id.to_be_bytes() {
+                        continue;
+                    }
+                    // TC: ask again over TCP.
+                    if buffer[2] & 0x02 != 0 {
+                        break exchange_tcp_raw(*server, &message, timeout).await?;
+                    }
+                    break buffer[..size].to_vec();
+                }
+            }
+            Transport::Tcp(server) => exchange_tcp_raw(*server, &message, timeout).await?,
+        };
+        if response.len() < 12 || response[..2] != id.to_be_bytes() {
+            return Err(invalid("DNS response id mismatch"));
+        }
+        response[..2].copy_from_slice(&original);
+        Ok(Some(response))
+    }
+}
+
+async fn udp_socket(server: SocketAddr) -> io::Result<UdpSocket> {
+    let bind: SocketAddr = if server.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
+    let socket = UdpSocket::bind(bind).await?;
+    socket.connect(server).await?;
+    Ok(socket)
+}
+
+async fn exchange_tcp_raw(server: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<Vec<u8>> {
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(server))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS over TCP: connect timed out"))??;
@@ -128,6 +172,11 @@ async fn exchange_tcp(server: SocketAddr, query: &[u8], id: u16, timeout: Durati
     let length = stream.read_u16().await? as usize;
     let mut response = vec![0u8; length];
     stream.read_exact(&mut response).await?;
+    Ok(response)
+}
+
+async fn exchange_tcp(server: SocketAddr, query: &[u8], id: u16, timeout: Duration) -> io::Result<Answer> {
+    let response = exchange_tcp_raw(server, query, timeout).await?;
     parse_response(&response, id).map(|(answer, _)| answer)
 }
 

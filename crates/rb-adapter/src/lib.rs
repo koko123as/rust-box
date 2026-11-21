@@ -6,11 +6,12 @@
 //! holds the [`ConnectionRouter`], the router holds the outbounds and the
 //! [`DnsResolver`], so every dependency shows in a constructor.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -111,8 +112,17 @@ pub struct InboundContext {
     pub user: Option<String>,
     /// Protocol found by sniffing (`tls`, `http`, ...).
     pub protocol: Option<String>,
-    /// Domain found by sniffing (TLS server name, HTTP host).
+    /// Domain found by sniffing (TLS server name, HTTP host, QUIC server name).
     pub sniff_host: Option<String>,
+    /// The inbound's UDP NAT expiration (`udp_timeout` listen field); the
+    /// router never keeps a packet connection idle longer than this.
+    pub inbound_udp_timeout: Option<Duration>,
+    /// `udp_timeout` from a matched route action (sing-box `metadata.UDPTimeout`).
+    pub udp_timeout: Option<Duration>,
+    /// `udp_connect` from a matched route action.
+    pub udp_connect: bool,
+    /// `udp_disable_domain_unmapping` from a matched route action.
+    pub udp_disable_domain_unmapping: bool,
 }
 
 impl InboundContext {
@@ -133,6 +143,10 @@ impl InboundContext {
             user: None,
             protocol: None,
             sniff_host: None,
+            inbound_udp_timeout: None,
+            udp_timeout: None,
+            udp_connect: false,
+            udp_disable_domain_unmapping: false,
         }
     }
 
@@ -192,13 +206,77 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
-/// An outbound (sing-box `adapter.Outbound`, TCP part).
+/// Largest UDP payload a packet connection carries.
+pub const MAX_PACKET_SIZE: usize = 65535;
+
+/// A connection that carries datagrams, each with an address (sing-box
+/// `N.PacketConn`).
+///
+/// On the client side of a route (what an inbound hands the router) the
+/// address of a read packet is where the client sent it, and the address of
+/// a written packet is the source the client should see. On the remote side
+/// (what an outbound returns) it is the other way around: packets are
+/// written to their destination and read with their source.
+///
+/// Both methods take `&self` so the two directions run at once, and
+/// `read_packet` must be cancel safe: the router races it against timeouts.
+#[async_trait]
+pub trait PacketConn: Send + Sync {
+    /// Reads one packet into `buffer` (truncated to its length) and returns
+    /// the packet's length and address.
+    async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)>;
+    async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()>;
+}
+
+pub type SharedPacketConn = Arc<dyn PacketConn>;
+
+/// A packet connection with packets already read from it put back in front
+/// (sing-box `bufio.NewCachedPacketConn`).
+pub struct CachedPacketConn {
+    cached: Mutex<VecDeque<(Vec<u8>, Socksaddr)>>,
+    inner: SharedPacketConn,
+}
+
+impl CachedPacketConn {
+    pub fn new(packets: Vec<(Vec<u8>, Socksaddr)>, inner: SharedPacketConn) -> Self {
+        CachedPacketConn { cached: Mutex::new(packets.into()), inner }
+    }
+}
+
+#[async_trait]
+impl PacketConn for CachedPacketConn {
+    async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
+        let cached = self.cached.lock().unwrap().pop_front();
+        if let Some((data, address)) = cached {
+            let length = data.len().min(buffer.len());
+            buffer[..length].copy_from_slice(&data[..length]);
+            return Ok((length, address));
+        }
+        self.inner.read_packet(buffer).await
+    }
+
+    async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
+        self.inner.write_packet(data, address).await
+    }
+}
+
+/// An outbound (sing-box `adapter.Outbound`).
 #[async_trait]
 pub trait Outbound: Send + Sync {
     fn tag(&self) -> &str;
     fn kind(&self) -> &'static str;
     /// Opens a TCP connection to the context's destination.
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream>;
+    /// Opens a packet connection for UDP whose first destination is the
+    /// context's (sing-box `ListenPacket`; `DialContext("udp")` when the
+    /// context asks for `udp_connect`).
+    async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
+        let _ = context;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("outbound/{}[{}]: UDP is not supported", self.kind(), self.tag()),
+        ))
+    }
 }
 
 /// Why a routed connection ended without being relayed.
@@ -210,6 +288,8 @@ pub enum RouteError {
     Resolve(io::Error),
     /// The outbound could not connect.
     Dial(io::Error),
+    /// Reading from the client failed while routing (packet sniffing).
+    Io(io::Error),
 }
 
 impl fmt::Display for RouteError {
@@ -218,6 +298,7 @@ impl fmt::Display for RouteError {
             RouteError::Rejected => f.write_str("rejected by rule"),
             RouteError::Resolve(error) => write!(f, "resolve: {error}"),
             RouteError::Dial(error) => write!(f, "dial: {error}"),
+            RouteError::Io(error) => write!(f, "{error}"),
         }
     }
 }
@@ -234,6 +315,18 @@ impl std::error::Error for RouteError {}
 #[async_trait]
 pub trait ConnectionRouter: Send + Sync {
     async fn route_connection(&self, context: InboundContext, client: BoxStream) -> Result<(), RouteError>;
+
+    /// Routes a UDP session (sing-box `RoutePacketConnectionEx`): the rules
+    /// are matched once, with the destination of the first packet, and the
+    /// session relays packets until it is idle for its UDP timeout or the
+    /// returned future is dropped. As in sing-box, an inbound that knows the
+    /// first packet already hands it in front of `client`
+    /// ([`CachedPacketConn`]).
+    async fn route_packet_connection(
+        &self,
+        context: InboundContext,
+        client: SharedPacketConn,
+    ) -> Result<(), RouteError>;
 }
 
 /// Domain resolution as outbounds and the router use it (sing-box
@@ -243,6 +336,14 @@ pub trait DnsResolver: Send + Sync {
     /// Resolves through the DNS server `server`, or through the DNS rules
     /// and `dns.final` when `server` is `None`.
     async fn lookup(&self, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>>;
+
+    /// Answers a whole DNS query message through the DNS rules (what
+    /// `hijack-dns` uses, sing-box `DNSRouter.Exchange`). `Ok(None)` means the
+    /// query is dropped without an answer.
+    async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
+        let _ = (query, options);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "DNS exchange is not supported"))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -253,6 +354,24 @@ pub struct LookupOptions {
     pub timeout: Option<Duration>,
     /// The inbound the query is for, for DNS rules.
     pub inbound: Option<String>,
+    /// The connection the query is for, for DNS rules (`source_ip_cidr`,
+    /// `source_port`, `auth_user`, `network`).
+    pub source: Option<SocketAddr>,
+    pub user: Option<String>,
+    pub network: Option<Network>,
+}
+
+impl LookupOptions {
+    /// Options for a query made on behalf of a connection.
+    pub fn for_context(context: &InboundContext) -> Self {
+        LookupOptions {
+            inbound: Some(context.inbound.clone()),
+            source: Some(context.source),
+            user: context.user.clone(),
+            network: Some(context.network),
+            ..Default::default()
+        }
+    }
 }
 
 /// A running inbound (sing-box `adapter.Inbound`).
@@ -313,6 +432,28 @@ mod tests {
         assert_eq!(apply_strategy(vec![v6, v4], DomainStrategy::PreferIpv4), vec![v4, v6]);
         assert_eq!(apply_strategy(vec![v4, v6], DomainStrategy::PreferIpv6), vec![v6, v4]);
         assert_eq!(apply_strategy(vec![v4, v6], DomainStrategy::Ipv6Only), vec![v6]);
+    }
+
+    struct Silent;
+
+    #[async_trait]
+    impl PacketConn for Silent {
+        async fn read_packet(&self, _buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+        }
+        async fn write_packet(&self, _data: &[u8], _address: &Socksaddr) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_packet_conn() {
+        let address = Socksaddr::from_host_port("1.2.3.4", 53);
+        let conn = CachedPacketConn::new(vec![(b"abc".to_vec(), address.clone())], Arc::new(Silent));
+        let mut buffer = [0u8; 2];
+        assert_eq!(conn.read_packet(&mut buffer).await.unwrap(), (2, address));
+        assert_eq!(&buffer, b"ab");
+        assert!(conn.read_packet(&mut buffer).await.is_err());
     }
 
     #[tokio::test]
