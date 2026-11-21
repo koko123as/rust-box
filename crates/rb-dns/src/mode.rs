@@ -394,15 +394,15 @@ mod tests {
                      "action":"route","server":"local","race":true}]"#,
                 "`race` requires `match_response` in sub-rules",
             ),
-            (
-                r#"[{"action":"evaluate","server":"local","tag":"answer"},
-                    {"type":"logical","mode":"and","rules":[{"match_response":"answer"}],
-                     "action":"route","server":"local","race":true}]"#,
-                "`race` requires `match_response` in sub-rules",
-            ),
         ] {
             let error = validate_evaluate_rules(&rules(json)).unwrap_err();
             assert!(error.contains(expected), "expected {expected:?}, got {error}");
         }
+        let logical_race = rules(
+            r#"[{"action":"evaluate","server":"local","tag":"answer"},
+                {"type":"logical","mode":"and","rules":[{"match_response":"answer"}],
+                 "action":"route","server":"local","race":true}]"#,
+        );
+        assert!(validate_evaluate_rules(&logical_race).is_ok());
     }
 }
