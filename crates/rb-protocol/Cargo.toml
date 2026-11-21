@@ -1,6 +1,6 @@
 [package]
 name = "rb-protocol"
-description = "rust-box protocols (sing-box protocol/): socks, http, mixed, direct, block"
+description = "rust-box protocols (sing-box protocol/): socks, http, mixed, shadowsocks, direct, block"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,8 @@ rb-adapter.workspace = true
 rb-dialer.workspace = true
 rb-tls.workspace = true
 rb-certificate.workspace = true
+rb-route.workspace = true
+rb-shadowsocks.workspace = true
 httparse.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

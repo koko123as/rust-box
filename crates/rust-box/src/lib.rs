@@ -17,7 +17,9 @@ use rb_adapter::{ConnectionRouter, DnsResolver, Inbound, InboundRegistry, Outbou
 use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions};
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
-use rb_protocol::{Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, SocksOutbound};
+use rb_protocol::{
+    Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
+};
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
 use rb_rule_set::{Env as RuleSetEnv, ManagedRuleSet, Updater};
@@ -128,9 +130,10 @@ impl RustBox {
                     HttpOutbound::new(http, tag, &dialer_env, &certificates)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
-                OutboundOptions::Shadowsocks(_) => {
-                    return Err(anyhow!("outbounds[{index}]: `shadowsocks` is not supported by rust-box yet"))
-                }
+                OutboundOptions::Shadowsocks(shadowsocks) => Arc::new(
+                    ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
             });
         }
         if outbounds.is_empty() {
@@ -149,17 +152,25 @@ impl RustBox {
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
         for (index, inbound) in options.inbounds.iter().enumerate() {
             let tag = if inbound.tag().is_empty() { index.to_string() } else { inbound.tag().to_string() };
-            let (kind, proxy) = match inbound {
-                InboundOptions::Mixed(proxy) => (ProxyKind::Mixed, proxy),
-                InboundOptions::Socks(proxy) => (ProxyKind::Socks, proxy),
-                InboundOptions::Http(proxy) => (ProxyKind::Http, proxy),
-                InboundOptions::Shadowsocks(_) => {
-                    return Err(anyhow!("inbounds[{index}]: `shadowsocks` is not supported by rust-box yet"))
-                }
+            let built: Arc<dyn Inbound> = match inbound {
+                InboundOptions::Mixed(proxy) => Arc::new(
+                    ProxyInbound::new(ProxyKind::Mixed, proxy, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Socks(proxy) => Arc::new(
+                    ProxyInbound::new(ProxyKind::Socks, proxy, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Http(proxy) => Arc::new(
+                    ProxyInbound::new(ProxyKind::Http, proxy, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Shadowsocks(shadowsocks) => Arc::new(
+                    ShadowsocksInbound::new(shadowsocks, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
             };
-            let inbound = ProxyInbound::new(kind, proxy, tag, connection_router.clone())
-                .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?;
-            inbounds.push(Arc::new(inbound));
+            inbounds.push(built);
         }
         inbound_registry.set(&inbounds);
         Ok(RustBox {

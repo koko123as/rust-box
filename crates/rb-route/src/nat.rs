@@ -8,9 +8,12 @@
 //!
 //! The SOCKS5 inbound does not need it (each UDP ASSOCIATE has its own
 //! socket and is one session, as in sing-box); inbounds that share one UDP
-//! socket between clients (`direct`, `shadowsocks`, `tun`) will.
+//! socket between clients (`direct`, `shadowsocks`, `tun`) do. [`KeyedNat`]
+//! keys sessions by anything (shadowsocks 2022 by its session id), each
+//! with its own [`SessionWriter`].
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -31,19 +34,28 @@ pub trait PacketWriter: Send + Sync {
     async fn write_back(&self, data: &[u8], from: &Socksaddr, to: SocketAddr) -> io::Result<()>;
 }
 
-type Packet = (Vec<u8>, Socksaddr);
-type Sessions = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Packet>>>>;
+/// Where the replies of one session go (sing `udpnat` `init`'s
+/// `N.PacketWriter`): it knows its client and how to encode for it.
+#[async_trait]
+pub trait SessionWriter: Send + Sync {
+    /// Sends `data` to the session's client, as if it came from `from`.
+    async fn write_packet(&self, data: &[u8], from: &Socksaddr) -> io::Result<()>;
+}
 
-pub struct UdpNat {
+type Packet = (Vec<u8>, Socksaddr);
+type Sessions<K> = Arc<Mutex<HashMap<K, mpsc::Sender<Packet>>>>;
+
+/// The NAT table with sessions under any key (sing `udpnat.Service[K]`):
+/// the client's address, or a protocol's session id (shadowsocks 2022).
+pub struct KeyedNat<K> {
     router: Arc<dyn ConnectionRouter>,
-    writer: Arc<dyn PacketWriter>,
-    sessions: Sessions,
+    sessions: Sessions<K>,
     tasks: Mutex<JoinSet<()>>,
 }
 
-impl UdpNat {
-    pub fn new(router: Arc<dyn ConnectionRouter>, writer: Arc<dyn PacketWriter>) -> Self {
-        UdpNat { router, writer, sessions: Arc::default(), tasks: Mutex::new(JoinSet::new()) }
+impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedNat<K> {
+    pub fn new(router: Arc<dyn ConnectionRouter>) -> Self {
+        KeyedNat { router, sessions: Arc::default(), tasks: Mutex::new(JoinSet::new()) }
     }
 
     /// Number of open sessions.
@@ -55,16 +67,22 @@ impl UdpNat {
         self.len() == 0
     }
 
-    /// Hands one packet from `context.source` to `context.destination` to
-    /// its session, opening and routing a new session for a new source.
-    /// A packet for a session whose queue is full is dropped, as UDP may.
-    pub fn new_packet(&self, context: InboundContext, data: Vec<u8>) {
-        let source = context.source;
+    /// Hands one packet to `context.destination` to the session `key`,
+    /// opening and routing a new session (with the writer `init` makes)
+    /// when there is none. Returns whether a session was opened. A packet
+    /// for a session whose queue is full is dropped, as UDP may.
+    pub fn new_packet(
+        &self,
+        key: K,
+        context: InboundContext,
+        data: Vec<u8>,
+        init: impl FnOnce() -> Arc<dyn SessionWriter>,
+    ) -> bool {
         let packet = (data, context.destination.clone());
         let mut sessions = self.sessions.lock().unwrap();
-        let packet = match sessions.get(&source) {
+        let packet = match sessions.get(&key) {
             Some(sender) => match sender.try_send(packet) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return,
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return false,
                 // The session just ended: start a new one.
                 Err(mpsc::error::TrySendError::Closed(packet)) => packet,
             },
@@ -72,12 +90,12 @@ impl UdpNat {
         };
         let (sender, receiver) = mpsc::channel(SESSION_QUEUE);
         let _ = sender.try_send(packet);
-        sessions.insert(source, sender.clone());
+        sessions.insert(key.clone(), sender.clone());
         drop(sessions);
-        let conn: SharedPacketConn =
-            Arc::new(NatConn { receiver: tokio::sync::Mutex::new(receiver), writer: self.writer.clone(), source });
+        let conn: SharedPacketConn = Arc::new(NatConn { receiver: tokio::sync::Mutex::new(receiver), writer: init() });
         let router = self.router.clone();
         let sessions = self.sessions.clone();
+        let source = context.source;
         let mut tasks = self.tasks.lock().unwrap();
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
@@ -85,18 +103,67 @@ impl UdpNat {
                 debug!(%source, %error, "udp nat session closed");
             }
             let mut sessions = sessions.lock().unwrap();
-            if sessions.get(&source).is_some_and(|current| current.same_channel(&sender)) {
-                sessions.remove(&source);
+            if sessions.get(&key).is_some_and(|current| current.same_channel(&sender)) {
+                sessions.remove(&key);
             }
         });
+        true
+    }
+
+    /// Ends every session.
+    pub fn close(&self) {
+        self.tasks.lock().unwrap().abort_all();
+        self.sessions.lock().unwrap().clear();
     }
 }
 
-/// One session: packets of one source, replies back to it.
-struct NatConn {
-    receiver: tokio::sync::Mutex<mpsc::Receiver<Packet>>,
+/// The NAT table of an inbound whose sessions are its clients' addresses,
+/// all answered through one [`PacketWriter`].
+pub struct UdpNat {
+    nat: KeyedNat<SocketAddr>,
+    writer: Arc<dyn PacketWriter>,
+}
+
+impl UdpNat {
+    pub fn new(router: Arc<dyn ConnectionRouter>, writer: Arc<dyn PacketWriter>) -> Self {
+        UdpNat { nat: KeyedNat::new(router), writer }
+    }
+
+    /// Number of open sessions.
+    pub fn len(&self) -> usize {
+        self.nat.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nat.is_empty()
+    }
+
+    /// Hands one packet from `context.source` to `context.destination` to
+    /// its session, opening and routing a new session for a new source.
+    pub fn new_packet(&self, context: InboundContext, data: Vec<u8>) {
+        let source = context.source;
+        let writer = self.writer.clone();
+        self.nat.new_packet(source, context, data, || Arc::new(BackWriter { writer, source }));
+    }
+}
+
+/// Replies of one source through the shared [`PacketWriter`].
+struct BackWriter {
     writer: Arc<dyn PacketWriter>,
     source: SocketAddr,
+}
+
+#[async_trait]
+impl SessionWriter for BackWriter {
+    async fn write_packet(&self, data: &[u8], from: &Socksaddr) -> io::Result<()> {
+        self.writer.write_back(data, from, self.source).await
+    }
+}
+
+/// One session: its packets, replies back to its client.
+struct NatConn {
+    receiver: tokio::sync::Mutex<mpsc::Receiver<Packet>>,
+    writer: Arc<dyn SessionWriter>,
 }
 
 #[async_trait]
@@ -111,7 +178,7 @@ impl PacketConn for NatConn {
     }
 
     async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
-        self.writer.write_back(data, address, self.source).await
+        self.writer.write_packet(data, address).await
     }
 }
 

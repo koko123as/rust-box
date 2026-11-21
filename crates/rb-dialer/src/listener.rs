@@ -24,6 +24,7 @@ pub struct Listener {
     keep_alive: Option<(Duration, Duration)>,
     tcp_fast_open: bool,
     tcp_multi_path: bool,
+    udp_fragment: Option<bool>,
 }
 
 impl Listener {
@@ -61,6 +62,7 @@ impl Listener {
             keep_alive,
             tcp_fast_open: options.tcp_fast_open,
             tcp_multi_path: options.tcp_multi_path,
+            udp_fragment: options.udp_fragment,
         })
     }
 
@@ -128,6 +130,28 @@ impl Listener {
             sys::set_keep_alive(stream.as_raw_fd(), idle, interval)?;
         }
         Ok(())
+    }
+
+    /// The inbound's UDP socket on the listen address (sing-box
+    /// `Listener.ListenUDP`): interface, mark, reuse, `udp_fragment` (off
+    /// unless set) and namespace. `::` listens on both families, as Go does.
+    pub fn listen_udp(&self) -> io::Result<UdpSocket> {
+        let address = self.address;
+        let fragment = self.udp_fragment.unwrap_or(false);
+        let socket = sys::maybe_in_netns(self.netns.as_deref(), || {
+            let domain = Domain::for_address(address);
+            let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.set_nonblocking(true)?;
+            if domain == Domain::IPV6 {
+                socket.set_only_v6(!address.ip().is_unspecified())?;
+            }
+            self.common(&socket)?;
+            sys::set_udp_fragment(socket.as_raw_fd(), domain == Domain::IPV6, fragment)?;
+            socket.bind(&address.into())?;
+            Ok(socket)
+        })
+        .map_err(|error| io::Error::new(error.kind(), format!("listen {address}: {error}")))?;
+        UdpSocket::from_std(std::net::UdpSocket::from(socket))
     }
 
     /// A UDP socket for the inbound's own use, such as a SOCKS5 UDP
