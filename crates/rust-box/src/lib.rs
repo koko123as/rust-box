@@ -113,6 +113,9 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
                 OutboundOptions::Block(_) => Arc::new(Block::new(tag)),
+                OutboundOptions::Socks(_) | OutboundOptions::Http(_) => {
+                    return Err(anyhow!("outbounds[{index}]: this outbound type is not supported by rust-box yet"))
+                }
             });
         }
         if outbounds.is_empty() {

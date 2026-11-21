@@ -14,6 +14,7 @@ pub mod query_types;
 pub mod rule;
 pub mod rule_set;
 pub mod srs;
+pub mod tls;
 pub mod types;
 
 use std::net::IpAddr;
@@ -30,6 +31,7 @@ pub use rule_set::{
     DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,
     RuleSetKind, RuleSetOptions,
 };
+pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions};
 pub use types::{DomainResolveOptions, DomainStrategy, Duration, Listable, QueryType, UdpTimeout, User};
 
 #[derive(Debug, thiserror::Error)]
@@ -261,6 +263,10 @@ with_listen_fields! {
         pub tag: String,
         #[serde(default)]
         pub users: Vec<User>,
+        /// `http` and `mixed` only (sing-box `InboundTLSOptionsContainer`
+        /// in `HTTPMixedInboundOptions`); rejected on `socks`.
+        #[serde(default)]
+        pub tls: Option<InboundTlsOptions>,
     }
 }
 
@@ -273,6 +279,10 @@ pub enum Outbound {
     Direct(DirectOutbound),
     #[serde(rename = "block")]
     Block(BlockOutbound),
+    #[serde(rename = "socks")]
+    Socks(SocksOutbound),
+    #[serde(rename = "http")]
+    Http(HttpOutbound),
 }
 
 impl Outbound {
@@ -280,7 +290,129 @@ impl Outbound {
         match self {
             Outbound::Direct(options) => &options.tag,
             Outbound::Block(options) => &options.tag,
+            Outbound::Socks(options) => &options.tag,
+            Outbound::Http(options) => &options.tag,
         }
+    }
+
+    /// The dial fields of an outbound that dials (sing-box outbounds
+    /// embedding `DialerOptions`).
+    pub fn dialer_options(&self) -> Option<DialerOptions> {
+        match self {
+            Outbound::Direct(options) => Some(options.dialer_options()),
+            Outbound::Block(_) => None,
+            Outbound::Socks(options) => Some(options.dialer_options()),
+            Outbound::Http(options) => Some(options.dialer_options()),
+        }
+    }
+}
+
+/// sing-box `option.NetworkList`: `tcp`, `udp` or both, as one string or a
+/// list. Empty means both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkList(pub Vec<String>);
+
+impl NetworkList {
+    /// sing-box `NetworkList.Build`.
+    pub fn build(&self) -> Vec<String> {
+        if self.0.is_empty() {
+            vec!["tcp".into(), "udp".into()]
+        } else {
+            self.0.clone()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let list = Listable::<String>::deserialize(deserializer)?;
+        for network in list.iter() {
+            if network != "tcp" && network != "udp" {
+                return Err(serde::de::Error::custom(format!("unknown network: {network}")));
+            }
+        }
+        Ok(NetworkList(list.0))
+    }
+}
+
+/// sing-box `option.UDPOverTCPOptions`: a bool, or `{"enabled", "version"}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UdpOverTcpOptions {
+    pub enabled: bool,
+    pub version: u8,
+}
+
+impl<'de> Deserialize<'de> for UdpOverTcpOptions {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Object {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default)]
+            version: u8,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            Bool(bool),
+            Object(Object),
+        }
+        Ok(match Form::deserialize(deserializer)? {
+            Form::Bool(enabled) => UdpOverTcpOptions { enabled, version: 0 },
+            Form::Object(object) => UdpOverTcpOptions { enabled: object.enabled, version: object.version },
+        })
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `SOCKSOutboundOptions` (`DialerOptions` + `ServerOptions`).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SocksOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        /// `4`, `4a` or `5` (the default).
+        #[serde(default)]
+        pub version: String,
+        #[serde(default)]
+        pub username: String,
+        #[serde(default)]
+        pub password: String,
+        #[serde(default)]
+        pub network: NetworkList,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub udp_over_tcp: Option<UdpOverTcpOptions>,
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `HTTPOutboundOptions` (`DialerOptions` + `ServerOptions`).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HttpOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub username: String,
+        #[serde(default)]
+        pub password: String,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+        #[serde(default)]
+        pub path: String,
+        /// sing-box `badoption.HTTPHeader`: a name to one value or a list.
+        #[serde(default)]
+        pub headers: std::collections::BTreeMap<String, Listable<String>>,
     }
 }
 
@@ -454,10 +586,41 @@ impl Options {
             if !detour.is_empty() && !inbound_tags.contains(detour) {
                 return Err(field(format!("inbounds[{index}].detour"), format!("inbound detour not found: {detour}")));
             }
+            if let Some(tls) = &options.tls {
+                // sing-box's socks inbound has no `tls` field.
+                if matches!(inbound, Inbound::Socks(_)) {
+                    return Err(field(format!("inbounds[{index}]"), "unknown field `tls`".into()));
+                }
+                tls.validate(&format!("inbounds[{index}].tls"))?;
+            }
         }
         for (index, outbound) in self.outbounds.iter().enumerate() {
-            let Outbound::Direct(direct) = outbound else { continue };
             let path = format!("outbounds[{index}]");
+            match outbound {
+                Outbound::Socks(socks) => {
+                    if !matches!(socks.version.as_str(), "" | "4" | "4a" | "5") {
+                        return Err(field(
+                            format!("{path}.version"),
+                            format!("unknown socks version: {}", socks.version),
+                        ));
+                    }
+                    if socks.udp_over_tcp.as_ref().is_some_and(|uot| uot.enabled) {
+                        return Err(field(
+                            format!("{path}.udp_over_tcp"),
+                            "`udp_over_tcp` is not supported by rust-box yet".into(),
+                        ));
+                    }
+                    self.check_dialer(&path, &socks.dialer_options(), &server_known)?;
+                }
+                Outbound::Http(http) => {
+                    if let Some(tls) = &http.tls {
+                        tls.validate(&format!("{path}.tls"))?;
+                    }
+                    self.check_dialer(&path, &http.dialer_options(), &server_known)?;
+                }
+                _ => {}
+            }
+            let Outbound::Direct(direct) = outbound else { continue };
             if !direct.override_address.is_empty() || direct.override_port != 0 {
                 return Err(field(
                     path,

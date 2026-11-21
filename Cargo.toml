@@ -20,6 +20,7 @@ rb-dialer = { path = "crates/rb-dialer" }
 rb-fswatch = { path = "crates/rb-fswatch" }
 rb-certificate = { path = "crates/rb-certificate" }
 rb-rule-set = { path = "crates/rb-rule-set" }
+rb-tls = { path = "crates/rb-tls" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
