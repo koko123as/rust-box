@@ -258,6 +258,8 @@ pub struct VisionStream<T> {
     /// The data of a pass-through write that returned pending was already
     /// filtered.
     filtered: bool,
+    /// Room for one chunk read through the TLS.
+    chunk: Vec<u8>,
 }
 
 impl<T: TlsConn> VisionStream<T> {
@@ -284,6 +286,7 @@ impl<T: TlsConn> VisionStream<T> {
             remaining: VecDeque::new(),
             out: VecDeque::new(),
             filtered: false,
+            chunk: Vec::new(),
         }
     }
 
@@ -576,14 +579,17 @@ impl<T: TlsConn> AsyncRead for VisionStream<T> {
             if this.direct_read {
                 return Pin::new(this.raw()).poll_read(cx, buf);
             }
-            let mut chunk = vec![0u8; CHUNK_SIZE.max(buf.remaining())];
-            let mut read = ReadBuf::new(&mut chunk);
+            let size = CHUNK_SIZE.max(buf.remaining());
+            if this.chunk.len() < size {
+                this.chunk.resize(size, 0);
+            }
+            let mut read = ReadBuf::new(&mut this.chunk[..size]);
             ready!(Pin::new(&mut this.inner).poll_read(cx, &mut read))?;
             let count = read.filled().len();
             if count == 0 {
                 return Poll::Ready(Ok(()));
             }
-            chunk.truncate(count);
+            let chunk = this.chunk[..count].to_vec();
             this.process_chunk(chunk)?;
         }
     }

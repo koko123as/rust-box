@@ -26,3 +26,5 @@ rustls.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true

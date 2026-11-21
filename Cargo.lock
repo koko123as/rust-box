@@ -1155,11 +1155,13 @@ dependencies = [
  "rb-route",
  "rb-shadowsocks",
  "rb-tls",
+ "rcgen",
  "rustls",
  "serde_json",
  "sha1",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 
@@ -1339,9 +1341,11 @@ dependencies = [
  "rb-rule",
  "rb-rule-set",
  "rcgen",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

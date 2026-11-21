@@ -16,9 +16,9 @@ plumbing) and 4 (rule-sets) are in place:
 | Area | Implemented | sing-box reference |
 |---|---|---|
 | Configuration | sing-box JSON for the sections below; unknown fields and sections rust-box lacks are rejected with their path | `option/` |
-| Inbounds | `mixed`, `socks` (4, 4a, 5 CONNECT and UDP ASSOCIATE, users, `udp_timeout`), `http` (CONNECT and plain requests, Basic auth), `shadowsocks` (none, AEAD, 2022; users, 2022 relay `destinations`, UDP over TCP) | `protocol/{mixed,socks,http,shadowsocks}` |
+| Inbounds | `mixed`, `socks` (4, 4a, 5 CONNECT and UDP ASSOCIATE, users, `udp_timeout`), `http` (CONNECT and plain requests, Basic auth), `shadowsocks` (none, AEAD, 2022; users, 2022 relay `destinations`, UDP over TCP), `trojan` (TCP, UDP, `fallback`, `fallback_for_alpn`, TLS), `vless` (TCP, UDP, packetaddr, XUDP / mux sessions, `xtls-rprx-vision`, UDP over TCP, TLS) | `protocol/{mixed,socks,http,shadowsocks,trojan,vless}` |
 | Inbounds: listen fields | `listen` (default `127.0.0.1`), `listen_port`, `bind_interface`, `routing_mark`, `reuse_addr`, `netns`, `tcp_fast_open`, `tcp_multi_path`, `tcp_keep_alive*`, `udp_timeout`, `udp_fragment`, `detour` (hand-over to another inbound); legacy fields rejected as in v1.14.4 | `option/inbound.go`, `common/listener` |
-| Outbounds | `direct` (TCP and UDP, happy-eyeballs with `fallback_delay`), `block`, `shadowsocks` (none, AEAD, 2022 with identity headers, legacy stream ciphers, `udp_over_tcp`) | `protocol/{direct,block,shadowsocks}` |
+| Outbounds | `direct` (TCP and UDP, happy-eyeballs with `fallback_delay`), `block`, `shadowsocks` (none, AEAD, 2022 with identity headers, legacy stream ciphers, `udp_over_tcp`), `trojan` (TCP, UDP, TLS), `vless` (TCP, UDP with `packet_encoding` `xudp` / `packetaddr` / none, `xtls-rprx-vision` with direct copy, TLS) | `protocol/{direct,block,shadowsocks,trojan,vless}` |
 | Dial fields | all of `shared/dial`: `detour`, `bind_interface`, `inet4/6_bind_address`, `bind_address_no_port`, `protect_path`, `routing_mark`, `reuse_addr`, `netns`, `connect_timeout`, `tcp_fast_open`, `tcp_multi_path`, keep-alive, `udp_fragment`, `domain_resolver`, `fallback_delay`, deprecated `domain_strategy`, `network_strategy`/`network_type`/`fallback_network_type` (no effect, as in sing-box's command line); on `direct` and on `udp`/`tcp` DNS servers; `route.default_interface`, `route.default_mark` | `option/outbound.go`, `common/dialer` |
 | UDP | packet connections routed through the rules (`network: udp`), idle timeouts (inbound `udp_timeout`, route `udp_timeout`, protocol defaults), domain unmapping, `udp_connect`, a UDP NAT table | `route/conn.go`, `sing/common/udpnat2` |
 | Route rules | default and logical rules; `inbound`, `ip_version`, `network`, `auth_user`, `protocol`, `domain*`, `ip_cidr`, `ip_is_private`, `source_*`, `port`, `port_range`, `rule_set`, `rule_set_ip_cidr_match_source`, `invert`; sing-box's grouping (address items OR'd, groups AND'd) | `route/rule/` |
@@ -29,8 +29,9 @@ plumbing) and 4 (rule-sets) are in place:
 | DNS | `local`, `udp`, `tcp` servers; rules (`domain*`, `query_type`, `inbound`, `rule_set`, ...) with `route` and `reject`; `final`, `strategy`, cache | `dns/` |
 | CLI | `run`, `check`, `version`; `rule-set compile`, `decompile`, `format`, `upgrade`, `merge`, `match`, `convert` (AdGuard) | `cmd/sing-box` |
 
-Not yet: TUN, encrypted protocols (VMess, VLESS, Trojan,
-Hysteria2, TUIC, ...), TLS, DNS over TLS/HTTPS/QUIC, FakeIP, Clash
+Not yet: TUN, other encrypted protocols (VMess, Hysteria2, TUIC, ...),
+`multiplex` (sing-mux), V2Ray transports (`transport`), trojan-go
+multiplex, uTLS / REALITY, DNS over TLS/HTTPS/QUIC, FakeIP, Clash
 API and `tls_spoof`. The `network_strategy` family of fields (dial fields,
 route option, `route.default_network_*`) only works with a platform
 interface in sing-box's graphical clients; rust-box handles them as
