@@ -63,6 +63,8 @@ pub struct ProxyInbound {
     users: Arc<HashMap<String, String>>,
     udp_timeout: Duration,
     router: Arc<dyn ConnectionRouter>,
+    /// `tls` of the `http` and `mixed` inbounds.
+    tls: Option<rb_tls::TlsServer>,
     local_addr: OnceLock<SocketAddr>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -77,6 +79,11 @@ impl ProxyInbound {
         let listen = options.listen_options();
         let listener = Listener::new(&listen)?;
         let users = options.users.iter().map(|user| (user.username.clone(), user.password.clone())).collect();
+        let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
+            Some(_) if kind == ProxyKind::Socks => return Err("unknown field `tls`".into()),
+            Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
+            None => None,
+        };
         Ok(ProxyInbound {
             tag,
             kind,
@@ -85,6 +92,7 @@ impl ProxyInbound {
             users: Arc::new(users),
             udp_timeout: if listen.udp_timeout.0 .0.is_zero() { DEFAULT_UDP_TIMEOUT } else { listen.udp_timeout.0 .0 },
             router,
+            tls,
             local_addr: OnceLock::new(),
             task: Mutex::new(None),
         })
@@ -110,6 +118,9 @@ impl Inbound for ProxyInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        if let Some(tls) = &self.tls {
+            tls.start().map_err(|error| io::Error::other(format!("create TLS config: {error}")))?;
+        }
         let listener = self.listener.listen_tcp()?;
         let local = listener.local_addr()?;
         let _ = self.local_addr.set(local);
@@ -161,6 +172,9 @@ impl Inbound for ProxyInbound {
         if let Some(task) = self.task.lock().unwrap().take() {
             task.abort();
         }
+        if let Some(tls) = &self.tls {
+            tls.close();
+        }
     }
 
     /// A connection handed over by another inbound's `detour`: served as if
@@ -204,6 +218,16 @@ impl ProxyInbound {
     /// local address and any inbound detour.
     async fn handle(&self, mut stream: BoxStream, context: InboundContext) {
         let source = context.source;
+        // sing-box `tls.ServerHandshake` before the protocol.
+        if let Some(tls) = &self.tls {
+            stream = match tls.accept(stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    error!("{}: process connection from {source}: TLS handshake: {error}", self.log_prefix());
+                    return;
+                }
+            };
+        }
         let kind = match self.kind {
             ProxyKind::Mixed => {
                 let mut first = [0u8; 1];

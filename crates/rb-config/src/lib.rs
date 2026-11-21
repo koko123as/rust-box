@@ -976,6 +976,51 @@ mod tests {
     }
 
     #[test]
+    fn proxy_outbounds_and_tls() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"l"}]},
+                "inbounds":[{"type":"http","tls":{"enabled":true,"certificate_path":"c","key_path":"k"}}],
+                "outbounds":[
+                  {"type":"socks","tag":"s","server":"proxy.test","server_port":1080,"version":"4a",
+                   "username":"u","network":"tcp","udp_over_tcp":false,"domain_resolver":"l"},
+                  {"type":"http","tag":"h","server":"1.2.3.4","server_port":8080,"path":"/p",
+                   "headers":{"X-A":["1","2"],"host":"h.test"},"detour":"s",
+                   "tls":{"enabled":true,"server_name":"h.test","alpn":"http/1.1","fragment":true}}]}"#,
+        )
+        .unwrap();
+        let Outbound::Socks(socks) = &options.outbounds[0] else { panic!() };
+        assert_eq!((socks.server.as_str(), socks.server_port, socks.version.as_str()), ("proxy.test", 1080, "4a"));
+        assert_eq!(socks.network.build(), vec!["tcp"]);
+        let Outbound::Http(http) = &options.outbounds[1] else { panic!() };
+        assert_eq!(http.headers["X-A"].0, vec!["1", "2"]);
+        assert_eq!(http.tls.as_ref().unwrap().server_name, "h.test");
+        assert_eq!(http.dialer_options().detour, "s");
+        assert!(options.inbounds[0].options().tls.is_some());
+
+        for (config, needle) in [
+            (r#"{"outbounds":[{"type":"socks","version":"6"}]}"#, "outbounds[0].version: unknown socks version: 6"),
+            (
+                r#"{"outbounds":[{"type":"socks","udp_over_tcp":true}]}"#,
+                "outbounds[0].udp_over_tcp: `udp_over_tcp` is not supported by rust-box yet",
+            ),
+            (r#"{"outbounds":[{"type":"socks","network":"icmp"}]}"#, "unknown network: icmp"),
+            (r#"{"outbounds":[{"type":"http","detour":"x"}]}"#, "outbounds[0].detour: outbound detour not found: x"),
+            (
+                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":true}}}]}"#,
+                "outbounds[0].tls.utls: `utls` is not supported by rust-box yet",
+            ),
+            (r#"{"inbounds":[{"type":"socks","tls":{"enabled":true}}]}"#, "inbounds[0]: unknown field `tls`"),
+            (
+                r#"{"inbounds":[{"type":"mixed","tls":{"enabled":true,"reality":{"enabled":true}}}]}"#,
+                "inbounds[0].tls.reality",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
     fn checks_references() {
         let error =
             parse(r#"{"outbounds":[{"type":"direct","tag":"d"}],"route":{"final":"proxy"}}"#).unwrap_err().to_string();

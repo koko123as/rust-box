@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use rb_adapter::{ConnectionRouter, DnsResolver, Inbound, InboundRegistry, Outbound, OutboundRegistry};
 use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions};
-use rb_dialer::NetworkDefaults;
+use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
-use rb_protocol::{Block, Direct, ProxyInbound, ProxyKind};
+use rb_protocol::{Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, SocksOutbound};
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
 use rb_rule_set::{Env as RuleSetEnv, ManagedRuleSet, Updater};
@@ -104,6 +104,13 @@ impl RustBox {
         }
         let dns: Arc<dyn DnsResolver> = dns_router.clone();
         let default_resolver = options.route.default_domain_resolver.as_ref();
+        // What remote proxy outbounds dial their server with.
+        let dialer_env = DialerEnv {
+            defaults: defaults.clone(),
+            outbounds: outbound_registry.clone(),
+            dns: dns.clone(),
+            default_resolver: default_resolver.cloned(),
+        };
         let mut outbounds: Vec<Arc<dyn Outbound>> = Vec::new();
         for (index, outbound) in options.outbounds.iter().enumerate() {
             let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
@@ -113,9 +120,14 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
                 OutboundOptions::Block(_) => Arc::new(Block::new(tag)),
-                OutboundOptions::Socks(_) | OutboundOptions::Http(_) => {
-                    return Err(anyhow!("outbounds[{index}]: this outbound type is not supported by rust-box yet"))
-                }
+                OutboundOptions::Socks(socks) => Arc::new(
+                    SocksOutbound::new(socks, tag, &dialer_env)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
+                OutboundOptions::Http(http) => Arc::new(
+                    HttpOutbound::new(http, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
             });
         }
         if outbounds.is_empty() {
