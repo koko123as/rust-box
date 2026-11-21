@@ -670,31 +670,105 @@ fn check_proxy_outbound(
     Ok(())
 }
 
-/// sing-box `V2RayTransportOptions`: parsed as far as its `type` (one of
-/// `http`, `ws`, `quic`, `grpc`, `httpupgrade`, else "unknown transport
-/// type: X" as sing-box); V2Ray transports are not implemented yet, so a
-/// transport that parses is refused with its path.
+/// A V2Ray transport configuration. Runtime support is enabled only when the
+/// corresponding transport is wired into a proxy; until then validation
+/// rejects the whole `transport` field with its path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct V2RayTransportOptions {
     pub r#type: String,
-    pub options: serde_json::Value,
+    pub config: V2RayTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum V2RayTransportConfig {
+    Http(V2RayHttpOptions),
+    WebSocket(V2RayWebSocketOptions),
+    Grpc(V2RayGrpcOptions),
+    HttpUpgrade(V2RayHttpUpgradeOptions),
+    /// The upstream `quic` transport is recognized but is outside this
+    /// milestone's supported transport set.
+    Quic(serde_json::Value),
+}
+
+pub type V2RayHeaders = std::collections::HashMap<String, Listable<String>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayWebSocketOptions {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub headers: V2RayHeaders,
+    #[serde(default)]
+    pub max_early_data: u32,
+    #[serde(default)]
+    pub early_data_header_name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayHttpOptions {
+    #[serde(default)]
+    pub host: Listable<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub headers: V2RayHeaders,
+    #[serde(default)]
+    pub idle_timeout: Duration,
+    #[serde(default)]
+    pub ping_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayGrpcOptions {
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub idle_timeout: Duration,
+    #[serde(default)]
+    pub ping_timeout: Duration,
+    #[serde(default)]
+    pub permit_without_stream: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayHttpUpgradeOptions {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub headers: V2RayHeaders,
 }
 
 impl<'de> Deserialize<'de> for V2RayTransportOptions {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let options = serde_json::Value::deserialize(deserializer)?;
-        let serde_json::Value::Object(object) = &options else {
+        let serde_json::Value::Object(mut object) = options else {
             return Err(serde::de::Error::custom("invalid type: expected an object"));
         };
-        let r#type = match object.get("type") {
+        let r#type = match object.remove("type") {
             None | Some(serde_json::Value::Null) => String::new(),
-            Some(serde_json::Value::String(value)) => value.clone(),
+            Some(serde_json::Value::String(value)) => value,
             Some(_) => return Err(serde::de::Error::custom("invalid type: expected a string for `type`")),
         };
-        if !matches!(r#type.as_str(), "http" | "ws" | "quic" | "grpc" | "httpupgrade") {
-            return Err(serde::de::Error::custom(format!("unknown transport type: {}", r#type)));
-        }
-        Ok(V2RayTransportOptions { r#type, options })
+        let fields = serde_json::Value::Object(object);
+        let config = match r#type.as_str() {
+            "http" => V2RayTransportConfig::Http(serde_json::from_value(fields).map_err(serde::de::Error::custom)?),
+            "ws" => V2RayTransportConfig::WebSocket(serde_json::from_value(fields).map_err(serde::de::Error::custom)?),
+            "grpc" => V2RayTransportConfig::Grpc(serde_json::from_value(fields).map_err(serde::de::Error::custom)?),
+            "httpupgrade" => {
+                V2RayTransportConfig::HttpUpgrade(serde_json::from_value(fields).map_err(serde::de::Error::custom)?)
+            }
+            "quic" => V2RayTransportConfig::Quic(fields),
+            other => return Err(serde::de::Error::custom(format!("unknown transport type: {other}"))),
+        };
+        Ok(V2RayTransportOptions { r#type, config })
     }
 }
 
@@ -2131,6 +2205,53 @@ mod tests {
         ] {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn v2ray_transport_options_are_typed_and_strict() {
+        let websocket: V2RayTransportOptions = serde_json::from_str(
+            r#"{"type":"ws","path":"/socket","headers":{"X-Test":["one","two"]},"max_early_data":2048,"early_data_header_name":"Sec-WebSocket-Protocol"}"#,
+        )
+        .unwrap();
+        assert_eq!(websocket.r#type, "ws");
+        let V2RayTransportConfig::WebSocket(websocket) = websocket.config else { panic!() };
+        assert_eq!(websocket.path, "/socket");
+        assert_eq!(websocket.headers["X-Test"].0, ["one", "two"]);
+        assert_eq!(websocket.max_early_data, 2048);
+        assert_eq!(websocket.early_data_header_name, "Sec-WebSocket-Protocol");
+
+        let http: V2RayTransportOptions =
+            serde_json::from_str(r#"{"type":"http","host":"one.test","path":"/proxy","idle_timeout":"15s"}"#).unwrap();
+        let V2RayTransportConfig::Http(http) = http.config else { panic!() };
+        assert_eq!(http.host.0, ["one.test"]);
+        assert_eq!(http.path, "/proxy");
+        assert_eq!(http.idle_timeout.0, std::time::Duration::from_secs(15));
+        assert!(http.ping_timeout.0.is_zero());
+
+        let grpc: V2RayTransportOptions = serde_json::from_str(
+            r#"{"type":"grpc","service_name":"edge","idle_timeout":"5s","ping_timeout":"2s","permit_without_stream":true}"#,
+        )
+        .unwrap();
+        let V2RayTransportConfig::Grpc(grpc) = grpc.config else { panic!() };
+        assert_eq!(grpc.service_name, "edge");
+        assert_eq!(grpc.idle_timeout.0, std::time::Duration::from_secs(5));
+        assert_eq!(grpc.ping_timeout.0, std::time::Duration::from_secs(2));
+        assert!(grpc.permit_without_stream);
+
+        let httpupgrade: V2RayTransportOptions =
+            serde_json::from_str(r#"{"type":"httpupgrade","host":"edge.test","path":"/upgrade"}"#).unwrap();
+        let V2RayTransportConfig::HttpUpgrade(httpupgrade) = httpupgrade.config else { panic!() };
+        assert_eq!((httpupgrade.host.as_str(), httpupgrade.path.as_str()), ("edge.test", "/upgrade"));
+        assert!(httpupgrade.headers.is_empty());
+
+        let quic: V2RayTransportOptions = serde_json::from_str(r#"{"type":"quic","key":"legacy"}"#).unwrap();
+        assert!(matches!(quic.config, V2RayTransportConfig::Quic(_)));
+
+        for transport in ["ws", "http", "grpc", "httpupgrade"] {
+            let config = format!(r#"{{"type":"{transport}","unknown_option":true}}"#);
+            let error = serde_json::from_str::<V2RayTransportOptions>(&config).unwrap_err().to_string();
+            assert!(error.contains("unknown field `unknown_option`"), "{config}: {error}");
         }
     }
 
