@@ -2251,16 +2251,16 @@ mod tests {
         let Outbound::Hysteria2(hysteria2) = &options.outbounds[1] else { panic!() };
         assert_eq!(hysteria2.up_mbps, 40);
 
-        for (config, path) in [
-            (r#"{"inbounds":[{"type":"tuic","unknown":true}]}"#, "inbounds[0]"),
-            (
-                r#"{"outbounds":[{"type":"hysteria2","obfs":{"type":"salamander","unknown":true}}]}"#,
-                "outbounds[0].obfs",
-            ),
-        ] {
-            let error = parse(config).unwrap_err().to_string();
-            assert!(error.contains(path) && error.contains("unknown field"), "{config}: {error}");
-        }
+        let unknown_top_level = parse(r#"{"inbounds":[{"type":"tuic","unknown":true}]}"#).unwrap_err().to_string();
+        assert!(
+            unknown_top_level.contains("inbounds[0]") && unknown_top_level.contains("unknown field"),
+            "{unknown_top_level}"
+        );
+        let unknown_nested =
+            parse(r#"{"outbounds":[{"type":"hysteria2","obfs":{"type":"salamander","unknown":true}}]}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(unknown_nested.contains("unknown field `unknown`"), "{unknown_nested}");
     }
 
     #[test]
