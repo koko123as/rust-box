@@ -90,7 +90,9 @@ async fn route_rules_use_rule_sets() {
     let directory = tempfile::tempdir().unwrap();
     let local = directory.path().join("local.json");
     std::fs::write(&local, r#"{"version":3,"rules":[{"domain":"localhost"}]}"#).unwrap();
-    // A binary rule-set written by `rule-set compile` and served over HTTP.
+    // A binary rule-set written by `rule-set compile` and served over HTTP;
+    // downloaded through `direct`, since the default outbound (`final`)
+    // blocks, as in sing-box.
     let compiled = rb_config::srs::write(
         &rb_config::PlainRuleSetCompat::parse(br#"{"version":2,"rules":[{"domain_suffix":"remote.test"}]}"#)
             .unwrap()
@@ -107,7 +109,7 @@ async fn route_rules_use_rule_sets() {
     "rule_set": [
       {{"tag": "blocked", "rules": [{{"domain_suffix": "blocked.test"}}]}},
       {{"type": "local", "tag": "local", "path": {local:?}}},
-      {{"type": "remote", "tag": "remote", "format": "binary", "url": "http://{server}/remote.srs"}}
+      {{"type": "remote", "tag": "remote", "format": "binary", "url": "http://{server}/remote.srs", "download_detour": "direct"}}
     ],
     "rules": [
       {{"rule_set": "blocked", "action": "reject"}},
