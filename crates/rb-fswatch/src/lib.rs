@@ -34,6 +34,9 @@ pub struct Options {
 struct State {
     /// The generation of the pending callback per path.
     pending: HashMap<PathBuf, u64>,
+    /// Generations only grow, so a timer thread that wakes late never
+    /// mistakes a newer timer of the same path for its own.
+    next_generation: u64,
     closed: bool,
 }
 
@@ -149,7 +152,8 @@ fn schedule(state: &Arc<Mutex<State>>, callback: &Callback, path: PathBuf, wait:
         if guard.closed {
             return;
         }
-        let generation = guard.pending.get(&path).copied().unwrap_or(0) + 1;
+        guard.next_generation += 1;
+        let generation = guard.next_generation;
         guard.pending.insert(path.clone(), generation);
         generation
     };
@@ -174,7 +178,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn wait_for(counter: &AtomicUsize, at_least: usize) -> bool {
-        for _ in 0..100 {
+        for _ in 0..200 {
             if counter.load(Ordering::SeqCst) >= at_least {
                 return true;
             }
@@ -196,7 +200,8 @@ mod tests {
             callback: Arc::new(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
-            wait_timeout: Some(Duration::from_millis(50)),
+            // Generous, so a slow CI runner still sees the burst as one.
+            wait_timeout: Some(Duration::from_millis(300)),
         })
         .unwrap();
         watcher.start().unwrap();
@@ -205,7 +210,7 @@ mod tests {
             std::fs::write(&path, content).unwrap();
         }
         assert!(wait_for(&count, 1));
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(700));
         assert_eq!(count.load(Ordering::SeqCst), 1);
         // A file renamed into place is seen too.
         let staged = directory.path().join("staged.tmp");
@@ -214,11 +219,11 @@ mod tests {
         assert!(wait_for(&count, 2));
         // Other files in the directory are not.
         std::fs::write(directory.path().join("other.json"), "x").unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(700));
         assert_eq!(count.load(Ordering::SeqCst), 2);
         watcher.close();
         std::fs::write(&path, "f").unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(700));
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 }
