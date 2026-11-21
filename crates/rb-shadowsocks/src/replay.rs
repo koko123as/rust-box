@@ -103,10 +103,12 @@ mod tests {
         window.add(5000);
         assert!(window.check(4000));
         assert!(!window.check(5000));
-        // Behind the window.
-        assert!(!window.check(5000 - WINDOW_SIZE - 1));
         window.add(4999);
         assert!(!window.check(4999));
+        // Behind the window.
+        window.add(10_000);
+        assert!(!window.check(10_000 - WINDOW_SIZE - 1));
+        assert!(window.check(10_000 - WINDOW_SIZE));
     }
 
     #[test]
