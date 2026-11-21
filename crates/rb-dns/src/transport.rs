@@ -4,11 +4,13 @@ mod doh;
 mod doq;
 mod dot;
 mod hosts;
+mod http3;
 mod quic_socket;
 pub use doh::DohTransport;
 pub use doq::DoqTransport;
 pub use dot::DotTransport;
 pub use hosts::HostsTransport;
+pub use http3::H3Transport;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -38,6 +40,7 @@ pub enum Transport {
     Dot(Arc<DotTransport>),
     Doq(Arc<DoqTransport>),
     Doh(Arc<DohTransport>),
+    H3(Arc<H3Transport>),
     Hosts(Arc<HostsTransport>),
 }
 
@@ -50,6 +53,7 @@ impl std::fmt::Debug for Transport {
             Transport::Dot(_) => f.write_str("Dot"),
             Transport::Doq(_) => f.write_str("Doq"),
             Transport::Doh(_) => f.write_str("Doh"),
+            Transport::H3(_) => f.write_str("H3"),
             Transport::Hosts(_) => f.write_str("Hosts"),
         }
     }
@@ -135,6 +139,12 @@ impl Transport {
                 let response = doh.exchange(&query, timeout).await?;
                 parse_response(&response, id).map(|(answer, _)| answer)
             }
+            Transport::H3(h3) => {
+                let id = next_id();
+                let query = build_query(domain, query_type, id)?;
+                let response = h3.exchange(&query, timeout).await?;
+                parse_response(&response, id).map(|(answer, _)| answer)
+            }
             Transport::Doq(doq) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
@@ -209,6 +219,7 @@ impl Transport {
             Transport::Dot(dot) => dot.exchange(&message, timeout).await?,
             Transport::Doq(doq) => doq.exchange(&message, timeout).await?,
             Transport::Doh(doh) => doh.exchange(&message, timeout).await?,
+            Transport::H3(h3) => h3.exchange(&message, timeout).await?,
         };
         if response.len() < 12 || response[..2] != id.to_be_bytes() {
             return Err(invalid("DNS response id mismatch"));

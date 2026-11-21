@@ -149,6 +149,53 @@ fn doq_server_defaults_to_853_and_sets_default_alpn() {
 }
 
 #[test]
+fn http3_server_defaults_and_forces_h3_alpn_without_overriding_tls_identity() {
+    let dns = router(
+        r#"{"servers":[{"type":"local","tag":"bootstrap"},
+            {"type":"h3","tag":"h3","server":"dns.example","domain_resolver":"bootstrap"}],
+            "final":"h3"}"#
+            .into(),
+    );
+    let Transport::H3(h3) = dns.servers.get("h3").unwrap().as_ref() else { panic!() };
+    assert_eq!(h3.server(), &Socksaddr::from_host_port("dns.example", 443));
+    assert_eq!(h3.authority(), "dns.example");
+    assert_eq!(h3.path(), "/dns-query");
+    assert_eq!(h3.uri().to_string(), "https://dns.example/dns-query");
+    assert_eq!(h3.tls_server_name(), "dns.example");
+    assert_eq!(h3.tls_alpn(), vec!["h3"]);
+
+    let dns = router(
+        r#"{"servers":[{"type":"local","tag":"bootstrap"},
+            {"type":"h3","tag":"h3","server":"dns.example","server_port":8443,
+             "domain_resolver":"bootstrap","path":"custom","method":"GET",
+             "headers":{"Host":"resolver.example"},"tls":{"server_name":"verify.example","alpn":["h2"]}}],
+            "final":"h3"}"#
+            .into(),
+    );
+    let Transport::H3(h3) = dns.servers.get("h3").unwrap().as_ref() else { panic!() };
+    assert_eq!(h3.server(), &Socksaddr::from_host_port("dns.example", 8443));
+    assert_eq!(h3.authority(), "resolver.example:8443");
+    assert_eq!(h3.uri().to_string(), "https://resolver.example:8443/custom");
+    assert_eq!(h3.tls_server_name(), "verify.example");
+    assert_eq!(h3.tls_alpn(), vec!["h3"]);
+
+    let options: rb_config::DnsOptions =
+        serde_json::from_str(r#"{"servers":[{"type":"h3","server":"dns.example"}]}"#).unwrap();
+    let certificates = rb_certificate::Store::new(None).unwrap();
+    let error = match DnsRouter::new(
+        &options,
+        &Default::default(),
+        &rb_adapter::OutboundRegistry::new(),
+        &rb_rule::RuleSets::new(),
+        &certificates,
+    ) {
+        Ok(_) => panic!("domain DoH3 server without a resolver must fail during construction"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("missing domain resolver for domain server address"), "{error}");
+}
+
+#[test]
 fn doh_server_defaults_and_uses_host_only_for_http_authority() {
     let dns = router(
         r#"{"servers":[{"type":"local","tag":"bootstrap"},
