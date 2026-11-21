@@ -323,6 +323,10 @@ pub enum Inbound {
     Vless(VlessInbound),
     #[serde(rename = "vmess")]
     Vmess(VmessInbound),
+    #[serde(rename = "tuic")]
+    Tuic(TuicInbound),
+    #[serde(rename = "hysteria2")]
+    Hysteria2(Hysteria2Inbound),
 }
 
 impl Inbound {
@@ -333,6 +337,8 @@ impl Inbound {
             Inbound::Trojan(options) => &options.tag,
             Inbound::Vless(options) => &options.tag,
             Inbound::Vmess(options) => &options.tag,
+            Inbound::Tuic(options) => &options.tag,
+            Inbound::Hysteria2(options) => &options.tag,
         }
     }
     pub fn kind(&self) -> &'static str {
@@ -344,6 +350,8 @@ impl Inbound {
             Inbound::Trojan(_) => "trojan",
             Inbound::Vless(_) => "vless",
             Inbound::Vmess(_) => "vmess",
+            Inbound::Tuic(_) => "tuic",
+            Inbound::Hysteria2(_) => "hysteria2",
         }
     }
 
@@ -355,6 +363,8 @@ impl Inbound {
             Inbound::Trojan(options) => options.listen_options(),
             Inbound::Vless(options) => options.listen_options(),
             Inbound::Vmess(options) => options.listen_options(),
+            Inbound::Tuic(options) => options.listen_options(),
+            Inbound::Hysteria2(options) => options.listen_options(),
         }
     }
 
@@ -366,6 +376,8 @@ impl Inbound {
             Inbound::Trojan(options) => options.removed_field_error(),
             Inbound::Vless(options) => options.removed_field_error(),
             Inbound::Vmess(options) => options.removed_field_error(),
+            Inbound::Tuic(options) => options.removed_field_error(),
+            Inbound::Hysteria2(options) => options.removed_field_error(),
         }
     }
 }
@@ -505,6 +517,10 @@ pub enum Outbound {
     Vless(VlessOutbound),
     #[serde(rename = "vmess")]
     Vmess(VmessOutbound),
+    #[serde(rename = "tuic")]
+    Tuic(TuicOutbound),
+    #[serde(rename = "hysteria2")]
+    Hysteria2(Hysteria2Outbound),
 }
 
 impl Outbound {
@@ -518,6 +534,8 @@ impl Outbound {
             Outbound::Trojan(options) => &options.tag,
             Outbound::Vless(options) => &options.tag,
             Outbound::Vmess(options) => &options.tag,
+            Outbound::Tuic(options) => &options.tag,
+            Outbound::Hysteria2(options) => &options.tag,
         }
     }
 
@@ -533,6 +551,8 @@ impl Outbound {
             Outbound::Trojan(options) => Some(options.dialer_options()),
             Outbound::Vless(options) => Some(options.dialer_options()),
             Outbound::Vmess(options) => Some(options.dialer_options()),
+            Outbound::Tuic(options) => Some(options.dialer_options()),
+            Outbound::Hysteria2(options) => Some(options.dialer_options()),
         }
     }
 }
@@ -1338,6 +1358,8 @@ impl Options {
                 Inbound::Trojan(options) => options.tls.as_ref(),
                 Inbound::Vless(options) => options.tls.as_ref(),
                 Inbound::Vmess(options) => options.tls.as_ref(),
+                Inbound::Tuic(options) => options.tls.as_ref(),
+                Inbound::Hysteria2(options) => options.tls.as_ref(),
             };
             if let Some(tls) = tls {
                 // sing-box's socks inbound has no `tls` field.
@@ -2194,6 +2216,50 @@ mod tests {
         ] {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn tuic_and_hysteria2_options_are_typed_and_strict() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"tuic","tag":"tuic-in","listen":"127.0.0.1","listen_port":443,
+                   "users":[{"name":"alice","uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p"}],
+                   "congestion_control":"new_reno","tls":{"enabled":true}},
+                  {"type":"hysteria2","tag":"hy2-in","listen_port":8443,
+                   "users":[{"name":"bob","password":"q"}],"tls":{"enabled":true},
+                   "obfs":{"type":"salamander","password":"secret"}}],
+                "outbounds":[
+                  {"type":"tuic","tag":"tuic-out","server":"example.com","server_port":443,
+                   "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p",
+                   "udp_relay_mode":"native","tls":{"enabled":true}},
+                  {"type":"hysteria2","tag":"hy2-out","server":"example.com","server_port":8443,
+                   "password":"q","up_mbps":40,"tls":{"enabled":true}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.inbounds[0].kind(), "tuic");
+        assert_eq!(options.inbounds[0].listen_options().listen_port, 443);
+        let Inbound::Tuic(tuic) = &options.inbounds[0] else { panic!() };
+        assert_eq!(tuic.users[0].name, "alice");
+        assert_eq!(tuic.congestion_control, "new_reno");
+        let Inbound::Hysteria2(hysteria2) = &options.inbounds[1] else { panic!() };
+        assert_eq!(hysteria2.obfs.as_ref().unwrap().r#type, "salamander");
+        assert_eq!(hysteria2.users[0].password, "q");
+        let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
+        assert_eq!(tuic.udp_relay_mode, "native");
+        assert_eq!(tuic.dialer_options().detour, "");
+        let Outbound::Hysteria2(hysteria2) = &options.outbounds[1] else { panic!() };
+        assert_eq!(hysteria2.up_mbps, 40);
+
+        for (config, path) in [
+            (r#"{"inbounds":[{"type":"tuic","unknown":true}]}"#, "inbounds[0]"),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","obfs":{"type":"salamander","unknown":true}}]}"#,
+                "outbounds[0].obfs",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(path) && error.contains("unknown field"), "{config}: {error}");
         }
     }
 

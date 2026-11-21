@@ -150,6 +150,12 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
                     built
                 }
+                OutboundOptions::Tuic(_) => {
+                    return Err(anyhow!("outbounds[{index}].type: `tuic` is not supported by rust-box yet"))
+                }
+                OutboundOptions::Hysteria2(_) => {
+                    return Err(anyhow!("outbounds[{index}].type: `hysteria2` is not supported by rust-box yet"))
+                }
             });
         }
         if outbounds.is_empty() {
@@ -197,6 +203,12 @@ impl RustBox {
                     VmessInbound::new(vmess, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
+                InboundOptions::Tuic(_) => {
+                    return Err(anyhow!("inbounds[{index}].type: `tuic` is not supported by rust-box yet"))
+                }
+                InboundOptions::Hysteria2(_) => {
+                    return Err(anyhow!("inbounds[{index}].type: `hysteria2` is not supported by rust-box yet"))
+                }
             };
             inbounds.push(built);
         }

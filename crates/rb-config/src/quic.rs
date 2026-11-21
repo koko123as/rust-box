@@ -302,10 +302,11 @@ mod tests {
 
     #[test]
     fn memory_bytes_accepts_v1_14_4_numeric_and_binary_unit_forms() {
-        for (source, expected) in [("65536", 65536), ("\"4 MB\"", 4 * 1024 * 1024), ("\"2GiB\"", 2 << 30)] {
+        for (source, expected) in [("65536", 65536), ("\"4 MB\"", 4 * 1024 * 1024), ("\"2 GB\"", 2 << 30)] {
             assert_eq!(serde_json::from_str::<MemoryBytes>(source).unwrap().value(), expected);
         }
         assert!(serde_json::from_str::<MemoryBytes>("\"1.5GB\"").is_err());
+        assert!(serde_json::from_str::<MemoryBytes>("\"2 GiB\"").is_err());
         assert!(serde_json::from_str::<MemoryBytes>("\"8MBps\"").is_err());
     }
 
