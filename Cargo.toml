@@ -21,6 +21,7 @@ rb-fswatch = { path = "crates/rb-fswatch" }
 rb-certificate = { path = "crates/rb-certificate" }
 rb-rule-set = { path = "crates/rb-rule-set" }
 rb-tls = { path = "crates/rb-tls" }
+rb-shadowsocks = { path = "crates/rb-shadowsocks" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -37,6 +38,14 @@ aes = "0.8"
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+ctr = "0.9"
+cfb-mode = "0.8"
+# `pure`: no C or assembly, so it cross-compiles (Android) without a C toolchain.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
 socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 httparse = "1"

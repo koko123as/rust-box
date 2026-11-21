@@ -1,0 +1,27 @@
+[package]
+name = "rb-shadowsocks"
+description = "rust-box shadowsocks wire format (sing-shadowsocks, sing-shadowsocks2): AEAD, 2022 and legacy stream ciphers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-adapter.workspace = true
+tokio.workspace = true
+rand.workspace = true
+aes.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+chacha20.workspace = true
+blake3.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+ctr.workspace = true
+cfb-mode.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,438 @@
+{
+  "time": 1795277340,
+  "keys": [
+    {
+      "password": "test-password",
+      "size": 16,
+      "key": "dfb450efddbb5387197c84460623675b"
+    },
+    {
+      "password": "test-password",
+      "size": 24,
+      "key": "dfb450efddbb5387197c84460623675b69f2cebcd8ef520a"
+    },
+    {
+      "password": "test-password",
+      "size": 32,
+      "key": "dfb450efddbb5387197c84460623675b69f2cebcd8ef520a3dfddef7c3d540b2"
+    }
+  ],
+  "aead_subkeys": [
+    {
+      "key": "8ce4b16b22b58894aa86c421e8759df3",
+      "salt": "30313233343536373839616263646566",
+      "size": 16,
+      "out": "be29706567d36f711eb0123e22685419"
+    },
+    {
+      "key": "8ce4b16b22b58894aa86c421e8759df3325190d36fce2620",
+      "salt": "303132333435363738396162636465663031323334353637",
+      "size": 24,
+      "out": "3f31292c29ec42a642403c328e02af7da5907bc7d064aae1"
+    },
+    {
+      "key": "8ce4b16b22b58894aa86c421e8759df3325190d36fce2620e358437b1c245789",
+      "salt": "3031323334353637383961626364656630313233343536373839616263646566",
+      "size": 32,
+      "out": "63f9b98b50196ac4158399bc16cec787b8f3dae02605e83419dd9292a5810bd2"
+    }
+  ],
+  "session_keys": [
+    {
+      "key": "000102030405060708090a0b0c0d0e0f",
+      "salt": "30313233343536373839616263646566",
+      "size": 16,
+      "out": "c58a95c13a36e552502c39c195387fd2"
+    },
+    {
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt": "3031323334353637383961626364656630313233343536373839616263646566",
+      "size": 32,
+      "out": "ad4e0d038d0404e28e7446052c14036c62ee2e737aa0d482b7421cbf1eb45ed8"
+    }
+  ],
+  "identity_subkeys": [
+    {
+      "key": "000102030405060708090a0b0c0d0e0f",
+      "salt": "30313233343536373839616263646566",
+      "size": 16,
+      "out": "3769859ee94b5779b0084a3eed5e8604"
+    },
+    {
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt": "3031323334353637383961626364656630313233343536373839616263646566",
+      "size": 32,
+      "out": "986104af7ad8eb3815a99c85ba84c966e8591f59251ae6ef0697ede4028d9df4"
+    }
+  ],
+  "psk_hashes": {
+    "000102030405060708090a0b0c0d0e0f": "a6a492965517a830cb75fdb713465aa4",
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f": "e528e95798037df410543d9f31e396ec"
+  },
+  "sha256_keys": [
+    {
+      "key": "61206b6579206c6f6e676572207468616e207468697274792d74776f2062797465732c2068617368656420646f776e",
+      "salt": "",
+      "size": 16,
+      "out": "c01b23db95d5e6e369eeda6893e1f497"
+    },
+    {
+      "key": "61206b6579206c6f6e676572207468616e207468697274792d74776f2062797465732c2068617368656420646f776e",
+      "salt": "",
+      "size": 32,
+      "out": "c01b23db95d5e6e369eeda6893e1f4976bf015a85500564d943eb1b8a9aaa84c"
+    }
+  ],
+  "base64_errors": {
+    "!!!!": "illegal base64 data at input byte 0",
+    "AAA=": "",
+    "AAAA AAAA": "illegal base64 data at input byte 4",
+    "AAAA=": "illegal base64 data at input byte 4",
+    "AAAAAA==AA": "illegal base64 data at input byte 8",
+    "AAAAAAAAAAAAAAAAAAAAAA": "illegal base64 data at input byte 20",
+    "ab=c": "illegal base64 data at input byte 2",
+    "abc": "illegal base64 data at input byte 0"
+  },
+  "tcp": [
+    {
+      "method": "aes-128-gcm",
+      "client_password": "test-password",
+      "server_password": "test-password",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "6eb42238b3b054cd80eb18450a5e03a15ae71fdba833419d08a6fab9ebe2a9a2f609a6deb1b140b863e6671ae9552bc1647d77917695676980be755254d2ba747f46f696e176cf92f518521ca206c53525a299a33b6a6919a31890f6f08c807aefa8337b584d1aeb",
+      "server_payload": "776f726c64",
+      "response": "470a8496f265f6f0ccd24807f76cb32c2ba864799c2172c0b2ae75bc888a3230a8176e80752a2d9a37ab3245e36cc6e6f146e113631bfd"
+    },
+    {
+      "method": "aes-192-gcm",
+      "client_password": "test-password",
+      "server_password": "test-password",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "dc8f46caebac1979b10de6822994cae43afa6e5be9531ae4471a9991e64b6a9f441a3de99e9986de33d6375635a53a5f32e688545925a27feb81fb8ca9dd43efacf19aeba38c284d1e988d2adc2f2b30747e4114e377d15980cde4b7601fd7f949d9ba52096d707ef536ca8bba40de6e",
+      "server_payload": "776f726c64",
+      "response": "fd36847d50e5b937e3c605aeb35fee4509f69e1c51ef335895898b7efd82897c31acf92b96af384e99c2d56a0a1d8f45e9ecb72288c70b7fa7a0b6025f9f08"
+    },
+    {
+      "method": "aes-256-gcm",
+      "client_password": "test-password",
+      "server_password": "test-password",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "043187daad181a4da5f33a2c5becb50f386f622c5cd296ca7aba1005d1324b946b31a0ed6ae1384165ed787a231a06d0f2e344be3c4851f161a391b89c5c80ad87e4173380e85d092fae5e415b318722f147006464a09f920375e55c4229631651bbe2143ad79148968d5127ec19c0109266db5eba238a8d",
+      "server_payload": "776f726c64",
+      "response": "13f25478c893eaab442d16b8866a2c4d22d4f28f11f648bca619d0f1555e7fa3166fc7c16307e58f53d78010270f0742d28f8d8953df3ae0f634d05785db0f71c2a41f12b3a0e5"
+    },
+    {
+      "method": "chacha20-ietf-poly1305",
+      "client_password": "test-password",
+      "server_password": "test-password",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "2411e0e74365e80c59fedf100fded73c5640b7fc0c7664c93ef1fa046a58e0d3f0e98e156b82e664f79b68807d01fd98a613f9077c2dc72884b163ad21b1beed1fefa163563bfe0cb43c6cec5e65390d19b8ce8fae2f17ebc2acc18127b3f4f2d74dc14c77f65ceb0cf4453f75eca6ddbd76843167cd61b9",
+      "server_payload": "776f726c64",
+      "response": "c6711d665f0ae845226f7feb73e920f77179cdcaf2c805060708d63fb211f981848796ed10e1a82b94a906bf82e0d057a4f69d44072248bdb82ab68829d7a65e7bb6f4fb1f2a01"
+    },
+    {
+      "method": "xchacha20-ietf-poly1305",
+      "client_password": "test-password",
+      "server_password": "test-password",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "491a01d989bb7eb0b3382f831670295563cc2fb1aedb8a8d0da5fe3e9374133eb03c87c031aac0b020d3bb04651b302aa7b0a0c62d90d856f2b318490354f268362165cc648d8a18151a5d11a805bf6797f80d20c66485c068fa9ec482672491af2ad59088dd4bce7be4b44a76f4b8e60ac1d36678d73efb",
+      "server_payload": "776f726c64",
+      "response": "ad9ec5dba9cf1f9691f8f5cc5bfa969227c86a8cb58cc27a0bbdec6e7f5557e24dc16b60b8b87694cf9ed9559ed9f1a1d09d023bb1f69c9fc6afc2ea911abe17548af3045ac882"
+    },
+    {
+      "method": "aes-128-gcm",
+      "client_password": "user-b",
+      "server_password": "",
+      "users": [
+        "user-a",
+        "user-b"
+      ],
+      "destination": "1.2.3.4:80",
+      "payload": "68656c6c6f",
+      "request": "96ca659d68721b0290e1831802b3a7c87f7bfd57b1066f5b5e7e94374d2edf09ac854fd36e66e9f3a894edd546ee150a408bf2e78ffbf0b3c19ef7cc5ca8f2dde77f326e56275b588f85351cf5011e13aa671c2ae0a17fd98cc59b3464e81828",
+      "server_payload": "776f726c64",
+      "response": "2c7708eb2180e3db603f0f4bacda96faa058417f007beea5634d25d043a11c9b6d2dfcb2999f9740a1a41ca811b4ffc5505a078cd2de02"
+    },
+    {
+      "method": "2022-blake3-aes-128-gcm",
+      "client_password": "AAECAwQFBgcICQoLDA0ODw==",
+      "server_password": "AAECAwQFBgcICQoLDA0ODw==",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "1afbf729c3b52d1c73e667544a8c170e60bf231ad19f746c54e311bfbccd5ef27207c0b928ca4c494d83a85f56a7faf9a7e30247c960bf01a436de3f8f2a11491d0d640ad09bb39181b80ba9ac86e6260a7695f98bedc84de7538cb25ae80d2189843f07bc00eecf663f612582f954825c67121c4fd2cccc874b852b72d961457b86a267680e6bf62a6b1596c883941855cc3b94e5bde2b0c280812c70b96e19df14fa6825569eed23d05f4e199ca55d5658cfe9e5a1a8691dbe32f39a68d8b1f37e2e2317c321c66e50bd430cd0ea41e25f79076c38e58070ea16441102e472aa0a7f97796d7973f0c6f581bac9d159839c10411d83a58cfe7adc27f6cccfedaafe55255c033c6fe758e3ec9018eb355f56776d51edf3190ba9b6c7b6df5194eac5db28fb0d5ba0b25619658ca2c470701d514cb5343c2e868f987afd8b712a0479b2fc2da424652482ff47f5bcf8e7af687ff1a6fab15a418bcc35c94f330f54d6c2a748a7087ac39394ec0d07fbe1a1d63089038b6fd63a63dc7f3ba98600010e83d7e41fb8708b9ef9a38e8d2d22f98af7fef8cd421a824b5e490efcbade39709f8d41aa13cf14bc866c59e62e3383127c6af622268ec11c9a225032516cae619ccf71ab717afdfb5d6d5198642ce7d3016be2d994bab8428d55fc521d4859db7c8838cb531ec894fc13c3261570ce9159a1337f25aed05c0bc4561ef5b34b14f01ffbb947d2032b808a1248f353e53069cdf7579319a163c57011d822a141d43c49ca2c9b077475d71bf73d89b047a7835d4c27d656baf30c7e89e37ad8ac148ff8e24dabe84642fb000b",
+      "server_payload": "776f726c64",
+      "response": "9d3633b15e1c08a1f0b4c9911c9d4229d4c94d731acc48fbfd6ae98fdd811ac7c9f8fbc87f2e8941bdb95da69b49c522e728dff340d9f4a88a05e133724ab61ae44900fae4986d411add4f09a12d6599"
+    },
+    {
+      "method": "2022-blake3-aes-256-gcm",
+      "client_password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "server_password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "users": null,
+      "destination": "[2001:db8::1]:443",
+      "payload": "68656c6c6f",
+      "request": "a845586fdcdab15c2b0f6fa9520a3e87c56bbfd068ebf7b2169bc8297f6e378c264acafb4dd2f5258488a47991968b5e70b9bc7ca398273f17087a6f56a015e8f262821d2551e350a251c4f362cf3f6d1947561a431c69f840d130d6682f1dc74f5e7eeaa554477f06c61f7c5bab43cf3c2b5d39595c5fddc6b51e6e16f060d91225277b41e16e4c35bc66bfc37fa7b7718bda9100a164aa80edfed3e7737e6a092825812b514245c4fccab1133cbd34dde843a42ad7a66337019f88947d8b44e78da48141fcd7d975702c92405b5a73f427037d924c3b3a02163af73c51e46d0e0261bc86ed77c5a475b8425c24b27a0e6114f2b9928ac7166916ec3f7d55b6c228847ec8ebdfa0ad92105887ec95e46fd435e6331b2703c48580942177676e479649458b803718df476465762900c63443c0d0fb14a5f2027f8ae999beac68b9a3f9e809d7f53f91559ddb9b8fb0a005b926f83b68912ef69aa78ef99ff0177536db38d4bced1b7752164b4e211b5b8c583ad0b8bae7369bd6ca62033190df2d264c86edb33e184b15edc2d02e788964405977d9815c2532daec1334e5733e03c5e131351a6bc02dcb966a18f5eed75ae7d307bcc815a3ca122dd4f1143f87f4717e5f08358f705000e706f84e47651c1720bc96e1dd1761b013198fbeaead32ce733c35e87e7fd0395fa675d60215820c8f38f19488a505326aeb80335bdacbaebd1ead443a4b0811ba8d1696595516ddedef9ee579cda3f821e8643e7f57ad89f001466b2200323b6586317f0ee9c5033ca75eb40a32693d24a312",
+      "server_payload": "776f726c64",
+      "response": "5a2d8ea8d3a1096d68ccf05e96395eb6cb3bb921cbfac534f29d53681a799a28bf9cba5f5c29a1a6d0b46834f67c98bcb47c641cf73696f8ff29ef906299e4104e6dd0b42f43022d062aeae1adc30f220dbdcf2e1b84a595473fb1eeb40aa5dc70b7cadaab0b5d805529fe9f427733a5"
+    },
+    {
+      "method": "2022-blake3-chacha20-poly1305",
+      "client_password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "server_password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "5f69efcb666003bc11464681d07fd3f7979bf6e7c6f15733380e31d0b1bd2b541507b662922e1ebae716d22d00aa84fe975de985171c5f1e688c7f71ed1cf36693c80d5b5b1044de768ba3c01c0e08e76f6f81359fb654171d86a6c9d13e6198fef6b0760b8684a49b7d7e65fb8ad093a83a64bc98fcc90e67c0998270f66158fc2050e05341ffb72b88d00741dc706cf7f9e20e0234cd3680b45f21f17d4a317651aa9d859f30ecad544cf9ca3256daf104ee3e4e8654f9d96f1152d006af42c7f1419787854a64d261c4240575088627cd5c67017b2f0b66d12e91b6e16dcf36a936087f7dd60681a05b2c913fca1095c71f92c3edfa3ffe430ab15ffc48d06fcbc7ce82de3fd819892f264ae7332df0d126553d7f62587f3431980f4e558c7ff3c3102bcfb18c1bd8260180b58c111823fe6611ece2242cedd366b7521c1b071419349bc8018b6dffb3460760af2a7465be09117819642fae8edd12b5b7411aeda424d5a66338733e4651d274c8114eb168459b77e9f99aa1a88288becd368d29e1860596485133f8a2498490a93e2ef5c41b09278efd3c46d2cf201f3af6120a33a6176494ce9fc61cf4111a5047664d0a4daa4e7f33b2627042782f13666873c3e905b10fd3e57ee93486d5051df0538dd7995ba9536952da7a12220a15197c49431bb51ebb6efbcf0f20ae497059efae7e6a461b6f168443579278db763cd16c31671ab9bfc2bf797120a84ce6c2ac54d6bbd9be3a4f135bfff0fd08992c9d75c0532a3305a5d70cccaa5bb6bfa8f4c6a2c24b93d294a2c2a5d7429ac7887baef98e528b8ecd14952582635dec28c5e7ca0fa298580123d17b55e36dc49bdc06cbbf0b45e67a7593cf8780554ee88f6b8540330138ed44c5a622e3eacf322fe097aba72a",
+      "server_payload": "776f726c64",
+      "response": "bd1b8d7805b4b97c2b9559c5ad87b6ab5926b8165fc0431f111caea559cc8fe15c53c4a824e7e1f58bf51535ee8514c464d86e2943862c0e22de19ce0563032b8bf5c648fb64ec1bdc117cf4e9d16d0db9e1d9e5e32e098173d70c9d342ded444d1a34dfbeb197a589c29be479557fe6"
+    },
+    {
+      "method": "2022-blake3-aes-128-gcm",
+      "client_password": "AAECAwQFBgcICQoLDA0ODw==:EBESExQVFhcYGRobHB0eHw==",
+      "server_password": "AAECAwQFBgcICQoLDA0ODw==",
+      "users": [
+        "AQEBAQEBAQEBAQEBAQEBAQ==",
+        "EBESExQVFhcYGRobHB0eHw=="
+      ],
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "dcdd3b0f7007b44fcd0cc10b7ee05c854fe9546b1ae10015069ffc9eef1ea49178283195e94a8feea579ac899c2bfde6659457d8d8622c0b18de8afafa86887bac3f6c668ea972b41af6f4a763692b559784c19d8a5f2ded50adda74ef4da829ca283417e4b25a5906f3205a1fb0b115283cb04bbd30b07d5a89fc81d9e7859e96a17a183cdb7ee6dcbf6a5753115c3edd5f9067108ec6bba69d323841cc2731698f97c8f9ae250d34595f90fccb3043abd8d1647d850e634bb568fb8e780c03e03cf57d58f6f540f074801e5adf8c3de42745730d75290f15eda610adcd18d9c651736b9e90639774c24479629315eb3b400385b366d023fe8a8f066db90c9a1f0cb620bf2259cc3019779035cd527d6a6da41f03d8723cdf4ede63372bd3e2c5fdb56e56e959385b1633f5c4d6c293fe05f1fa46035c4b6e0ab858515e5fc8e9c30775cb738cfe863f43db29d691777ddc35ed9308a3e25bbe06e6e61f83b1525be8ae08709d3034747087c7979c762de1a158578596b80b4b6a8b5547ba0bd05e5748f9ac0d851d195188e514ed6d1ccc55f6289085b5ecd0afdc3c651da5aba4f42aa7333eb5a48c7917f63c4b78e09f29ff78af5fcb624eb7a98454fc3e2d6c48766f4cd544f773ae3b8d7c289c7806380a9d49d99e89742c2c9801dd10063da5b5151b2cb581e920d161ad67b035ba29fd0b94caa1d7e01eb2e2a4a93c848af890d1090d01ff0ff589960ce007c415a40f3e7738ce62e39369204b07ca931444846c5c8582eba0b62042b53c5563bc72945be4e968ca8a29e82f874b4f9175ad50d32b19c655c58a059d3bda8b7354353b81ff767b78969fc7cbae400886849dfaf9d71f61143288f9502194a1ba6a5463dea8fb80b8e5af7fb51a0c8200d53668b94cf1279c9eb30c6e4fe9b2b294b7dbe4dc5944c8c58f8f714db409b7b76eada60612aaa1af553d77ee378ca848a77a004e6b55fe57c69a54ca042f0c51b671bac4c37b98258f9b720ad237173ddd0200a4d1dfa60dccd8036b07c7d1a698415bbc6e451c8d4bb282393979d27173413884d37c033a58590ac27a3c9904777b9d81ff26075fb49e93dfe2545dce62fd62269c5e2e14ebe655b4",
+      "server_payload": "776f726c64",
+      "response": "9c5f41acada1d44c1364ca511b6c83d14bd258bacc1d1eda190221bfba677b010e8a2e570b4f9b28c09a230db0a2a022cd21cc8667c20347ec57801830e4568885b485256aee5e71a36792d1acb4dbc9"
+    },
+    {
+      "method": "none",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "030b6578616d706c652e636f6d01bb68656c6c6f",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "aes-128-ctr",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "17d13bcf128a4a846023f70888e670d7b57e100897efcea709281e0d6da554eb5c54125d",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "aes-192-ctr",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "c2b6529bbf33f91e961056444471c23225e2c1d7a65d0809c0738f35df8a51a65ea51461",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "aes-256-ctr",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "bfee706660a3ac988e2103ab94c927b94c99db03d31e78d9bff7b7d82635c3e628508afb",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "aes-128-cfb",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "d9cc58a08f33c84ded5dbb4a9ef17142f49031bf0752d5ec97516c9f76ff67814a554a9c",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "aes-192-cfb",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "809940781221622edae21f563ef319a82e6b6ba014d122dd4a1595d4062658c1aebfd91b",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "aes-256-cfb",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "935e77303ce3590177aa2efc4775795ae1f84df4c48b023dba8b1b894c7a3a852e6778ff",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "rc4-md5",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "6d3e8ef1439fccdb664429aad729f57b8f27c1174aa3705e6f925e367fac6ed85f0cd360",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "chacha20-ietf",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "715751a640f71c37049f7aa16e5a1dbb43600d2d5b1284280ce8a4bb969d44d3",
+      "server_payload": "776f726c64",
+      "response": ""
+    },
+    {
+      "method": "xchacha20",
+      "client_password": "test-password",
+      "server_password": "",
+      "users": null,
+      "destination": "example.com:443",
+      "payload": "68656c6c6f",
+      "request": "ab8daaf3a31f642ac4a809fa063140870cf1c85ad4fb4ed6193574bb39cc6bf526e63160b2b944751466b35f",
+      "server_payload": "776f726c64",
+      "response": ""
+    }
+  ],
+  "udp": [
+    {
+      "method": "none",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "030b6578616d706c652e636f6d003570696e67"
+    },
+    {
+      "method": "aes-128-gcm",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "3d7eb5b8ae0009b7b5af16fcc097585d6ff497856a25fae74cb77b42fa50dd8bfaffa7f33bc9ae70618f5c8f0a48a1d749699b"
+    },
+    {
+      "method": "aes-192-gcm",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "b3996f75064ac4aa39a615fc1e6b17b0f961d5554bee88b06fc153059afcfbf708c64a17fece15c33b68f3ca7dcf2d08ecc8a26bf89263d53fea51"
+    },
+    {
+      "method": "aes-256-gcm",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "ffbab09bdedac53f765252153d9b91794fa595989ebd0362628fb015155522a8d0498da5cbf3a155873f0309bfbdd8ffcee3875301c506ae33a7b5d31188abc735caf2"
+    },
+    {
+      "method": "chacha20-ietf-poly1305",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "e89096f3af00729456401796d81b7f478df5bf0bb22c509c340002fd196518a2d947b7fe1b3a1e4e862ca02879b671aaac5e4a1b3fb83dbfff5c20e9e49dc6c186432c"
+    },
+    {
+      "method": "xchacha20-ietf-poly1305",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "469d738a86fc7a3efee86f45d1494d94b9f91af96920275ec6faaa682132978d233819595ac25b4d9929c75094e4d4f76fdae68fac8efe38ba24e37f1becd9cb6d9bd1"
+    },
+    {
+      "method": "aes-128-ctr",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "2f0b79dd0ca1a20efcc20616b19cfa519cd68473989527ef7e686a12fe23e5bc20698c"
+    },
+    {
+      "method": "aes-256-cfb",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "4d7b6d4e02d0e51699cebe7c3bc95cb47275ce391d01b4ad299699d404a97ce262de8f"
+    },
+    {
+      "method": "rc4-md5",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "1748dd7e749f3387f50a04be2f272a1676196f10f79ede1c42321d6bf385f978843a31"
+    },
+    {
+      "method": "chacha20-ietf",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "21f21478e3149eb517b7a63c0437f5939902e3eca530cb367e2ba97c8dabfd"
+    },
+    {
+      "method": "xchacha20",
+      "password": "test-password",
+      "destination": "example.com:53",
+      "payload": "70696e67",
+      "packet": "db906cd02f47a9d3ebd0ea4de86060bbea18c4294091c48dd5f3fbddc01d79674dc592d8ee214c7a9b1e3c"
+    },
+    {
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAECAwQFBgcICQoLDA0ODw==",
+      "destination": "1.2.3.4:53",
+      "payload": "70696e67",
+      "packet": "4f125d2d7f40559ef9bd9e298a997360b975a4906293fc97e540d02a52e338087d6ae6a9851c7cc519609b356cf211110133d4027b48a0e457077fd23136c9c793b9394c38dd4f1072a6b272bd8d223af03cbc04e10b763bf79d2b536d3cce33b8fafcd77ec833f18d683a9b5b253972c550a3264a94fbad2318817203287fed86b7f641bfad32623cf85a3d520760aace9ec734eb6acf18fbe3000b78c5d01fb972d639246234ed337db9f0aee0"
+    },
+    {
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAECAwQFBgcICQoLDA0ODw==",
+      "destination": "example.com:443",
+      "payload": "70696e67",
+      "packet": "08a41ee9979ae2f8ab5786ec8da7a76d75ab74208768a09a752460e131cdf79ef01f408732970ef984ac60292cfa14e6e25bfca19fe9833a5c3ef77aa288"
+    },
+    {
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "destination": "[2001:db8::1]:53",
+      "payload": "70696e67",
+      "packet": "54d4f8874fab94d31d773fdf5601351870bf3f2020fc7d9e5056d5a65e2f69fa2bf47b40d8ec144e28cbf7e11466a449866fc421707a869ab2fc13b11447c01d1b8a8586d8011408c3abc80787a146170b31c7da3af3c218512173ae5462963614d2b5c6633d421ec9a866582076eac254d5faeda82b517077a853b299a58d945a8128865ac5db638f20e89523c7d33dd30fd6ded452390429a47e1f031482a710f734cb4d0e66fdd30fe5b433259cd76ad9804a274578208ee581598d3d8a7a00a183354729970d3779009fefa58b75ea36dd22b75082834dcb263de7566d489e6e4c7df6e1604991e5219971782343576f75dfcd5434c55d80bcada86c93fb8e630b8ae6425dba0de99a6d23f5ec2f49cc4aad397b387a6c2d17619ebcd64e62e6900de8fd68d437598b8dd7f7215c924649cfe7045ff1f76f8d7a1f908a535f8de27fec919615b8dbaed12e6e104367ee68e577d657cbdc61c70d95e1102bbdf0d2236028521e1babf0b62cb27168c4bf5fdcb3f343dfc1a215824f02af500e1f97dd5118a16fed508baf9afe81fb08c52b65215ae1f79b2ed6a0bedbc2772589ed1805eb0cb451e99e86d7be298d161b1ffbd4aefff055986f7b228d22c47585662ce4970cea840b3feb5e55e7f9971dacf9855bd58625d0151c97"
+    },
+    {
+      "method": "2022-blake3-chacha20-poly1305",
+      "password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "destination": "1.2.3.4:53",
+      "payload": "70696e67",
+      "packet": "e64f551245a6c52984585855d7fed4b78841979096b0803f532695c27fa65042720dc49afb72f0d5790b23f5c139f468e976ecb067d81b3b46f4208d999d0a40fd7116e221c79451eae2fbc4a21103c0542867bf4efd58d2629b447e6d6289e6a2ae626b6384bf894647e40fcecfae2c07d8463d5b6d46947f0ec78b9dcf5212f406dc7688eeb0ea20896f867259f0e24f20750dedfe3b08fc67d8c6e2266f4cb91d8a5b698e8f35741e238a228d3632c26692a7630859fbc729b94e0483702b7d954b06ae002898b0cd58a31c58a39889c0c5d25503a9c3f11ff457ad0694e10818ad8d7da81144a823be869c118873250884d7e9c1b926bf412f8f60dbcfd2101ec4a6546e15a6c223234536832ffac1f28b187a042bc67d2d807ae7be770d9eaea3be139a83d38cf1bd84d82d1f8fe970fc0e89f4767fdfe8e14def0c63aa4138ca43ba680a269ef057917543c8330ffb8ae59d3ea76d30cb9a3b114f6a0028caba26f6596166f128d433698ed4744c386192978ff1ecb396418f57f29d85a62d79883a6871a10e1a0fc19963fce0ffe94080970629b10cb6d63d7779f202e69c0aa97dc36fc397fac827fee6a2f49372c8f0c2eaa05be1146899dba2ddc83d7a9f9dd1c2bfe7b169635bd3449d522b678db1ba27d5f6140bf27e627bc695c15cf76f95212fbaf71d255e7ef6c7e9b59e0567f9c64c8afd4969b08445b83777f919ff8014a0f9c27d331a78a6bd155cdb760ac4eee41479b48432ce30cfc3818bc5113f961b743ebb8de5fdf9a411318569c0aa9908cd7969cbbf3b457ff44870163c57d8fea85bd7beea3daf496fae55bb2213ec7c3043c8763184959c7ed92cb3238b747fe1380c3f27171cd1bc8c28ad93e111fa2079cb0a1a1841257231d58383398dead0370591a2ed27f3c940a2262cd8db13a091362f3f5848fee98a5b8bdad03efe2933fa318c6f2040de99fa7391fd313cd96a7cec2cfaeb993a8b122c4e4848dff3a1bfc21eecc4bd56139636c856ba8b3284e77dcbc2bc47de91d8c745791d0aa8ec24fad1ebd3b74bcc07cf653527a5e3aac07ca09e1f5ce5f20bb58b132c6798338de67d5d19e6550bfe85a92fddfdd36bbe0f8c20a65d9ae140310d79538afb"
+    },
+    {
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAECAwQFBgcICQoLDA0ODw==:EBESExQVFhcYGRobHB0eHw==",
+      "destination": "1.2.3.4:53",
+      "payload": "70696e67",
+      "packet": "a67c1dc4aa51e6785e4dbf4a986a4190640baae94bc564181da977829cefbf3d81ff3c3d3758710950f715f196bb829a3a0f14f3fccbda51910dd18f5f25ade3e1d104231c3451d61c660c55725b96a6f8fac16a39b78f7e080426f87cae5602c5717bb77a24099bb401c4d30b97e17b1668122e8d159b99d4de0d0cc8956e01d44223c5cce925c976e366917ddf0ec31cc261fbeaf9c4a99f25b669074e9c7ad1c282f78cdb8416cb9c4b6bacd04357b4e5db4436f49954e8cd59aa95f8d245d09ba97a2ea389ca63c8ca351055be1090fb1f0b05a0505278c834a8f7e543ca5be5df4ea3aaa9f34978cf388bc9b77fa46db1b99ecbc8db31842323f76efb78b4542d3ac104519996140a00795908a9bf11e8436b5174af463f0e553e5e3ca678afd19a7b91404efa17221c2ded52c82eea20f9356a70d2d347e3b110d1e4d29e229113dcc7d4c880c08b3c733af5995b56f3d568b1f3fe89e7601f2c06238ba0bddc839a2809e17aaedf6e366f4fde63c3e3de9bc5d3deb3b3cc00e91a387472304723f06e5d3570a9cc68ae3041c2081fdcb2aee505d152d4b0194278474568395ad7db7beeea0826f9c57a11a045582316c05d822883f5c1c3cd9cc0626676b551b15846"
+    }
+  ]
+}
