@@ -1,3 +1,4 @@
+pub mod h2;
 pub mod httpupgrade;
 pub mod websocket;
 
