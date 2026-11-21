@@ -1,7 +1,9 @@
 //! DNS transports: `udp`, `tcp`, `tls` (DoT), `hosts` and `local`.
 
+mod doh;
 mod dot;
 mod hosts;
+pub use doh::DohTransport;
 pub use dot::DotTransport;
 pub use hosts::HostsTransport;
 
@@ -31,6 +33,7 @@ pub enum Transport {
     Udp(SocketAddr, Arc<dyn Dialer>),
     Tcp(SocketAddr, Arc<dyn Dialer>),
     Dot(Arc<DotTransport>),
+    Doh(Arc<DohTransport>),
     Hosts(Arc<HostsTransport>),
 }
 
@@ -41,6 +44,7 @@ impl std::fmt::Debug for Transport {
             Transport::Udp(server, _) => write!(f, "Udp({server})"),
             Transport::Tcp(server, _) => write!(f, "Tcp({server})"),
             Transport::Dot(_) => f.write_str("Dot"),
+            Transport::Doh(_) => f.write_str("Doh"),
             Transport::Hosts(_) => f.write_str("Hosts"),
         }
     }
@@ -120,6 +124,12 @@ impl Transport {
                 let response = dot.exchange(&query, timeout).await?;
                 parse_response(&response, id).map(|(answer, _)| answer)
             }
+            Transport::Doh(doh) => {
+                let id = next_id();
+                let query = build_query(domain, query_type, id)?;
+                let response = doh.exchange(&query, timeout).await?;
+                parse_response(&response, id).map(|(answer, _)| answer)
+            }
             Transport::Udp(server, dialer) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
@@ -186,6 +196,7 @@ impl Transport {
                 exchange_tcp_raw(dialer.as_ref(), &Socksaddr::from(*server), &message, timeout).await?
             }
             Transport::Dot(dot) => dot.exchange(&message, timeout).await?,
+            Transport::Doh(doh) => doh.exchange(&message, timeout).await?,
         };
         if response.len() < 12 || response[..2] != id.to_be_bytes() {
             return Err(invalid("DNS response id mismatch"));

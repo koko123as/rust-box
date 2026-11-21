@@ -17,6 +17,11 @@ tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 hickory-proto.workspace = true
+h2.workspace = true
+http.workspace = true
+bytes.workspace = true
+httparse.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

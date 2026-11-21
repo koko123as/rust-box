@@ -120,6 +120,49 @@ fn dot_server_defaults_to_853_and_requires_explicit_domain_resolver() {
 }
 
 #[test]
+fn doh_server_defaults_and_uses_host_only_for_http_authority() {
+    let dns = router(
+        r#"{"servers":[{"type":"local","tag":"bootstrap"},
+            {"type":"https","tag":"doh","server":"dns.example","domain_resolver":"bootstrap"}],
+            "final":"doh"}"#
+            .into(),
+    );
+    let Transport::Doh(doh) = dns.servers.get("doh").unwrap().as_ref() else { panic!() };
+    assert_eq!(doh.server(), &Socksaddr::from_host_port("dns.example", 443));
+    assert_eq!(doh.authority(), "dns.example");
+    assert_eq!(doh.path(), "/dns-query");
+    assert_eq!(doh.tls_server_name(), "dns.example");
+    assert_eq!(doh.tls_alpn(), vec!["h2", "http/1.1"]);
+
+    let dns = router(
+        r#"{"servers":[{"type":"local","tag":"bootstrap"},
+            {"type":"https","tag":"doh","server":"dns.example","domain_resolver":"bootstrap",
+             "path":"/custom","headers":{"Host":"resolver.example"},
+             "tls":{"server_name":"verify.example"}}],"final":"doh"}"#
+            .into(),
+    );
+    let Transport::Doh(doh) = dns.servers.get("doh").unwrap().as_ref() else { panic!() };
+    assert_eq!(doh.authority(), "resolver.example");
+    assert_eq!(doh.path(), "/custom");
+    assert_eq!(doh.tls_server_name(), "verify.example");
+
+    let options: rb_config::DnsOptions =
+        serde_json::from_str(r#"{"servers":[{"type":"https","server":"dns.example"}]}"#).unwrap();
+    let certificates = rb_certificate::Store::new(None).unwrap();
+    let error = match DnsRouter::new(
+        &options,
+        &Default::default(),
+        &rb_adapter::OutboundRegistry::new(),
+        &rb_rule::RuleSets::new(),
+        &certificates,
+    ) {
+        Ok(_) => panic!("domain DoH server without a resolver must fail during construction"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("missing domain resolver for domain server address"), "{error}");
+}
+
+#[test]
 fn cache_eviction() {
     let mut cache = Cache { entries: HashMap::new(), capacity: 2, disable_expire: false };
     cache.put(("s".to_string(), "ttl".to_string(), 1), vec!["1.1.1.1".parse().unwrap()], 60);

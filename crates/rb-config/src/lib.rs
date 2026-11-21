@@ -201,6 +201,8 @@ pub enum DnsServer {
     Tcp(RemoteDnsServer),
     #[serde(rename = "tls")]
     Tls(Box<RemoteTlsDnsServer>),
+    #[serde(rename = "https")]
+    Https(Box<RemoteHttpsDnsServer>),
     #[serde(rename = "hosts")]
     Hosts(HostsDnsServer),
 }
@@ -211,6 +213,7 @@ impl DnsServer {
             DnsServer::Local { tag } => tag,
             DnsServer::Udp(server) | DnsServer::Tcp(server) => &server.tag,
             DnsServer::Tls(server) => &server.tag,
+            DnsServer::Https(server) => &server.tag,
             DnsServer::Hosts(server) => &server.tag,
         }
     }
@@ -240,6 +243,27 @@ with_dial_fields! {
         pub server: String,
         #[serde(default)]
         pub server_port: u16,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `RemoteHTTPSDNSServerOptions` (DNS over HTTPS).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RemoteHttpsDnsServer {
+        #[serde(default)]
+        pub tag: String,
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub path: String,
+        #[serde(default)]
+        pub method: String,
+        #[serde(default)]
+        pub headers: std::collections::BTreeMap<String, Listable<String>>,
         #[serde(default)]
         pub tls: Option<OutboundTlsOptions>,
     }
@@ -1246,6 +1270,15 @@ impl Options {
                         tls.validate(&format!("dns.servers[{index}].tls"))?;
                     }
                 }
+                DnsServer::Https(remote) => {
+                    self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+                    if let Some(tls) = &remote.tls {
+                        // sing-box forces TLS on for a `type: https` DNS server.
+                        let mut tls = tls.clone();
+                        tls.enabled = true;
+                        tls.validate(&format!("dns.servers[{index}].tls"))?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1555,6 +1588,44 @@ mod tests {
         let error =
             parse(r#"{"dns":{"servers":[{"type":"tls","server":"1.1.1.1","unknown":true}]}}"#).unwrap_err().to_string();
         assert!(error.contains("unknown field `unknown`"), "{error}");
+    }
+
+    #[test]
+    fn https_dns_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"https","tag":"doh","server":"dns.example","domain_resolver":"local",
+                 "server_port":8443,"path":"/custom-query","method":"GET",
+                 "headers":{"Host":"resolver.example","X-Mode":["one","two"]},
+                 "tls":{"server_name":"tls.example","alpn":[]}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[1].tag(), "doh");
+        let DnsServer::Https(server) = &options.dns.servers[1] else { panic!() };
+        assert_eq!((server.server.as_str(), server.server_port), ("dns.example", 8443));
+        assert_eq!(server.path, "/custom-query");
+        assert_eq!(server.method, "GET");
+        assert_eq!(server.headers["Host"].0, vec!["resolver.example"]);
+        assert_eq!(server.headers["X-Mode"].0, vec!["one", "two"]);
+        assert_eq!(server.dialer_options().domain_resolver.unwrap().server, "local");
+        assert_eq!(server.tls.as_ref().unwrap().server_name, "tls.example");
+        assert!(server.tls.as_ref().unwrap().alpn.is_empty());
+
+        for (config, needle) in [
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                    {"type":"https","server":"dns.example","domain_resolver":"local",
+                     "tls":{"utls":{"enabled":true}}}]}}"#,
+                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"https","server":"dns.example","unknown":true}]}}"#,
+                "unknown field `unknown`",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
     }
 
     #[test]

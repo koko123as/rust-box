@@ -23,7 +23,7 @@ use rb_config::{DnsOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, R
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
 
-pub use transport::{Answer, DotTransport, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
+pub use transport::{Answer, DohTransport, DotTransport, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA};
 
 /// sing-box `C.DNSTimeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -241,6 +241,50 @@ impl DnsRouter {
                         .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
                     let tls_dialer = Arc::new(rb_tls::TlsDialer::new(remote_dialer, client));
                     Transport::Dot(Arc::new(DotTransport::new(address, tls_dialer)))
+                }
+                DnsServer::Https(remote) => {
+                    let address = Socksaddr::from_host_port(&remote.server, port_or_default_https(remote.server_port));
+                    if remote.server.is_empty() {
+                        return Err(DnsError(format!("dns.servers[{index}]: invalid server address: {address}")));
+                    }
+                    let dial_options = remote.dialer_options();
+                    let has_resolver =
+                        dial_options.domain_resolver.as_ref().is_some_and(|resolver| !resolver.server.is_empty());
+                    if address.domain().is_some() && dial_options.detour.is_empty() && !has_resolver {
+                        return Err(DnsError(format!(
+                            "dns.servers[{index}]: missing domain resolver for domain server address"
+                        )));
+                    }
+                    let environment = DialerEnv {
+                        defaults: defaults.clone(),
+                        outbounds: outbounds.clone(),
+                        dns: dns_resolver_trait.clone(),
+                        default_resolver: None,
+                    };
+                    let remote_dialer = rb_dialer::new_outbound_dialer(
+                        &dial_options,
+                        address.domain().is_some(),
+                        &environment,
+                        &format!("dns/transport/https[{tag}]"),
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let mut tls = remote.tls.clone().unwrap_or_default();
+                    tls.enabled = true;
+                    if tls.alpn.is_empty() {
+                        tls.alpn.0 = vec!["h2".into(), "http/1.1".into()];
+                    }
+                    let client = rb_tls::TlsClient::new(&tls, &remote.server, certificates)
+                        .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let doh = DohTransport::new(
+                        address,
+                        remote_dialer,
+                        client,
+                        remote.server_port,
+                        &remote.path,
+                        &remote.headers,
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    Transport::Doh(Arc::new(doh))
                 }
                 DnsServer::Hosts(hosts) => {
                     Transport::hosts(hosts).map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?
@@ -754,6 +798,14 @@ fn port_or_default(port: u16) -> u16 {
 fn port_or_default_dot(port: u16) -> u16 {
     if port == 0 {
         853
+    } else {
+        port
+    }
+}
+
+fn port_or_default_https(port: u16) -> u16 {
+    if port == 0 {
+        443
     } else {
         port
     }

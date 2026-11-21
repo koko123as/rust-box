@@ -1177,7 +1177,12 @@ name = "rb-dns"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "flate2",
+ "h2",
  "hickory-proto",
+ "http",
+ "httparse",
  "rb-adapter",
  "rb-certificate",
  "rb-config",
