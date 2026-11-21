@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::dial::NetworkStrategy;
+use crate::rule_set::Prefixable;
 use crate::types::{DomainStrategy, Duration, Listable, QueryType};
 
 /// Match fields shared by route rules (sing-box `RawDefaultRule`, the subset
@@ -391,11 +392,57 @@ fn take_route_options(object: &mut Map<String, Value>, exclusive: bool) -> Resul
     Ok(options)
 }
 
+/// DNS route options shared by sing-box's `route` and `evaluate` actions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsRouteActionOptions {
+    #[serde(default)]
+    pub timeout: Duration,
+    #[serde(default)]
+    pub strategy: DomainStrategy,
+    #[serde(default)]
+    pub disable_cache: bool,
+    /// There is no optimistic DNS cache in rust-box, so caching is already
+    /// non-optimistic regardless of this compatibility option.
+    #[serde(default)]
+    pub disable_optimistic_cache: bool,
+    #[serde(default)]
+    pub rewrite_ttl: Option<u32>,
+    /// Parsed as a sing-box `Prefixable`; rejected by configuration
+    /// validation until EDNS client subnet support is implemented.
+    #[serde(default)]
+    pub client_subnet: Option<Prefixable>,
+    /// Rejected by configuration validation until EDNS client subnet support
+    /// is implemented.
+    #[serde(default)]
+    pub remove_client_subnet: bool,
+}
+
 /// DNS rule actions (sing-box `DNSRuleAction`, the subset rust-box implements).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRuleAction {
-    Route { server: String, strategy: DomainStrategy, disable_cache: bool },
-    Reject(RejectOptions),
+    Route { server: String, options: DnsRouteActionOptions, speculative: bool, race: bool },
+    Evaluate { server: String, tag: String, options: DnsRouteActionOptions, speculative: bool, race: bool },
+    Respond { race: bool },
+    Reject { options: RejectOptions, race: bool },
+}
+
+const DNS_ROUTE_OPTION_FIELDS: &[&str] = &[
+    "timeout",
+    "strategy",
+    "disable_cache",
+    "disable_optimistic_cache",
+    "rewrite_ttl",
+    "client_subnet",
+    "remove_client_subnet",
+];
+
+fn take_dns_route_options(object: &mut Map<String, Value>) -> Result<DnsRouteActionOptions, String> {
+    let options: DnsRouteActionOptions = take_as(object, DNS_ROUTE_OPTION_FIELDS)?;
+    if options.client_subnet.is_some() && options.remove_client_subnet {
+        return Err("`client_subnet` and `remove_client_subnet` are mutually exclusive".into());
+    }
+    Ok(options)
 }
 
 /// Parses rule actions out of a rule object.
@@ -499,24 +546,62 @@ impl ActionParser for DnsRuleAction {
                     #[serde(default)]
                     server: String,
                     #[serde(default)]
-                    strategy: DomainStrategy,
+                    speculative: bool,
                     #[serde(default)]
-                    disable_cache: bool,
+                    race: bool,
                 }
-                let route: Route = take_as(object, &["server", "strategy", "disable_cache"])?;
+                let route: Route = take_as(object, &["server", "speculative", "race"])?;
                 if route.server.is_empty() {
                     return Err("missing server for DNS route action".into());
                 }
                 Ok(DnsRuleAction::Route {
                     server: route.server,
-                    strategy: route.strategy,
-                    disable_cache: route.disable_cache,
+                    options: take_dns_route_options(object)?,
+                    speculative: route.speculative,
+                    race: route.race,
                 })
             }
-            "reject" => Ok(DnsRuleAction::Reject(take_as(object, &["method", "no_drop"])?)),
-            "evaluate" | "respond" | "route-options" | "predefined" => {
-                Err(format!("DNS rule action {name:?} is not supported by rust-box yet"))
+            "evaluate" => {
+                #[derive(Deserialize)]
+                struct Evaluate {
+                    #[serde(default)]
+                    server: String,
+                    #[serde(default)]
+                    tag: String,
+                    #[serde(default)]
+                    speculative: bool,
+                    #[serde(default)]
+                    race: bool,
+                }
+                let evaluate: Evaluate = take_as(object, &["server", "tag", "speculative", "race"])?;
+                Ok(DnsRuleAction::Evaluate {
+                    server: evaluate.server,
+                    tag: evaluate.tag,
+                    options: take_dns_route_options(object)?,
+                    speculative: evaluate.speculative,
+                    race: evaluate.race,
+                })
             }
+            "respond" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Respond {
+                    #[serde(default)]
+                    race: bool,
+                }
+                let respond: Respond = take_as(object, &["race"])?;
+                Ok(DnsRuleAction::Respond { race: respond.race })
+            }
+            "reject" => {
+                #[derive(Deserialize)]
+                struct Reject {
+                    #[serde(default)]
+                    race: bool,
+                }
+                let reject: Reject = take_as(object, &["race"])?;
+                Ok(DnsRuleAction::Reject { options: take_as(object, &["method", "no_drop"])?, race: reject.race })
+            }
+            "route-options" | "predefined" => Err(format!("DNS rule action {name:?} is not supported by rust-box yet")),
             _ => Err(format!("unknown DNS rule action: {name}")),
         }
     }
@@ -682,6 +767,50 @@ mod tests {
         let Rule::Default { matcher, action } = rule else { panic!() };
         assert_eq!(matcher.query_type.0.len(), 2);
         assert!(matches!(action, Some(DnsRuleAction::Route { ref server, .. }) if server == "local"));
+    }
+
+    #[test]
+    fn dns_evaluate_and_respond_actions_are_strictly_parsed() {
+        let rule: DnsRule = serde_json::from_str(
+            r#"{"domain":"example.com","action":"evaluate","server":"remote","tag":"answer",
+                "timeout":"2s","strategy":"prefer_ipv4","disable_cache":true,
+                "disable_optimistic_cache":true,"rewrite_ttl":30,"speculative":true,"race":false}"#,
+        )
+        .unwrap();
+        let Some(DnsRuleAction::Evaluate { server, tag, options, speculative, race }) = rule.action() else { panic!() };
+        assert_eq!(server, "remote");
+        assert_eq!(tag, "answer");
+        assert_eq!(options.timeout.0, std::time::Duration::from_secs(2));
+        assert_eq!(options.strategy, DomainStrategy::PreferIpv4);
+        assert!(options.disable_cache && options.disable_optimistic_cache);
+        assert_eq!(options.rewrite_ttl, Some(30));
+        assert!(*speculative);
+        assert!(!race);
+
+        let anonymous: DnsRule = serde_json::from_str(r#"{"action":"evaluate","server":"remote"}"#).unwrap();
+        assert!(matches!(anonymous.action(), Some(DnsRuleAction::Evaluate { tag, .. }) if tag.is_empty()));
+        let missing_server: DnsRule = serde_json::from_str(r#"{"action":"evaluate"}"#).unwrap();
+        assert!(matches!(missing_server.action(), Some(DnsRuleAction::Evaluate { server, .. }) if server.is_empty()));
+
+        let respond: DnsRule = serde_json::from_str(r#"{"action":"respond","race":true}"#).unwrap();
+        assert!(matches!(respond.action(), Some(DnsRuleAction::Respond { race: true })));
+        let reject: DnsRule = serde_json::from_str(r#"{"action":"reject","method":"drop","race":true}"#).unwrap();
+        assert!(matches!(reject.action(), Some(DnsRuleAction::Reject { options, race: true })
+            if options.method == RejectMethod::Drop));
+
+        for (json, expected) in [
+            (r#"{"action":"evaluate","unknown":true}"#, "unknown"),
+            (r#"{"action":"respond","server":"remote"}"#, "server"),
+            (r#"{"action":"respond","unknown":true}"#, "unknown"),
+            (r#"{"action":"route","server":"remote","unknown":true}"#, "unknown"),
+            (
+                r#"{"action":"evaluate","client_subnet":"192.0.2.0/24","remove_client_subnet":true}"#,
+                "mutually exclusive",
+            ),
+        ] {
+            let error = serde_json::from_str::<DnsRule>(json).unwrap_err();
+            assert!(error.to_string().contains(expected), "{json}: {error}");
+        }
     }
 
     #[test]

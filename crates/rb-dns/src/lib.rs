@@ -88,6 +88,7 @@ impl Cache {
 enum Selection {
     Server { server: String, strategy: DomainStrategy, disable_cache: bool },
     Reject(RejectMethod),
+    Unsupported(&'static str),
 }
 
 /// The compiled rules and the mode they run in.
@@ -521,21 +522,31 @@ impl DnsRouter {
                 continue;
             }
             match rule.action() {
-                Some(DnsRuleAction::Route { server, strategy, disable_cache }) => {
+                Some(DnsRuleAction::Route { server, options: route_options, .. }) => {
                     tracing::debug!(domain = metadata.domain, rule = index, server, "dns: match");
-                    let strategy = if *strategy != DomainStrategy::AsIs { *strategy } else { options.strategy };
+                    let strategy = if route_options.strategy != DomainStrategy::AsIs {
+                        route_options.strategy
+                    } else {
+                        options.strategy
+                    };
                     return (
                         Selection::Server {
                             server: server.clone(),
                             strategy,
-                            disable_cache: *disable_cache || options.disable_cache,
+                            disable_cache: route_options.disable_cache || options.disable_cache,
                         },
                         Some(index),
                     );
                 }
-                Some(DnsRuleAction::Reject(reject)) => {
+                Some(DnsRuleAction::Reject { options: reject, .. }) => {
                     tracing::debug!(domain = metadata.domain, rule = index, "dns: reject");
                     return (Selection::Reject(reject.method), Some(index));
+                }
+                Some(DnsRuleAction::Evaluate { .. }) => {
+                    return (Selection::Unsupported("evaluate action is not implemented yet"), Some(index));
+                }
+                Some(DnsRuleAction::Respond { .. }) => {
+                    return (Selection::Unsupported("respond action is not implemented yet"), Some(index));
                 }
                 None => {}
             }
@@ -618,6 +629,7 @@ impl DnsRouter {
         };
         match selection {
             Selection::Reject(method) => Err(reject_error(domain, method)),
+            Selection::Unsupported(message) => Err(io::Error::new(io::ErrorKind::Unsupported, message)),
             Selection::Server { server, strategy, disable_cache } => {
                 if !strategy_allows(strategy, query_type) {
                     return Ok(Vec::new());
@@ -669,6 +681,7 @@ impl DnsRouter {
             let (selection, index) = self.match_rules(rules, &mut metadata, start, true, options);
             let (server, strategy, disable_cache) = match selection {
                 Selection::Reject(method) => return Err(reject_error(domain, method)),
+                Selection::Unsupported(message) => return Err(io::Error::new(io::ErrorKind::Unsupported, message)),
                 Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
             };
             let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
@@ -721,6 +734,7 @@ impl DnsRouter {
                 self.match_rules(&rules, &mut metadata, start, is_address_query(query_type), options);
             let (server, strategy, disable_cache) = match selection {
                 Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+                Selection::Unsupported(message) => return Err(io::Error::new(io::ErrorKind::Unsupported, message)),
                 Selection::Reject(RejectMethod::Drop) => return Ok(None),
                 Selection::Reject(_) => return response(request, ResponseCode::Refused, Vec::new()).map(Some),
             };

@@ -45,7 +45,7 @@ impl MetadataLookup<'_> {
 
 /// `dnsRuleActionHasStrategy`.
 fn action_has_strategy(action: Option<&DnsRuleAction>) -> bool {
-    matches!(action, Some(DnsRuleAction::Route { strategy, .. }) if *strategy != DomainStrategy::AsIs)
+    matches!(action, Some(DnsRuleAction::Route { options, .. }) if options.strategy != DomainStrategy::AsIs)
 }
 
 /// `defaultRuleNeedsLegacyDNSModeFromAddressFilter`.

@@ -1304,11 +1304,51 @@ impl Options {
         if !self.dns.r#final.is_empty() && !server_known(&self.dns.r#final) {
             return Err(field("dns.final".into(), format!("DNS server not found: {}", self.dns.r#final)));
         }
+        let check_dns_route_options = |path: &str, options: &rule::DnsRouteActionOptions| {
+            if options.client_subnet.is_some() {
+                return Err(field(
+                    format!("{path}.client_subnet"),
+                    "`client_subnet` is not supported by rust-box yet".into(),
+                ));
+            }
+            if options.remove_client_subnet {
+                return Err(field(
+                    format!("{path}.remove_client_subnet"),
+                    "`remove_client_subnet` is not supported by rust-box yet".into(),
+                ));
+            }
+            Ok(())
+        };
         for (index, rule) in self.dns.rules.iter().enumerate() {
-            if let Some(DnsRuleAction::Route { server, .. }) = rule.action() {
-                if !server_known(server) {
-                    return Err(field(format!("dns.rules[{index}]"), format!("DNS server not found: {server}")));
+            let path = format!("dns.rules[{index}]");
+            match rule.action() {
+                Some(DnsRuleAction::Route { server, options, .. }) => {
+                    if !server_known(server) {
+                        return Err(field(path, format!("DNS server not found: {server}")));
+                    }
+                    check_dns_route_options(&path, options)?;
                 }
+                Some(DnsRuleAction::Evaluate { server, options, .. }) => {
+                    if server.is_empty() {
+                        return Err(field(path, "missing server field".into()));
+                    }
+                    if !server_known(server) {
+                        return Err(field(path, format!("DNS server not found: {server}")));
+                    }
+                    let fakeip = self.dns.servers.iter().enumerate().any(|(server_index, candidate)| {
+                        let tag = if candidate.tag().is_empty() {
+                            server_index.to_string()
+                        } else {
+                            candidate.tag().to_string()
+                        };
+                        tag == *server && matches!(candidate, DnsServer::FakeIp(_))
+                    });
+                    if fakeip {
+                        return Err(field(path, format!("evaluate action cannot use fakeip server: {server}")));
+                    }
+                    check_dns_route_options(&path, options)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1464,6 +1504,41 @@ mod tests {
         ] {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains("dns.servers[0]") && error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn dns_evaluate_validates_server_and_unsupported_route_options() {
+        parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"}],
+                "rules":[{"domain":"example.com","action":"evaluate","server":"local"} ]}}"#,
+        )
+        .unwrap();
+
+        for (config, expected) in [
+            (r#"{"dns":{"rules":[{"action":"evaluate"}]}}"#, "dns.rules[0]: missing server field"),
+            (
+                r#"{"dns":{"rules":[{"action":"evaluate","server":"missing"}]}}"#,
+                "dns.rules[0]: DNS server not found: missing",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15"}],
+                    "rules":[{"action":"evaluate","server":"fake"}]}}"#,
+                "evaluate action cannot use fakeip server: fake",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"}],
+                    "rules":[{"action":"evaluate","server":"local","client_subnet":"192.0.2.0/24"}]}}"#,
+                "dns.rules[0].client_subnet: `client_subnet` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"}],
+                    "rules":[{"action":"route","server":"local","remove_client_subnet":true}]}}"#,
+                "dns.rules[0].remove_client_subnet: `remove_client_subnet` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
         }
     }
 
