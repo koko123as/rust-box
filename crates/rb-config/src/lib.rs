@@ -243,6 +243,21 @@ pub struct RouteOptions {
     /// Routing mark outbound connections get by default (Linux).
     #[serde(default)]
     pub default_mark: FwMark,
+    /// `default_network_strategy`, `default_network_type`,
+    /// `default_fallback_network_type` and `default_fallback_delay` are the
+    /// defaults of the dial fields of the same names. sing-box only reads
+    /// them with a platform interface (its graphical clients); its command
+    /// line checks `default_network_strategy` against `default_interface`
+    /// and `auto_detect_interface` and otherwise leaves them without effect,
+    /// and so does rust-box.
+    #[serde(default)]
+    pub default_network_strategy: Option<NetworkStrategy>,
+    #[serde(default)]
+    pub default_network_type: Listable<InterfaceType>,
+    #[serde(default)]
+    pub default_fallback_network_type: Listable<InterfaceType>,
+    #[serde(default)]
+    pub default_fallback_delay: Duration,
 }
 
 /// Parses a configuration, naming the path of a field that fails.
@@ -266,6 +281,21 @@ impl Options {
     /// the box (duplicate tags, unknown outbounds and DNS servers).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let field = |path: String, message: String| ConfigError::Field { path, message };
+        // sing-box `route.NewNetworkManager`.
+        if self.route.default_network_strategy.is_some() {
+            if !self.route.default_interface.is_empty() {
+                return Err(field(
+                    "route.default_network_strategy".into(),
+                    "`default_network_strategy` is conflict with `default_interface`".into(),
+                ));
+            }
+            if !self.route.auto_detect_interface {
+                return Err(field(
+                    "route.default_network_strategy".into(),
+                    "`auto_detect_interface` is required by `default_network_strategy`".into(),
+                ));
+            }
+        }
         let mut tags = std::collections::HashSet::new();
         let inbound_tags: Vec<String> = self
             .inbounds
@@ -383,14 +413,12 @@ impl Options {
         server_known: &dyn Fn(&str) -> bool,
     ) -> Result<(), ConfigError> {
         let field = |path: String, message: String| ConfigError::Field { path, message };
-        if let Some(name) = options.platform_only_field() {
-            return Err(field(
-                format!("{path}.{name}"),
-                format!(
-                    "`{name}` is only supported in graphical clients with a platform interface (Android, Apple) \
-                     and `auto_detect_interface`, which rust-box does not have yet"
-                ),
-            ));
+        // sing-box checks this in `dialer.NewDefault`, which only runs for a
+        // dialer without `detour`.
+        if options.detour.is_empty() {
+            if let Some(message) = options.network_strategy_conflict() {
+                return Err(field(format!("{path}.network_strategy"), message.into()));
+            }
         }
         if let Some(resolver) = &options.domain_resolver {
             if !server_known(&resolver.server) {
@@ -508,11 +536,6 @@ mod tests {
         let error =
             parse(r#"{"route":{"rules":[{"action":"route-options","tls_spoof":"a.com"}]}}"#).unwrap_err().to_string();
         assert!(error.contains("route.rules[0]") && error.contains("tls_spoof"), "{error}");
-        let error = parse(r#"{"outbounds":[{"type":"direct","network_strategy":"hybrid"}]}"#).unwrap_err().to_string();
-        assert!(error.contains("outbounds[0].network_strategy"), "{error}");
-        let error =
-            parse(r#"{"outbounds":[{"type":"direct","fallback_network_type":["wifi"]}]}"#).unwrap_err().to_string();
-        assert!(error.contains("outbounds[0].fallback_network_type"), "{error}");
         let error = parse(
             r#"{"dns":{"servers":[{"type":"local","tag":"l"}]},
                 "outbounds":[{"type":"direct","domain_resolver":{"server":"l","client_subnet":"1.2.3.0/24"}}]}"#,
@@ -520,8 +543,84 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("outbounds[0].domain_resolver.client_subnet"), "{error}");
+    }
+
+    /// sing-box v1.14.4 without a platform interface: the platform network
+    /// fields are accepted without effect, and only its own checks fail.
+    #[test]
+    fn platform_network_fields() {
+        let options = parse(
+            r#"{"outbounds":[{"type":"direct","network_strategy":"hybrid","network_type":["wifi","cellular"],
+                "fallback_network_type":"ethernet","fallback_delay":"100ms"}],
+                "route":{"rules":[{"action":"route-options","network_strategy":"fallback"}],
+                "default_network_type":"wifi","default_fallback_network_type":["cellular"],
+                "default_fallback_delay":"1s"}}"#,
+        )
+        .unwrap();
+        let Outbound::Direct(direct) = &options.outbounds[0] else { panic!() };
+        let dialer = direct.dialer_options();
+        assert_eq!(dialer.network_strategy, Some(NetworkStrategy::Hybrid));
+        assert_eq!(dialer.fallback_network_type.unwrap().0, vec![InterfaceType::Ethernet]);
+        assert_eq!(options.route.default_network_type.0, vec![InterfaceType::Wifi]);
+        // `null` is a nil list in Go, `[]` an empty one.
+        let options = parse(r#"{"outbounds":[{"type":"direct","fallback_network_type":null}]}"#).unwrap();
+        let Outbound::Direct(direct) = &options.outbounds[0] else { panic!() };
+        assert!(direct.fallback_network_type.is_none());
+
+        // dialer.NewDefault: conflict with the fields that bind the socket.
+        let conflict =
+            "is conflict with `bind_interface`, `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`";
+        for dial in [
+            r#""network_strategy":"default","tcp_fast_open":true"#,
+            r#""network_strategy":"hybrid","bind_interface":"eth0""#,
+            r#""network_strategy":"hybrid","inet4_bind_address":"127.0.0.1""#,
+            r#""network_type":"wifi","inet6_bind_address":"::1""#,
+        ] {
+            let error = parse(&format!(r#"{{"outbounds":[{{"type":"direct",{dial}}}]}}"#)).unwrap_err().to_string();
+            assert!(error.contains("outbounds[0].network_strategy") && error.contains(conflict), "{dial}: {error}");
+        }
+        // Go's precedence: `network_type` alone only conflicts without
+        // `fallback_network_type` (even an empty list) and `fallback_delay`.
+        for dial in [
+            r#""network_type":"wifi","fallback_network_type":[],"tcp_fast_open":true"#,
+            r#""network_type":"wifi","fallback_delay":"1ms","tcp_fast_open":true"#,
+            r#""fallback_network_type":"wifi","tcp_fast_open":true"#,
+            r#""network_type":"wifi""#,
+        ] {
+            parse(&format!(r#"{{"outbounds":[{{"type":"direct",{dial}}}]}}"#)).unwrap();
+        }
+        // A DNS server's dialer is checked the same way, but not one with a
+        // `detour` (sing-box builds no default dialer for it).
+        let error = parse(
+            r#"{"dns":{"servers":[{"type":"udp","server":"1.1.1.1","network_strategy":"hybrid","tcp_fast_open":true}]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dns.servers[0].network_strategy") && error.contains(conflict), "{error}");
+        parse(
+            r#"{"dns":{"servers":[{"type":"udp","server":"1.1.1.1","detour":"d","network_strategy":"hybrid",
+                "tcp_fast_open":true}]},"outbounds":[{"type":"direct","tag":"d","routing_mark":1}]}"#,
+        )
+        .unwrap();
+
+        // route.NewNetworkManager.
         let error = parse(r#"{"route":{"default_network_strategy":"hybrid"}}"#).unwrap_err().to_string();
-        assert!(error.contains("default_network_strategy"), "{error}");
+        assert!(
+            error.contains("route.default_network_strategy")
+                && error.contains("`auto_detect_interface` is required by `default_network_strategy`"),
+            "{error}"
+        );
+        let error = parse(
+            r#"{"route":{"default_network_strategy":"hybrid","auto_detect_interface":true,"default_interface":"eth0"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("`default_network_strategy` is conflict with `default_interface`"), "{error}");
+        parse(r#"{"route":{"default_network_strategy":"hybrid","auto_detect_interface":true}}"#).unwrap();
+        let error = parse(r#"{"route":{"default_network_strategy":"fast","auto_detect_interface":true}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("route.default_network_strategy"), "{error}");
     }
 
     #[test]

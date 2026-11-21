@@ -148,10 +148,8 @@ impl DefaultDialer {
         if !options.protect_path.is_empty() && !cfg!(unix) {
             return Err("`protect_path` is only supported on Unix".into());
         }
-        if let Some(name) = options.platform_only_field() {
-            return Err(format!(
-                "`{name}` is only supported in graphical clients with a platform interface, which rust-box does not have yet"
-            ));
+        if let Some(message) = options.network_strategy_conflict() {
+            return Err(message.into());
         }
         defaults.check()?;
         let inet4_bind_address = match options.inet4_bind_address {

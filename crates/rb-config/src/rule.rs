@@ -153,7 +153,11 @@ pub struct RouteActionOptions {
     pub override_address: String,
     #[serde(default)]
     pub override_port: u16,
-    /// Rejected by [`take_route_options`]: graphical clients only.
+    /// Accepted without effect, as in sing-box v1.14.4 without a platform
+    /// interface: the strategy reaches the default dialer only through
+    /// `direct`'s resolving dialer, which dials IP destinations directly
+    /// (`resolveParallelNetworkDialer.DialParallelInterface`), and other
+    /// outbounds do not read it.
     #[serde(default)]
     pub network_strategy: Option<NetworkStrategy>,
     /// A plain number, used as nanoseconds: sing-box v1.14.4 declares this
@@ -252,11 +256,6 @@ fn take_route_options(object: &mut Map<String, Value>, exclusive: bool) -> Resul
     }
     if !options.tls_spoof.is_empty() {
         return Err("route option `tls_spoof` is not supported by rust-box yet".into());
-    }
-    if options.network_strategy.is_some() {
-        return Err("route option `network_strategy` is only supported in graphical clients with a platform \
-                    interface (Android, Apple), which rust-box does not have yet"
-            .into());
     }
     Ok(options)
 }
@@ -511,12 +510,18 @@ mod tests {
         for (field, needle) in [
             (r#""tls_spoof":"example.com""#, "tls_spoof"),
             (r#""tls_spoof_method":"wrong-ack""#, "spoof_method requires spoof"),
-            (r#""network_strategy":"hybrid""#, "network_strategy"),
             (r#""network_type":"wifi""#, "network_type"),
         ] {
             let error = serde_json::from_str::<RouteRule>(&format!(r#"{{"outbound":"a",{field}}}"#)).unwrap_err();
             assert!(error.to_string().contains(needle), "{field}: {error}");
         }
+        // Accepted without effect, as sing-box without a platform interface.
+        let rule: RouteRule =
+            serde_json::from_str(r#"{"action":"route-options","network_strategy":"hybrid"}"#).unwrap();
+        assert!(matches!(rule.action(), Some(RuleAction::RouteOptions(options))
+            if options.network_strategy == Some(NetworkStrategy::Hybrid)));
+        let error = serde_json::from_str::<RouteRule>(r#"{"outbound":"a","network_strategy":"fast"}"#).unwrap_err();
+        assert!(error.to_string().contains("fast"), "{error}");
         assert_eq!(
             serde_json::from_str::<RouteRule>(r#"{"action":"hijack-dns"}"#).unwrap().action(),
             Some(&RuleAction::HijackDns)

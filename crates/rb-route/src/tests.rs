@@ -277,7 +277,8 @@ async fn route_options_apply_to_the_context() {
     let router = router(
         r#"[{"domain":"a.test","action":"route-options","override_address":"b.test","fallback_delay":300000000,
              "tls_fragment":true,"tls_fragment_fallback_delay":"20ms"},
-            {"domain":"b.test","outbound":"direct","override_port":8443,"tls_record_fragment":true},
+            {"domain":"b.test","outbound":"direct","override_port":8443,"tls_record_fragment":true,
+             "network_strategy":"hybrid"},
             {"outbound":"proxy"}]"#,
         Arc::default(),
     );

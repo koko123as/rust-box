@@ -211,12 +211,34 @@ async fn protect_path_hands_over_the_socket() {
     assert!(error.to_string().contains("connect protect path"), "{error}");
 }
 
+/// Without a platform interface the platform network fields leave dialing
+/// as it is (sing-box's command line).
+#[tokio::test]
+async fn platform_network_fields_have_no_effect() {
+    let echo = echo_listener().await;
+    let dialer = dialer(DialerOptions {
+        network_strategy: Some(rb_config::NetworkStrategy::Fallback),
+        network_type: rb_config::Listable(vec![rb_config::InterfaceType::Cellular]),
+        fallback_network_type: Some(rb_config::Listable(vec![rb_config::InterfaceType::Wifi])),
+        ..Default::default()
+    });
+    roundtrip(Box::new(dialer.connect_tcp(echo).await.unwrap())).await;
+}
+
 #[test]
 fn refused_options() {
     let new = |options: DialerOptions| DefaultDialer::new(&options, &NetworkDefaults::default(), false).err();
+    // Without a platform interface sing-box accepts the platform network
+    // fields without effect, and refuses them only next to a socket binding.
     assert!(new(DialerOptions { network_strategy: Some(rb_config::NetworkStrategy::Hybrid), ..Default::default() })
-        .unwrap()
-        .contains("network_strategy"));
+        .is_none());
+    assert!(new(DialerOptions {
+        network_strategy: Some(rb_config::NetworkStrategy::Hybrid),
+        tcp_fast_open: true,
+        ..Default::default()
+    })
+    .unwrap()
+    .contains("`network_strategy` is conflict with"));
     assert!(new(DialerOptions { inet4_bind_address: Some("::1".parse().unwrap()), ..Default::default() })
         .unwrap()
         .contains("not an IPv4 address"));

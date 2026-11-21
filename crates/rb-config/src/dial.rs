@@ -106,7 +106,9 @@ pub struct DialerOptions {
     pub domain_resolver: Option<DomainResolveOptions>,
     pub network_strategy: Option<NetworkStrategy>,
     pub network_type: Listable<InterfaceType>,
-    pub fallback_network_type: Listable<InterfaceType>,
+    /// `None` when absent or `null`; `Some` (possibly empty) when given, as
+    /// sing-box tells a nil `Listable` from an empty one.
+    pub fallback_network_type: Option<Listable<InterfaceType>>,
     pub fallback_delay: Duration,
     /// Deprecated in sing-box 1.12.0 (migrated to `domain_resolver`), still
     /// honored by v1.14.4.
@@ -120,15 +122,28 @@ impl DialerOptions {
         *self == DialerOptions::default()
     }
 
-    /// Fields sing-box only honors in its graphical clients (with a platform
-    /// interface), which rust-box does not have: the first one set.
-    pub fn platform_only_field(&self) -> Option<&'static str> {
-        if self.network_strategy.is_some() {
-            Some("network_strategy")
-        } else if !self.network_type.is_empty() {
-            Some("network_type")
-        } else if !self.fallback_network_type.is_empty() {
-            Some("fallback_network_type")
+    /// sing-box `dialer.NewDefault`'s check of the platform network fields
+    /// against the fields that bind the socket themselves. `network_strategy`,
+    /// `network_type` and `fallback_network_type` are otherwise accepted and
+    /// only take effect with a platform interface and
+    /// `auto_detect_interface` (sing-box's graphical clients); rust-box has
+    /// no platform interface, so, like sing-box's command line, it leaves
+    /// them without effect.
+    pub fn network_strategy_conflict(&self) -> Option<&'static str> {
+        let disable_default_bind =
+            !self.bind_interface.is_empty() || self.inet4_bind_address.is_some() || self.inet6_bind_address.is_some();
+        // Go: `NetworkStrategy != nil || len(NetworkType) > 0 &&
+        // FallbackNetworkType == nil && FallbackDelay == 0`.
+        if (disable_default_bind || self.tcp_fast_open)
+            && (self.network_strategy.is_some()
+                || !self.network_type.is_empty()
+                    && self.fallback_network_type.is_none()
+                    && self.fallback_delay.0.is_zero())
+        {
+            Some(
+                "`network_strategy` is conflict with `bind_interface`, `inet4_bind_address`, \
+                 `inet6_bind_address` and `tcp_fast_open`",
+            )
         } else {
             None
         }
@@ -206,7 +221,7 @@ macro_rules! with_dial_fields {
             #[serde(default)]
             pub network_type: $crate::types::Listable<$crate::dial::InterfaceType>,
             #[serde(default)]
-            pub fallback_network_type: $crate::types::Listable<$crate::dial::InterfaceType>,
+            pub fallback_network_type: Option<$crate::types::Listable<$crate::dial::InterfaceType>>,
             #[serde(default)]
             pub fallback_delay: $crate::types::Duration,
             #[serde(default)]

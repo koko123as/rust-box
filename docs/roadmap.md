@@ -100,20 +100,43 @@ silently ignored.
 | `reuse_addr` | `SO_REUSEADDR` + `SO_REUSEPORT` | same | `SO_REUSEADDR` |
 | `tcp_keep_alive*`, `disable_tcp_keep_alive` | `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, count 9 (Go's default) | same | idle time only |
 
-`network_strategy`, `network_type` and `fallback_network_type` (dial fields
-and the `network_strategy` route option) only take effect in sing-box's
-graphical clients, through their platform interface with
-`auto_detect_interface`. rust-box has no platform interface yet
-(milestone 8), so these fields are rejected with their path.
+`network_strategy`, `network_type` and `fallback_network_type` (dial fields),
+the `network_strategy` route option and `route.default_network_strategy`,
+`default_network_type`, `default_fallback_network_type` and
+`default_fallback_delay` only take effect in sing-box's graphical clients,
+through their platform interface with `auto_detect_interface`. rust-box has
+no platform interface yet (milestone 8) and handles them exactly as sing-box
+v1.14.4's command line does (an exception to "never silently ignore"
+approved by the user):
+
+- They are parsed and validated (`unknown network strategy`, `unknown
+  interface type`) and otherwise have no effect; neither sing-box nor
+  rust-box logs anything about them.
+- `dialer.NewDefault`: with `bind_interface`, `inet4_bind_address`,
+  `inet6_bind_address` or `tcp_fast_open`, a dialer fails with sing-box's
+  message "`network_strategy` is conflict with `bind_interface`,
+  `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`" when
+  `network_strategy` is set, or when `network_type` is set with neither
+  `fallback_network_type` (an explicit `[]` counts as set, `null` does not)
+  nor `fallback_delay` (Go's operator precedence). A dialer with `detour`
+  is not checked, as sing-box builds no default dialer for it. rust-box
+  reports this when the configuration loads, with the field path.
+- `route.NewNetworkManager`: `default_network_strategy` fails with
+  "`default_network_strategy` is conflict with `default_interface`" or
+  "`auto_detect_interface` is required by `default_network_strategy`".
+- The `network_strategy` route option reaches sing-box's default dialer only
+  through `direct`'s resolving dialer, which dials IP destinations without
+  it (`resolveParallelNetworkDialer.DialParallelInterface`); other outbounds
+  do not read it. So it has no effect in either program.
 
 ## Known differences in milestone 3
 
-- Rejected with their path rather than implemented: `network_strategy`,
-  `network_type`, `fallback_network_type` (sing-box's command line parses
-  them and leaves them unused), the route options `network_strategy`,
+- The platform network fields (`network_strategy` and the others above)
+  behave as in sing-box's command line: accepted without effect, with its
+  conflict checks (the first version of this milestone rejected them).
+- Rejected with their path rather than implemented: the route options
   `tls_spoof` and `tls_spoof_method` (raw-socket injection),
-  `route.default_network_strategy` and the other `default_network_*`
-  fields, `domain_resolver.client_subnet`, and the `network_namespaces`
+  `domain_resolver.client_subnet`, and the `network_namespaces`
   section (so `netns` takes a name under `/var/run/netns` or a path, not a
   namespace tag).
 - `domain_resolver.disable_optimistic_cache` is accepted; rust-box has no
