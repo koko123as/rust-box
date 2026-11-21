@@ -1,0 +1,18 @@
+[package]
+name = "rb-mux"
+description = "rust-box multiplexing (sing-mux): smux, yamux and h2mux sessions, padding, client pool and server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-adapter.workspace = true
+rb-shadowsocks.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+rand.workspace = true
+h2.workspace = true
+http.workspace = true
+bytes.workspace = true

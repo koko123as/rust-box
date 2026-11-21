@@ -310,6 +310,11 @@ impl PacketConn for CachedPacketConn {
 pub trait Outbound: Send + Sync {
     fn tag(&self) -> &str;
     fn kind(&self) -> &'static str;
+    /// The networks it carries (sing-box `Outbound.Network`); the router
+    /// refuses the others.
+    fn networks(&self) -> &[Network] {
+        &[Network::Tcp, Network::Udp]
+    }
     /// Opens a TCP connection to the context's destination.
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream>;
     /// Opens a packet connection for UDP whose first destination is the

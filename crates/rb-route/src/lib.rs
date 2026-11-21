@@ -319,10 +319,18 @@ impl Router {
         self.inbounds.get(detour).ok_or_else(|| error(format!("inbound detour not found: {detour}")))
     }
 
-    fn outbound(&self, tag: &str) -> Result<&Arc<dyn Outbound>, RouteError> {
-        self.outbounds.get(tag).ok_or_else(|| {
+    /// The outbound for a network (sing-box `resolveOutbound`).
+    fn outbound(&self, tag: &str, network: Network) -> Result<&Arc<dyn Outbound>, RouteError> {
+        let outbound = self.outbounds.get(tag).ok_or_else(|| {
             RouteError::Dial(io::Error::new(io::ErrorKind::NotFound, format!("outbound not found: {tag}")))
-        })
+        })?;
+        if !outbound.networks().contains(&network) {
+            return Err(RouteError::Dial(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{} is not supported by outbound: {tag}", network.as_str().to_uppercase()),
+            )));
+        }
+        Ok(outbound)
     }
 
     /// Answers DNS over TCP on a hijacked connection (sing-box
@@ -585,7 +593,7 @@ impl ConnectionRouter for Router {
                 return Ok(());
             }
         };
-        let outbound = self.outbound(&tag)?;
+        let outbound = self.outbound(&tag, Network::Tcp)?;
         info!(
             "outbound/{}[{}]: outbound connection to {}",
             outbound.kind(),
@@ -640,7 +648,7 @@ impl ConnectionRouter for Router {
                 return Ok(());
             }
         };
-        let outbound = self.outbound(&tag)?;
+        let outbound = self.outbound(&tag, Network::Udp)?;
         info!(
             "outbound/{}[{}]: outbound packet connection to {}",
             outbound.kind(),

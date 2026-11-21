@@ -27,19 +27,16 @@ impl<T> Listable<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Listable<T> {
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for Listable<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum OneOrMany<T> {
-            Many(Vec<T>),
-            One(T),
-        }
+        // Through a JSON value, so an item's own error (an unknown name)
+        // reaches the user instead of "did not match any variant".
+        let item = |value: serde_json::Value| T::deserialize(value).map_err(de::Error::custom);
         // A null leaves the list empty, as in Go.
-        Ok(match Option::<OneOrMany<T>>::deserialize(deserializer)? {
-            None => Listable(Vec::new()),
-            Some(OneOrMany::Many(items)) => Listable(items),
-            Some(OneOrMany::One(item)) => Listable(vec![item]),
+        Ok(match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null => Listable(Vec::new()),
+            serde_json::Value::Array(items) => Listable(items.into_iter().map(item).collect::<Result<_, _>>()?),
+            value => Listable(vec![item(value)?]),
         })
     }
 }

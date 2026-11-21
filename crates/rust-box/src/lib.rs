@@ -15,9 +15,12 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use rb_adapter::{ConnectionRouter, DnsResolver, Inbound, InboundRegistry, Outbound, OutboundRegistry};
 use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions};
-use rb_dialer::NetworkDefaults;
+use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
-use rb_protocol::{Block, Direct, ProxyInbound, ProxyKind};
+use rb_protocol::{
+    Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
+    TrojanInbound, TrojanOutbound, VlessInbound, VlessOutbound, VmessInbound, VmessOutbound,
+};
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
 use rb_rule_set::{Env as RuleSetEnv, ManagedRuleSet, Updater};
@@ -104,6 +107,13 @@ impl RustBox {
         }
         let dns: Arc<dyn DnsResolver> = dns_router.clone();
         let default_resolver = options.route.default_domain_resolver.as_ref();
+        // What remote proxy outbounds dial their server with.
+        let dialer_env = DialerEnv {
+            defaults: defaults.clone(),
+            outbounds: outbound_registry.clone(),
+            dns: dns.clone(),
+            default_resolver: default_resolver.cloned(),
+        };
         let mut outbounds: Vec<Arc<dyn Outbound>> = Vec::new();
         for (index, outbound) in options.outbounds.iter().enumerate() {
             let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
@@ -113,6 +123,34 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
                 OutboundOptions::Block(_) => Arc::new(Block::new(tag)),
+                OutboundOptions::Socks(socks) => Arc::new(
+                    SocksOutbound::new(socks, tag, &dialer_env)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
+                OutboundOptions::Http(http) => Arc::new(
+                    HttpOutbound::new(http, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
+                OutboundOptions::Shadowsocks(shadowsocks) => {
+                    let built: Arc<dyn Outbound> = ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Trojan(trojan) => {
+                    let built: Arc<dyn Outbound> = TrojanOutbound::new(trojan, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Vless(vless) => {
+                    let built: Arc<dyn Outbound> = VlessOutbound::new(vless, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Vmess(vmess) => {
+                    let built: Arc<dyn Outbound> = VmessOutbound::new(vmess, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
             });
         }
         if outbounds.is_empty() {
@@ -131,14 +169,37 @@ impl RustBox {
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
         for (index, inbound) in options.inbounds.iter().enumerate() {
             let tag = if inbound.tag().is_empty() { index.to_string() } else { inbound.tag().to_string() };
-            let (kind, proxy) = match inbound {
-                InboundOptions::Mixed(proxy) => (ProxyKind::Mixed, proxy),
-                InboundOptions::Socks(proxy) => (ProxyKind::Socks, proxy),
-                InboundOptions::Http(proxy) => (ProxyKind::Http, proxy),
+            let built: Arc<dyn Inbound> = match inbound {
+                InboundOptions::Mixed(proxy) => Arc::new(
+                    ProxyInbound::new(ProxyKind::Mixed, proxy, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Socks(proxy) => Arc::new(
+                    ProxyInbound::new(ProxyKind::Socks, proxy, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Http(proxy) => Arc::new(
+                    ProxyInbound::new(ProxyKind::Http, proxy, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Shadowsocks(shadowsocks) => Arc::new(
+                    ShadowsocksInbound::new(shadowsocks, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Trojan(trojan) => Arc::new(
+                    TrojanInbound::new(trojan, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Vless(vless) => Arc::new(
+                    VlessInbound::new(vless, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Vmess(vmess) => Arc::new(
+                    VmessInbound::new(vmess, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
             };
-            let inbound = ProxyInbound::new(kind, proxy, tag, connection_router.clone())
-                .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?;
-            inbounds.push(Arc::new(inbound));
+            inbounds.push(built);
         }
         inbound_registry.set(&inbounds);
         Ok(RustBox {

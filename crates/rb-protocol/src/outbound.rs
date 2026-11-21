@@ -20,10 +20,10 @@ use async_trait::async_trait;
 use rb_adapter::{
     BoxStream, DnsResolver, Host, InboundContext, LookupOptions, Outbound, PacketConn, SharedPacketConn, Socksaddr,
 };
-use rb_config::{DirectOutbound, DomainResolveOptions, DomainStrategy};
+use rb_config::{DirectOutbound, DomainResolveOptions};
 use rb_dialer::{dial_parallel, dial_serial, socket_address, DefaultDialer, NetworkDefaults};
 use tokio::net::UdpSocket;
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub use rb_dialer::DEFAULT_CONNECT_TIMEOUT;
 
@@ -36,17 +36,7 @@ pub struct Direct {
     is_empty: bool,
 }
 
-/// Lookup options from a `domain_resolver` object.
-pub fn resolve_options(resolver: &DomainResolveOptions) -> LookupOptions {
-    LookupOptions {
-        server: Some(resolver.server.clone()),
-        strategy: resolver.strategy,
-        disable_cache: resolver.disable_cache,
-        timeout: (!resolver.timeout.0.is_zero()).then_some(resolver.timeout.0),
-        rewrite_ttl: resolver.rewrite_ttl,
-        ..Default::default()
-    }
-}
+pub use rb_dialer::resolve_options;
 
 impl Direct {
     /// `default_resolver` is `route.default_domain_resolver`, used when the
@@ -65,21 +55,7 @@ impl Direct {
         }
         // `udp_fragment` defaults to on for direct (sing-box `UDPFragmentDefault`).
         let dialer = DefaultDialer::new(&dial, defaults, true)?;
-        let own = dial.domain_resolver.as_ref().filter(|resolver| !resolver.server.is_empty());
-        let mut resolve = match own.or(default_resolver) {
-            Some(resolver) => resolve_options(resolver),
-            None => LookupOptions::default(),
-        };
-        // The deprecated `domain_strategy` still sets the strategy when the
-        // resolver has none (sing-box `dialer.NewWithOptions`).
-        if dial.domain_strategy != DomainStrategy::AsIs
-            && own.is_none_or(|resolver| resolver.strategy == DomainStrategy::AsIs)
-        {
-            warn!(
-                "outbound/direct[{tag}]: `domain_strategy` is deprecated in sing-box 1.12.0, use `domain_resolver` instead"
-            );
-            resolve.strategy = dial.domain_strategy;
-        }
+        let resolve = rb_dialer::lookup_options(&dial, default_resolver, &format!("outbound/direct[{tag}]"));
         Ok(Direct { tag, dns, resolve, dialer, fallback_delay: dial.fallback_delay.0, is_empty: dial.is_empty() })
     }
 
