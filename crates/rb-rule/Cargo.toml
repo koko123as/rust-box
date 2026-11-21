@@ -1,0 +1,16 @@
+[package]
+name = "rb-rule"
+description = "rust-box rule matching (sing-box route/rule)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-config.workspace = true
+ipnet.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+rb-config = { path = "crates/rb-config" }
+rb-adapter = { path = "crates/rb-adapter" }
+rb-rule = { path = "crates/rb-rule" }
+rb-dns = { path = "crates/rb-dns" }
+rb-route = { path = "crates/rb-route" }
+rb-protocol = { path = "crates/rb-protocol" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+ipnet = "2"
+regex = "1"
+hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

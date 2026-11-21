@@ -1,0 +1,19 @@
+[package]
+name = "rb-dns"
+description = "rust-box DNS (sing-box dns/)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-config.workspace = true
+rb-adapter.workspace = true
+rb-rule.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+hickory-proto.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

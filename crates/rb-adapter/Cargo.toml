@@ -1,0 +1,12 @@
+[package]
+name = "rb-adapter"
+description = "rust-box core abstractions (sing-box adapter/)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+rb-config.workspace = true
