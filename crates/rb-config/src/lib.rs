@@ -234,12 +234,15 @@ pub enum Inbound {
     Socks(ProxyInbound),
     #[serde(rename = "http")]
     Http(ProxyInbound),
+    #[serde(rename = "shadowsocks")]
+    Shadowsocks(ShadowsocksInbound),
 }
 
 impl Inbound {
     pub fn tag(&self) -> &str {
         match self {
             Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => &options.tag,
+            Inbound::Shadowsocks(options) => &options.tag,
         }
     }
     pub fn kind(&self) -> &'static str {
@@ -247,8 +250,120 @@ impl Inbound {
             Inbound::Mixed(_) => "mixed",
             Inbound::Socks(_) => "socks",
             Inbound::Http(_) => "http",
+            Inbound::Shadowsocks(_) => "shadowsocks",
         }
     }
+
+    /// The listen fields of any inbound.
+    pub fn listen_options(&self) -> ListenOptions {
+        match self {
+            Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.listen_options(),
+            Inbound::Shadowsocks(options) => options.listen_options(),
+        }
+    }
+
+    /// The error sing-box reports for a removed listen field that is set.
+    pub fn removed_field_error(&self) -> Option<&'static str> {
+        match self {
+            Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.removed_field_error(),
+            Inbound::Shadowsocks(options) => options.removed_field_error(),
+        }
+    }
+}
+
+with_listen_fields! {
+    /// sing-box `ShadowsocksInboundOptions`.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShadowsocksInbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub network: NetworkList,
+        #[serde(default)]
+        pub method: String,
+        #[serde(default)]
+        pub password: String,
+        #[serde(default)]
+        pub users: Vec<ShadowsocksUser>,
+        #[serde(default)]
+        pub destinations: Vec<ShadowsocksDestination>,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<InboundMultiplexOptions>,
+        /// Accepted: without the SSM API service (which rust-box does not
+        /// have) a managed inbound simply has no users, as in sing-box.
+        #[serde(default)]
+        pub managed: bool,
+    }
+}
+
+/// sing-box `ShadowsocksUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowsocksUser {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// sing-box `ShadowsocksDestination` (a relay destination).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowsocksDestination {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub server: String,
+    #[serde(default)]
+    pub server_port: u16,
+}
+
+/// sing-box `BrutalOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrutalOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub up_mbps: i64,
+    #[serde(default)]
+    pub down_mbps: i64,
+}
+
+/// sing-box `InboundMultiplexOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundMultiplexOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub padding: bool,
+    #[serde(default)]
+    pub brutal: Option<BrutalOptions>,
+}
+
+/// sing-box `OutboundMultiplexOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundMultiplexOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub max_connections: i64,
+    #[serde(default)]
+    pub min_streams: i64,
+    #[serde(default)]
+    pub max_streams: i64,
+    #[serde(default)]
+    pub padding: bool,
+    #[serde(default)]
+    pub brutal: Option<BrutalOptions>,
 }
 
 with_listen_fields! {
@@ -283,6 +398,8 @@ pub enum Outbound {
     Socks(SocksOutbound),
     #[serde(rename = "http")]
     Http(HttpOutbound),
+    #[serde(rename = "shadowsocks")]
+    Shadowsocks(ShadowsocksOutbound),
 }
 
 impl Outbound {
@@ -292,6 +409,7 @@ impl Outbound {
             Outbound::Block(options) => &options.tag,
             Outbound::Socks(options) => &options.tag,
             Outbound::Http(options) => &options.tag,
+            Outbound::Shadowsocks(options) => &options.tag,
         }
     }
 
@@ -303,6 +421,7 @@ impl Outbound {
             Outbound::Block(_) => None,
             Outbound::Socks(options) => Some(options.dialer_options()),
             Outbound::Http(options) => Some(options.dialer_options()),
+            Outbound::Shadowsocks(options) => Some(options.dialer_options()),
         }
     }
 }
@@ -388,6 +507,37 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub udp_over_tcp: Option<UdpOverTcpOptions>,
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `ShadowsocksOutboundOptions` (`DialerOptions` + `ServerOptions`).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShadowsocksOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub method: String,
+        #[serde(default)]
+        pub password: String,
+        /// SIP003 plugin: not supported yet, rejected when set.
+        #[serde(default)]
+        pub plugin: String,
+        #[serde(default)]
+        pub plugin_opts: String,
+        #[serde(default)]
+        pub network: NetworkList,
+        #[serde(default)]
+        pub udp_over_tcp: Option<UdpOverTcpOptions>,
+        /// Not supported yet: rejected when enabled (and `udp_over_tcp` is
+        /// not, which makes sing-box ignore it).
+        #[serde(default)]
+        pub multiplex: Option<OutboundMultiplexOptions>,
     }
 }
 
@@ -578,15 +728,26 @@ impl Options {
             check_resolver("route.default_domain_resolver", resolver)?;
         }
         for (index, inbound) in self.inbounds.iter().enumerate() {
-            let options = inbound.options();
-            if let Some(message) = options.removed_field_error() {
+            if let Some(message) = inbound.removed_field_error() {
                 return Err(field(format!("inbounds[{index}]"), message.to_string()));
             }
-            let detour = &options.detour;
+            let detour = &inbound.listen_options().detour;
             if !detour.is_empty() && !inbound_tags.contains(detour) {
                 return Err(field(format!("inbounds[{index}].detour"), format!("inbound detour not found: {detour}")));
             }
-            if let Some(tls) = &options.tls {
+            if let Inbound::Shadowsocks(shadowsocks) = inbound {
+                if shadowsocks.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
+                    return Err(field(
+                        format!("inbounds[{index}].multiplex"),
+                        "`multiplex` is not supported by rust-box yet".into(),
+                    ));
+                }
+            }
+            let tls = match inbound {
+                Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.tls.as_ref(),
+                Inbound::Shadowsocks(_) => None,
+            };
+            if let Some(tls) = tls {
                 // sing-box's socks inbound has no `tls` field.
                 if matches!(inbound, Inbound::Socks(_)) {
                     return Err(field(format!("inbounds[{index}]"), "unknown field `tls`".into()));
@@ -617,6 +778,22 @@ impl Options {
                         tls.validate(&format!("{path}.tls"))?;
                     }
                     self.check_dialer(&path, &http.dialer_options(), &server_known)?;
+                }
+                Outbound::Shadowsocks(shadowsocks) => {
+                    if !shadowsocks.plugin.is_empty() {
+                        return Err(field(
+                            format!("{path}.plugin"),
+                            "`plugin` is not supported by rust-box yet".into(),
+                        ));
+                    }
+                    let uot = shadowsocks.udp_over_tcp.as_ref().is_some_and(|uot| uot.enabled);
+                    if !uot && shadowsocks.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
+                        return Err(field(
+                            format!("{path}.multiplex"),
+                            "`multiplex` is not supported by rust-box yet".into(),
+                        ));
+                    }
+                    self.check_dialer(&path, &shadowsocks.dialer_options(), &server_known)?;
                 }
                 _ => {}
             }
@@ -720,15 +897,6 @@ impl Options {
             }
         }
         Ok(())
-    }
-}
-
-impl Inbound {
-    /// The listen fields of any inbound.
-    pub fn options(&self) -> &ProxyInbound {
-        match self {
-            Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options,
-        }
     }
 }
 
@@ -949,7 +1117,7 @@ mod tests {
                   {"type":"socks","tag":"b"}]}"#,
         )
         .unwrap();
-        let listen = options.inbounds[0].options().listen_options();
+        let listen = options.inbounds[0].listen_options();
         assert_eq!(listen.listen, Some("::".parse().unwrap()));
         assert_eq!(listen.routing_mark, FwMark(16));
         assert_eq!(listen.detour, "b");
@@ -995,7 +1163,8 @@ mod tests {
         assert_eq!(http.headers["X-A"].0, vec!["1", "2"]);
         assert_eq!(http.tls.as_ref().unwrap().server_name, "h.test");
         assert_eq!(http.dialer_options().detour, "s");
-        assert!(options.inbounds[0].options().tls.is_some());
+        let Inbound::Http(http) = &options.inbounds[0] else { panic!() };
+        assert!(http.tls.is_some());
 
         for (config, needle) in [
             (r#"{"outbounds":[{"type":"socks","version":"6"}]}"#, "outbounds[0].version: unknown socks version: 6"),
@@ -1013,6 +1182,60 @@ mod tests {
             (
                 r#"{"inbounds":[{"type":"mixed","tls":{"enabled":true,"reality":{"enabled":true}}}]}"#,
                 "inbounds[0].tls.reality",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn shadowsocks_options() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"shadowsocks","tag":"ss","listen_port":8388,"network":"tcp",
+                   "method":"2022-blake3-aes-128-gcm","password":"AAAAAAAAAAAAAAAAAAAAAA==",
+                   "users":[{"name":"u","password":"AQEBAQEBAQEBAQEBAQEBAQ=="}],"multiplex":{"enabled":false}},
+                  {"type":"shadowsocks","method":"2022-blake3-aes-128-gcm","password":"AAAAAAAAAAAAAAAAAAAAAA==",
+                   "destinations":[{"name":"d","server":"example.com","server_port":8388,
+                                    "password":"AQEBAQEBAQEBAQEBAQEBAQ=="}],"managed":false}],
+                "outbounds":[
+                  {"type":"shadowsocks","tag":"o","server":"127.0.0.1","server_port":8388,
+                   "method":"aes-128-gcm","password":"p","network":["tcp","udp"],
+                   "udp_over_tcp":{"enabled":true,"version":2},"multiplex":{"enabled":true,"protocol":"smux"}},
+                  {"type":"shadowsocks","method":"none","plugin":"","udp_over_tcp":false}]}"#,
+        )
+        .unwrap();
+        let Inbound::Shadowsocks(inbound) = &options.inbounds[0] else { panic!() };
+        assert_eq!(inbound.network.build(), vec!["tcp"]);
+        assert_eq!(inbound.users[0], ShadowsocksUser { name: "u".into(), password: "AQEBAQEBAQEBAQEBAQEBAQ==".into() });
+        assert_eq!(options.inbounds[0].listen_options().listen_port, 8388);
+        let Inbound::Shadowsocks(relay) = &options.inbounds[1] else { panic!() };
+        assert_eq!((relay.destinations[0].server.as_str(), relay.destinations[0].server_port), ("example.com", 8388));
+        let Outbound::Shadowsocks(outbound) = &options.outbounds[0] else { panic!() };
+        assert_eq!(outbound.udp_over_tcp, Some(UdpOverTcpOptions { enabled: true, version: 2 }));
+        assert!(outbound.multiplex.as_ref().unwrap().enabled);
+
+        for (config, needle) in [
+            (
+                r#"{"outbounds":[{"type":"shadowsocks","method":"none","plugin":"obfs-local"}]}"#,
+                "outbounds[0].plugin: `plugin` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"shadowsocks","method":"none","multiplex":{"enabled":true}}]}"#,
+                "outbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"shadowsocks","method":"none","multiplex":{"enabled":true}}]}"#,
+                "inbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+            ),
+            (r#"{"inbounds":[{"type":"shadowsocks","method":"none","tls":{}}]}"#, "unknown field `tls`"),
+            (r#"{"inbounds":[{"type":"shadowsocks","users":[{"name":"a","uuid":"x"}]}]}"#, "unknown field `uuid`"),
+            (r#"{"inbounds":[{"type":"shadowsocks","network":"icmp"}]}"#, "unknown network: icmp"),
+            (r#"{"inbounds":[{"type":"shadowsocks","sniff":true}]}"#, "legacy inbound fields"),
+            (
+                r#"{"outbounds":[{"type":"shadowsocks","multiplex":{"protocol":"smux","foo":1}}]}"#,
+                "unknown field `foo`",
             ),
         ] {
             let error = parse(config).unwrap_err().to_string();

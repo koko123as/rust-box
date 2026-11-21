@@ -128,6 +128,9 @@ impl RustBox {
                     HttpOutbound::new(http, tag, &dialer_env, &certificates)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
+                OutboundOptions::Shadowsocks(_) => {
+                    return Err(anyhow!("outbounds[{index}]: `shadowsocks` is not supported by rust-box yet"))
+                }
             });
         }
         if outbounds.is_empty() {
@@ -150,6 +153,9 @@ impl RustBox {
                 InboundOptions::Mixed(proxy) => (ProxyKind::Mixed, proxy),
                 InboundOptions::Socks(proxy) => (ProxyKind::Socks, proxy),
                 InboundOptions::Http(proxy) => (ProxyKind::Http, proxy),
+                InboundOptions::Shadowsocks(_) => {
+                    return Err(anyhow!("inbounds[{index}]: `shadowsocks` is not supported by rust-box yet"))
+                }
             };
             let inbound = ProxyInbound::new(kind, proxy, tag, connection_router.clone())
                 .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?;
