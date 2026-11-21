@@ -53,6 +53,13 @@ pub struct RuleMatch {
     #[serde(default)]
     pub port_range: Listable<String>,
     #[serde(default)]
+    pub rule_set: Listable<String>,
+    #[serde(default)]
+    pub rule_set_ip_cidr_match_source: bool,
+    /// Removed in sing-box 1.11.0; rejected when the rule is built.
+    #[serde(default)]
+    pub rule_set_ipcidr_match_source: bool,
+    #[serde(default)]
     pub invert: bool,
 }
 
@@ -93,6 +100,24 @@ pub struct DnsRuleMatch {
     pub port: Listable<u16>,
     #[serde(default)]
     pub port_range: Listable<String>,
+    #[serde(default)]
+    pub rule_set: Listable<String>,
+    #[serde(default)]
+    pub rule_set_ip_cidr_match_source: bool,
+    /// Deprecated in sing-box 1.11.0: only allowed in the legacy DNS mode.
+    #[serde(default)]
+    pub rule_set_ip_cidr_accept_empty: bool,
+    /// Removed in sing-box 1.11.0; rejected when the rule is built.
+    #[serde(default)]
+    pub rule_set_ipcidr_match_source: bool,
+    /// Address filter items: they match the addresses of the response
+    /// (sing-box's legacy DNS mode).
+    #[serde(default)]
+    pub ip_cidr: Listable<String>,
+    #[serde(default)]
+    pub ip_is_private: bool,
+    #[serde(default)]
+    pub ip_accept_any: bool,
     #[serde(default)]
     pub invert: bool,
 }

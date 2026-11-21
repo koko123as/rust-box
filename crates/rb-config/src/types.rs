@@ -35,9 +35,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Listable<T> {
             Many(Vec<T>),
             One(T),
         }
-        Ok(match OneOrMany::deserialize(deserializer)? {
-            OneOrMany::Many(items) => Listable(items),
-            OneOrMany::One(item) => Listable(vec![item]),
+        // A null leaves the list empty, as in Go.
+        Ok(match Option::<OneOrMany<T>>::deserialize(deserializer)? {
+            None => Listable(Vec::new()),
+            Some(OneOrMany::Many(items)) => Listable(items),
+            Some(OneOrMany::One(item)) => Listable(vec![item]),
         })
     }
 }
@@ -213,27 +215,9 @@ impl<'de> Deserialize<'de> for DomainResolveOptions {
 pub struct QueryType(pub u16);
 
 impl QueryType {
+    /// miekg/dns `StringToType` (case-sensitive).
     pub fn from_name(name: &str) -> Option<u16> {
-        Some(match name.to_ascii_uppercase().as_str() {
-            "A" => 1,
-            "NS" => 2,
-            "CNAME" => 5,
-            "SOA" => 6,
-            "PTR" => 12,
-            "MX" => 15,
-            "TXT" => 16,
-            "AAAA" => 28,
-            "SRV" => 33,
-            "NAPTR" => 35,
-            "DS" => 43,
-            "RRSIG" => 46,
-            "DNSKEY" => 48,
-            "SVCB" => 64,
-            "HTTPS" => 65,
-            "CAA" => 257,
-            "ANY" => 255,
-            _ => return None,
-        })
+        crate::query_types::from_name(name)
     }
 }
 
@@ -249,7 +233,7 @@ impl<'de> Deserialize<'de> for QueryType {
             Raw::Number(number) => Ok(QueryType(number)),
             Raw::Name(name) => QueryType::from_name(&name)
                 .map(QueryType)
-                .ok_or_else(|| de::Error::custom(format!("unknown DNS query type {name:?}"))),
+                .ok_or_else(|| de::Error::custom(format!("unknown DNS query type: \"{name}\""))),
         }
     }
 }
@@ -304,7 +288,9 @@ mod tests {
 
     #[test]
     fn query_types() {
-        let types: Listable<QueryType> = serde_json::from_str(r#"["A", 28, "https"]"#).unwrap();
+        let types: Listable<QueryType> = serde_json::from_str(r#"["A", 28, "HTTPS"]"#).unwrap();
         assert_eq!(types.0, vec![QueryType(1), QueryType(28), QueryType(65)]);
+        // miekg/dns names are case-sensitive.
+        assert!(serde_json::from_str::<QueryType>(r#""https""#).is_err());
     }
 }

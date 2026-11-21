@@ -8,7 +8,12 @@
 
 #[macro_use]
 pub mod dial;
+pub mod adguard;
+pub mod deprecated;
+pub mod query_types;
 pub mod rule;
+pub mod rule_set;
+pub mod srs;
 pub mod types;
 
 use std::net::IpAddr;
@@ -20,6 +25,10 @@ pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrat
 pub use rule::{
     DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule,
     Rule, RuleAction, RuleMatch, SNIFFERS,
+};
+pub use rule_set::{
+    DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,
+    RuleSetKind, RuleSetOptions,
 };
 pub use types::{DomainResolveOptions, DomainStrategy, Duration, Listable, QueryType, UdpTimeout, User};
 
@@ -36,7 +45,6 @@ pub enum ConfigError {
 /// Top-level sections sing-box has and rust-box does not implement yet.
 const UNSUPPORTED_SECTIONS: &[&str] = &[
     "ntp",
-    "certificate",
     "certificate_providers",
     "endpoints",
     "services",
@@ -61,6 +69,90 @@ pub struct Options {
     pub outbounds: Vec<Outbound>,
     #[serde(default)]
     pub route: RouteOptions,
+    #[serde(default)]
+    pub certificate: Option<CertificateOptions>,
+}
+
+/// The top-level `certificate` section (sing-box `option.CertificateOptions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificateOptions {
+    /// `system` (the default), `mozilla`, `chrome` or `none`.
+    #[serde(default)]
+    pub store: String,
+    #[serde(default)]
+    pub certificate: Listable<String>,
+    #[serde(default)]
+    pub certificate_path: Listable<String>,
+    #[serde(default)]
+    pub certificate_directory_path: Listable<String>,
+}
+
+/// Strips `//`, `/* */` and `#` comments outside strings, keeping line
+/// breaks (sing-box `contextjson.stripJSONComments`).
+pub fn strip_json_comments(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut clean = data.to_vec();
+    let blank = |clean: &mut Vec<u8>, start: usize, end: usize| {
+        for byte in &mut clean[start..end] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            b'"' => {
+                i += 1;
+                while i < data.len() {
+                    match data[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                i = i.min(data.len());
+            }
+            b'#' => {
+                let start = i;
+                while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+                blank(&mut clean, start, i);
+            }
+            b'/' if i + 1 < data.len() && data[i + 1] == b'/' => {
+                let start = i;
+                while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+                blank(&mut clean, start, i);
+            }
+            b'/' if i + 1 < data.len() && data[i + 1] == b'*' => {
+                let start = i;
+                i += 2;
+                while i + 1 < data.len() && (data[i] != b'*' || data[i + 1] != b'/') {
+                    i += 1;
+                }
+                if i + 1 >= data.len() {
+                    return Err(format!("unexpected end of JSON comment (offset {start})"));
+                }
+                i += 2;
+                blank(&mut clean, start, i);
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(clean)
+}
+
+/// sing-box `json.UnmarshalExtended` into a JSON value: comments allowed,
+/// syntax errors located by row and column.
+pub fn parse_json_extended(content: &[u8]) -> Result<Value, String> {
+    let clean = strip_json_comments(content)?;
+    serde_json::from_slice(&clean).map_err(|error| error.to_string())
 }
 
 /// sing-box `LogOptions`.
@@ -230,6 +322,8 @@ pub struct RouteOptions {
     #[serde(default)]
     pub rules: Vec<RouteRule>,
     #[serde(default)]
+    pub rule_set: Vec<RuleSetOptions>,
+    #[serde(default)]
     pub r#final: String,
     #[serde(default)]
     pub default_domain_resolver: Option<DomainResolveOptions>,
@@ -262,7 +356,8 @@ pub struct RouteOptions {
 
 /// Parses a configuration, naming the path of a field that fails.
 pub fn parse(content: &str) -> Result<Options, ConfigError> {
-    let value: Value = serde_json::from_str(content)?;
+    let clean = strip_json_comments(content.as_bytes()).map_err(ConfigError::Unsupported)?;
+    let value: Value = serde_json::from_slice(&clean)?;
     if let Value::Object(object) = &value {
         for section in UNSUPPORTED_SECTIONS {
             if object.contains_key(*section) {

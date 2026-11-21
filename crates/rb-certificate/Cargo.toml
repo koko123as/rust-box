@@ -1,0 +1,17 @@
+[package]
+name = "rb-certificate"
+description = "rust-box certificate store (sing-box common/certificate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-config.workspace = true
+rb-fswatch.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

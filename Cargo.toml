@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 rust-version = "1.88"
 
 [workspace.dependencies]
+rb-common = { path = "crates/rb-common" }
 rb-config = { path = "crates/rb-config" }
 rb-adapter = { path = "crates/rb-adapter" }
 rb-rule = { path = "crates/rb-rule" }
@@ -16,15 +17,17 @@ rb-dns = { path = "crates/rb-dns" }
 rb-route = { path = "crates/rb-route" }
 rb-protocol = { path = "crates/rb-protocol" }
 rb-dialer = { path = "crates/rb-dialer" }
+rb-fswatch = { path = "crates/rb-fswatch" }
+rb-certificate = { path = "crates/rb-certificate" }
+rb-rule-set = { path = "crates/rb-rule-set" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-ipnet = "2"
 regex = "1"
 hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
@@ -37,6 +40,11 @@ socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 httparse = "1"
 rand = "0.9"
+flate2 = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tempfile = "3"
 
 [profile.release]
 lto = true

@@ -1,22 +1,27 @@
 //! DNS, mirroring sing-box `dns/`: transports (`dns/transport/{udp,tcp}`,
 //! `dns/transport/local`), the DNS router with its rules (`dns/router.go`)
-//! and the response cache (`dns/client.go`).
+//! and the response cache (`dns/client.go`). The router has sing-box's two
+//! rule modes: the legacy mode (address filter fields and rule `strategy`,
+//! where a rule's address limit is checked against the response and the
+//! walk goes on when it fails) and the default mode.
 
 mod transport;
+
+mod mode;
 
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{RData, Record};
 use rb_adapter::{apply_strategy, DnsResolver, LookupOptions, OutboundRegistry};
-use rb_config::{DnsOptions, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
+use rb_config::{DnsOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
 use rb_dialer::NetworkDefaults;
-use rb_rule::{compile, compile_dns_match, Compiled, Metadata};
+use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
 
 pub use transport::{Answer, Transport, QTYPE_A, QTYPE_AAAA};
 
@@ -82,10 +87,25 @@ enum Selection {
     Reject(RejectMethod),
 }
 
+/// The compiled rules and the mode they run in.
+struct DnsRules {
+    rules: Vec<Compiled<DnsRuleAction>>,
+    legacy: bool,
+}
+
+#[derive(Default)]
+struct RulesState {
+    started: bool,
+    closing: bool,
+    legacy: bool,
+}
+
 /// The DNS router (sing-box `dns.Router` + `dns.Client`).
 pub struct DnsRouter {
     servers: HashMap<String, Arc<Transport>>,
-    rules: Vec<Compiled<DnsRuleAction>>,
+    raw_rules: Vec<DnsRule>,
+    rules: RwLock<Arc<DnsRules>>,
+    state: Mutex<RulesState>,
     final_server: String,
     strategy: DomainStrategy,
     timeout: Duration,
@@ -103,14 +123,42 @@ impl std::fmt::Display for DnsError {
 
 impl std::error::Error for DnsError {}
 
+fn rejected(domain: &str) -> io::Error {
+    io::Error::other(format!("{domain}: response rejected"))
+}
+
+/// sing-box `isAddressQuery`.
+fn is_address_query(query_type: u16) -> bool {
+    query_type == QTYPE_A || query_type == QTYPE_AAAA || query_type == QTYPE_HTTPS
+}
+
+const QTYPE_HTTPS: u16 = 65;
+const QTYPE_SVCB: u16 = 64;
+
+fn ip_version_of(query_type: u16) -> Option<u8> {
+    match query_type {
+        QTYPE_A => Some(4),
+        QTYPE_AAAA => Some(6),
+        _ => None,
+    }
+}
+
+fn strategy_allows(strategy: DomainStrategy, query_type: u16) -> bool {
+    !((strategy == DomainStrategy::Ipv4Only && query_type == QTYPE_AAAA)
+        || (strategy == DomainStrategy::Ipv6Only && query_type == QTYPE_A))
+}
+
 impl DnsRouter {
     /// `defaults` are the route-level dial defaults and `outbounds` the
     /// handle a server's `detour` dials through (filled once the outbounds
-    /// are built).
+    /// are built). The rules are checked against the rule-sets as they are
+    /// now (sing-box `Router.Initialize`) and built again by
+    /// [`DnsRouter::start`] once the rule-sets are loaded.
     pub fn new(
         options: &DnsOptions,
         defaults: &NetworkDefaults,
         outbounds: &Arc<OutboundRegistry>,
+        rule_sets: &RuleSets,
     ) -> Result<Self, DnsError> {
         let mut servers = HashMap::new();
         let mut first = None;
@@ -141,14 +189,6 @@ impl DnsRouter {
             servers.insert("local".into(), Arc::new(Transport::Local));
             "local".into()
         };
-        let rules = options
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(index, rule)| {
-                compile(rule, &compile_dns_match).map_err(|error| DnsError(format!("dns.rules[{index}]: {error}")))
-            })
-            .collect::<Result<_, _>>()?;
         let timeout = if options.timeout.0.is_zero() { DEFAULT_TIMEOUT } else { options.timeout.0 };
         let cache = (!options.disable_cache).then(|| {
             Mutex::new(Cache {
@@ -161,54 +201,150 @@ impl DnsRouter {
                 disable_expire: options.disable_expire,
             })
         });
-        Ok(DnsRouter { servers, rules, final_server, strategy: options.strategy, timeout, cache })
+        let router = DnsRouter {
+            servers,
+            raw_rules: options.rules.clone(),
+            rules: RwLock::new(Arc::new(DnsRules { rules: Vec::new(), legacy: false })),
+            state: Mutex::new(RulesState::default()),
+            final_server,
+            strategy: options.strategy,
+            timeout,
+            cache,
+        };
+        let (rules, _) = router.build_rules(rule_sets)?;
+        *router.rules.write().unwrap() = Arc::new(rules);
+        Ok(router)
     }
 
-    /// Picks the server for one query: the first matching rule's, else
-    /// `dns.final` (sing-box `Router.matchDNS`).
-    fn select(&self, domain: &str, query_type: u16, options: &LookupOptions) -> Selection {
-        if let Some(server) = &options.server {
-            return Selection::Server {
-                server: server.clone(),
-                strategy: options.strategy,
-                disable_cache: options.disable_cache,
-            };
+    /// `Router.buildRules`.
+    fn build_rules(&self, rule_sets: &RuleSets) -> Result<(DnsRules, mode::ModeFlags), DnsError> {
+        let lookup = mode::MetadataLookup { rule_sets, overrides: HashMap::new() };
+        let (legacy, flags) = mode::resolve_legacy_mode(&self.raw_rules, &lookup).map_err(DnsError)?;
+        if !legacy {
+            mode::validate_disabled_rules(&self.raw_rules, &lookup).map_err(DnsError)?;
         }
-        let metadata = Metadata {
-            inbound: options.inbound.as_deref().unwrap_or(""),
-            network: options.network.map(|network| network.as_str()),
-            user: options.user.as_deref(),
-            source: options.source,
-            domain: Some(domain),
-            query_type: Some(query_type),
-            ..Default::default()
+        let context = RuleContext { rule_sets, legacy_dns_mode: legacy, network_manager: true };
+        let rules = self
+            .raw_rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                compile(rule, &|options| compile_dns_match(options, &context))
+                    .map_err(|error| DnsError(format!("parse dns rule[{index}]: {error}")))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((DnsRules { rules, legacy }, flags))
+    }
+
+    /// Builds the rules with the loaded rule-sets (sing-box `Router.Start`).
+    pub fn start(&self, rule_sets: &RuleSets) -> Result<(), DnsError> {
+        let (rules, flags) = self.build_rules(rule_sets)?;
+        let legacy = rules.legacy;
+        if legacy && rules.rules.iter().any(|rule| rule.matcher.with_address_limit()) {
+            rb_config::deprecated::report(rb_config::deprecated::LEGACY_DNS_ADDRESS_FILTER);
+        }
+        if legacy && flags.needed_from_strategy {
+            rb_config::deprecated::report(rb_config::deprecated::LEGACY_DNS_RULE_STRATEGY);
+        }
+        *self.rules.write().unwrap() = Arc::new(rules);
+        let mut state = self.state.lock().unwrap();
+        state.started = true;
+        state.legacy = legacy;
+        Ok(())
+    }
+
+    /// Stops accepting rule-set updates (sing-box marks the router closing).
+    pub fn close(&self) {
+        self.state.lock().unwrap().closing = true;
+    }
+
+    /// Whether the rules run in sing-box's legacy DNS mode.
+    pub fn legacy_mode(&self) -> bool {
+        self.rules.read().unwrap().legacy
+    }
+
+    /// `ValidateRuleSetMetadataUpdate`: whether a rule-set may change to
+    /// content with `metadata`.
+    pub fn validate_rule_set_update(
+        &self,
+        rule_sets: &RuleSets,
+        tag: &str,
+        metadata: &RuleSetMetadata,
+    ) -> Result<(), String> {
+        let (started, legacy, closing) = {
+            let state = self.state.lock().unwrap();
+            (state.started, state.legacy, state.closing)
         };
-        for (index, rule) in self.rules.iter().enumerate() {
-            if !rule.matches(&metadata) {
+        if closing {
+            return Ok(());
+        }
+        let lookup = mode::MetadataLookup { rule_sets, overrides: HashMap::from([(tag.to_string(), *metadata)]) };
+        mode::validate_update(&self.raw_rules, &lookup, started, legacy)
+    }
+
+    /// `Router.matchDNS`: the first rule that routes or rejects, from
+    /// `start`, and its index.
+    fn match_rules(
+        &self,
+        rules: &DnsRules,
+        metadata: &mut Metadata,
+        start: usize,
+        address_query: bool,
+        options: &LookupOptions,
+    ) -> (Selection, Option<usize>) {
+        if let Some(server) = &options.server {
+            return (
+                Selection::Server {
+                    server: server.clone(),
+                    strategy: options.strategy,
+                    disable_cache: options.disable_cache,
+                },
+                None,
+            );
+        }
+        for (index, rule) in rules.rules.iter().enumerate().skip(start) {
+            let matched = if rules.legacy {
+                if rule.matcher.with_address_limit() && !address_query {
+                    continue;
+                }
+                metadata.reset_rule_cache();
+                metadata.destination_address_match_from_response = false;
+                rule.matcher.legacy_pre_match(metadata)
+            } else {
+                metadata.reset_rule_cache();
+                rule.matches(metadata)
+            };
+            if !matched {
                 continue;
             }
             match rule.action() {
                 Some(DnsRuleAction::Route { server, strategy, disable_cache }) => {
-                    tracing::debug!(domain, rule = index, server, "dns: match");
+                    tracing::debug!(domain = metadata.domain, rule = index, server, "dns: match");
                     let strategy = if *strategy != DomainStrategy::AsIs { *strategy } else { options.strategy };
-                    return Selection::Server {
-                        server: server.clone(),
-                        strategy,
-                        disable_cache: *disable_cache || options.disable_cache,
-                    };
+                    return (
+                        Selection::Server {
+                            server: server.clone(),
+                            strategy,
+                            disable_cache: *disable_cache || options.disable_cache,
+                        },
+                        Some(index),
+                    );
                 }
                 Some(DnsRuleAction::Reject(reject)) => {
-                    tracing::debug!(domain, rule = index, "dns: reject");
-                    return Selection::Reject(reject.method);
+                    tracing::debug!(domain = metadata.domain, rule = index, "dns: reject");
+                    return (Selection::Reject(reject.method), Some(index));
                 }
                 None => {}
             }
         }
-        Selection::Server {
-            server: self.final_server.clone(),
-            strategy: options.strategy,
-            disable_cache: options.disable_cache,
-        }
+        (
+            Selection::Server {
+                server: self.final_server.clone(),
+                strategy: options.strategy,
+                disable_cache: options.disable_cache,
+            },
+            None,
+        )
     }
 
     fn transport(&self, server: &str) -> io::Result<&Arc<Transport>> {
@@ -252,26 +388,100 @@ impl DnsRouter {
         Ok(answer)
     }
 
-    async fn query(
+    fn base_metadata<'a>(domain: &'a str, options: &'a LookupOptions) -> Metadata<'a> {
+        Metadata {
+            inbound: options.inbound.as_deref().unwrap_or(""),
+            network: options.network.map(|network| network.as_str()),
+            user: options.user.as_deref(),
+            source: options.source,
+            domain: Some(domain),
+            ..Default::default()
+        }
+    }
+
+    /// One lookup type in the default mode (`lookupWithRulesType`).
+    async fn lookup_type(
         &self,
+        rules: &DnsRules,
         domain: &str,
         query_type: u16,
         options: &LookupOptions,
-    ) -> io::Result<(Vec<IpAddr>, DomainStrategy)> {
-        let (server, strategy, disable_cache) = match self.select(domain, query_type, options) {
-            Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
-            Selection::Reject(method) => {
-                let kind = if method == RejectMethod::Drop {
-                    io::ErrorKind::TimedOut
-                } else {
-                    io::ErrorKind::ConnectionRefused
-                };
-                return Err(io::Error::new(kind, format!("{domain}: rejected by DNS rule")));
+    ) -> io::Result<Vec<IpAddr>> {
+        let selection = {
+            let mut metadata = Self::base_metadata(domain, options);
+            metadata.query_type = Some(query_type);
+            metadata.ip_version = ip_version_of(query_type);
+            self.match_rules(rules, &mut metadata, 0, true, options).0
+        };
+        match selection {
+            Selection::Reject(method) => Err(reject_error(domain, method)),
+            Selection::Server { server, strategy, disable_cache } => {
+                if !strategy_allows(strategy, query_type) {
+                    return Ok(Vec::new());
+                }
+                let answer = self.query_server(&server, disable_cache, domain, query_type, options).await?;
+                Ok(answer.addresses)
+            }
+        }
+    }
+
+    /// A and AAAA lookups against one server, each response checked
+    /// against the rule's address limit (`Client.Lookup` with a response
+    /// checker).
+    #[allow(clippy::too_many_arguments)]
+    async fn lookup_server(
+        &self,
+        rules: &DnsRules,
+        check: Option<(usize, &Metadata<'_>)>,
+        server: &str,
+        disable_cache: bool,
+        domain: &str,
+        strategy: DomainStrategy,
+        options: &LookupOptions,
+    ) -> io::Result<Vec<IpAddr>> {
+        let query = |query_type: u16| async move {
+            let answer = self.query_server(server, disable_cache, domain, query_type, options).await?;
+            if let Some((index, metadata)) = check {
+                if !rules.rules[index].matcher.match_address_limit(metadata, &answer.addresses) {
+                    return Err(rejected(domain));
+                }
+            }
+            Ok(answer.addresses)
+        };
+        let (a, aaaa) = match strategy {
+            DomainStrategy::Ipv4Only => (Some(query(QTYPE_A).await), None),
+            DomainStrategy::Ipv6Only => (None, Some(query(QTYPE_AAAA).await)),
+            _ => {
+                let (a, aaaa) = tokio::join!(query(QTYPE_A), query(QTYPE_AAAA));
+                (Some(a), Some(aaaa))
             }
         };
-        let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
-        let answer = self.query_server(&server, disable_cache, domain, query_type, options).await?;
-        Ok((answer.addresses, strategy))
+        combine(domain, a, aaaa, strategy)
+    }
+
+    async fn lookup_legacy(&self, rules: &DnsRules, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>> {
+        let mut start = 0;
+        loop {
+            let mut metadata = Self::base_metadata(domain, options);
+            let (selection, index) = self.match_rules(rules, &mut metadata, start, true, options);
+            let (server, strategy, disable_cache) = match selection {
+                Selection::Reject(method) => return Err(reject_error(domain, method)),
+                Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+            };
+            let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
+            let check = index.filter(|index| rules.rules[*index].matcher.with_address_limit());
+            let metadata = Self::base_metadata(domain, options);
+            let result = self
+                .lookup_server(rules, check.map(|index| (index, &metadata)), &server, disable_cache, domain, strategy, options)
+                .await;
+            match (check, result) {
+                (Some(index), Err(error)) => {
+                    tracing::debug!(domain, %error, "dns: lookup failed, trying the next rule");
+                    start = index + 1;
+                }
+                (_, result) => return result,
+            }
+        }
     }
 
     /// Answers one query message (sing-box `dns.Router.Exchange`).
@@ -280,25 +490,65 @@ impl DnsRouter {
     /// strategy, cache) and the answer is built from the addresses; other
     /// types are forwarded as they are to the selected `udp`/`tcp` server.
     async fn exchange_message(&self, request: &Message, options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
-        let Some(question) = request.queries().first().cloned() else {
+        if request.queries().len() != 1 {
             return response(request, ResponseCode::FormErr, Vec::new()).map(Some);
-        };
+        }
+        let question = request.queries()[0].clone();
         let domain = question.name().to_ascii().trim_end_matches('.').to_ascii_lowercase();
         let query_type = u16::from(question.query_type());
-        let (server, strategy, disable_cache) = match self.select(&domain, query_type, options) {
-            Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
-            Selection::Reject(RejectMethod::Drop) => return Ok(None),
-            Selection::Reject(_) => return response(request, ResponseCode::Refused, Vec::new()).map(Some),
-        };
+        // isResolverDiscoveryQuery: an empty answer for `_dns.` SVCB.
+        if query_type == QTYPE_SVCB && domain.len() > 4 && domain[..5].eq_ignore_ascii_case("_dns.") {
+            return response(request, ResponseCode::NoError, Vec::new()).map(Some);
+        }
+        let rules = self.rules.read().unwrap().clone();
+        let mut start = 0;
+        loop {
+            let mut metadata = Self::base_metadata(&domain, options);
+            metadata.query_type = Some(query_type);
+            metadata.ip_version = ip_version_of(query_type);
+            let (selection, index) =
+                self.match_rules(&rules, &mut metadata, start, is_address_query(query_type), options);
+            let (server, strategy, disable_cache) = match selection {
+                Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+                Selection::Reject(RejectMethod::Drop) => return Ok(None),
+                Selection::Reject(_) => return response(request, ResponseCode::Refused, Vec::new()).map(Some),
+            };
+            let check = index.filter(|index| rules.legacy && rules.rules[*index].matcher.with_address_limit());
+            let (result, addresses) = self
+                .exchange_with_server(request, &question, &domain, query_type, &server, strategy, disable_cache, options)
+                .await?;
+            if let Some(index) = check {
+                if !rules.rules[index].matcher.match_address_limit(&metadata, &addresses) {
+                    tracing::debug!(domain, "dns: response rejected, trying the next rule");
+                    start = index + 1;
+                    continue;
+                }
+            }
+            return Ok(result);
+        }
+    }
+
+    /// Exchanges `request` with one server, returning the response and the
+    /// addresses of a successful one (for the address limit).
+    #[allow(clippy::too_many_arguments)]
+    async fn exchange_with_server(
+        &self,
+        request: &Message,
+        question: &hickory_proto::op::Query,
+        domain: &str,
+        query_type: u16,
+        server: &str,
+        strategy: DomainStrategy,
+        disable_cache: bool,
+        options: &LookupOptions,
+    ) -> io::Result<(Option<Vec<u8>>, Vec<IpAddr>)> {
         if query_type == QTYPE_A || query_type == QTYPE_AAAA {
             let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
             // A strategy that rules this type out answers with no records.
-            if (strategy == DomainStrategy::Ipv4Only && query_type == QTYPE_AAAA)
-                || (strategy == DomainStrategy::Ipv6Only && query_type == QTYPE_A)
-            {
-                return response(request, ResponseCode::NoError, Vec::new()).map(Some);
+            if !strategy_allows(strategy, query_type) {
+                return Ok((Some(response(request, ResponseCode::NoError, Vec::new())?), Vec::new()));
             }
-            return match self.query_server(&server, disable_cache, &domain, query_type, options).await {
+            return match self.query_server(server, disable_cache, domain, query_type, options).await {
                 Ok(answer) => {
                     let records = answer
                         .addresses
@@ -310,31 +560,83 @@ impl DnsRouter {
                         })
                         .map(|data| Record::from_rdata(question.name().clone(), answer.ttl, data))
                         .collect();
-                    response(request, ResponseCode::NoError, records).map(Some)
+                    Ok((Some(response(request, ResponseCode::NoError, records)?), answer.addresses))
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    response(request, ResponseCode::NXDomain, Vec::new()).map(Some)
+                    Ok((Some(response(request, ResponseCode::NXDomain, Vec::new())?), Vec::new()))
                 }
                 Err(error) => {
                     tracing::debug!(domain, %error, "dns: exchange failed");
-                    response(request, ResponseCode::ServFail, Vec::new()).map(Some)
+                    Ok((Some(response(request, ResponseCode::ServFail, Vec::new())?), Vec::new()))
                 }
             };
         }
-        let transport = self.transport(&server)?;
+        let transport = self.transport(server)?;
         let timeout = options.timeout.unwrap_or(self.timeout);
         let raw = request.to_vec().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         match tokio::time::timeout(timeout, transport.exchange(&raw, timeout)).await {
-            Ok(Ok(Some(answer))) => Ok(Some(answer)),
+            Ok(Ok(Some(answer))) => {
+                let addresses = response_addresses(&answer);
+                Ok((Some(answer), addresses))
+            }
             // The local resolver only knows addresses.
-            Ok(Ok(None)) => response(request, ResponseCode::NotImp, Vec::new()).map(Some),
+            Ok(Ok(None)) => Ok((Some(response(request, ResponseCode::NotImp, Vec::new())?), Vec::new())),
             Ok(Err(error)) => {
                 tracing::debug!(domain, %error, "dns: exchange failed");
-                response(request, ResponseCode::ServFail, Vec::new()).map(Some)
+                Ok((Some(response(request, ResponseCode::ServFail, Vec::new())?), Vec::new()))
             }
-            Err(_) => response(request, ResponseCode::ServFail, Vec::new()).map(Some),
+            Err(_) => Ok((Some(response(request, ResponseCode::ServFail, Vec::new())?), Vec::new())),
         }
     }
+}
+
+/// `DNSResponseAddresses`: the A and AAAA answers of a successful response.
+fn response_addresses(message: &[u8]) -> Vec<IpAddr> {
+    let Ok(message) = Message::from_vec(message) else { return Vec::new() };
+    if message.response_code() != ResponseCode::NoError {
+        return Vec::new();
+    }
+    message
+        .answers()
+        .iter()
+        .filter_map(|record| match record.data() {
+            RData::A(a) => Some(IpAddr::V4(a.0)),
+            RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reject_error(domain: &str, method: RejectMethod) -> io::Error {
+    let kind = if method == RejectMethod::Drop { io::ErrorKind::TimedOut } else { io::ErrorKind::ConnectionRefused };
+    io::Error::new(kind, format!("{domain}: rejected by DNS rule"))
+}
+
+/// The A and AAAA results of a lookup: an error only when both gave no
+/// address, IPv6 first with `prefer_ipv6` (`sortAddresses`).
+fn combine(
+    domain: &str,
+    a: Option<io::Result<Vec<IpAddr>>>,
+    aaaa: Option<io::Result<Vec<IpAddr>>>,
+    strategy: DomainStrategy,
+) -> io::Result<Vec<IpAddr>> {
+    let mut last_error = None;
+    let mut take = |result: Option<io::Result<Vec<IpAddr>>>| match result {
+        Some(Ok(addresses)) => addresses,
+        Some(Err(error)) => {
+            last_error = Some(error);
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let v4 = take(a);
+    let v6 = take(aaaa);
+    if v4.is_empty() && v6.is_empty() {
+        return Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{domain}: no addresses"))));
+    }
+    let mut addresses = if strategy == DomainStrategy::PreferIpv6 { [v6, v4].concat() } else { [v4, v6].concat() };
+    addresses = apply_strategy(addresses, strategy);
+    Ok(addresses)
 }
 
 /// A response to `request` with `code` and `answers`.
@@ -367,38 +669,26 @@ impl DnsResolver for DnsRouter {
             return Ok(vec![ip]);
         }
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        // The strategy that decides which types to ask for is the lookup's,
-        // else the default one; a rule's own strategy then filters the answer.
-        let wanted = if options.strategy != DomainStrategy::AsIs { options.strategy } else { self.strategy };
-        let (a, aaaa) = match wanted {
-            DomainStrategy::Ipv4Only => (Some(self.query(&domain, QTYPE_A, options).await), None),
-            DomainStrategy::Ipv6Only => (None, Some(self.query(&domain, QTYPE_AAAA, options).await)),
+        let rules = self.rules.read().unwrap().clone();
+        let strategy = if options.strategy != DomainStrategy::AsIs { options.strategy } else { self.strategy };
+        if let Some(server) = &options.server {
+            return self.lookup_server(&rules, None, server, options.disable_cache, &domain, strategy, options).await;
+        }
+        if rules.legacy {
+            return self.lookup_legacy(&rules, &domain, options).await;
+        }
+        let (a, aaaa) = match strategy {
+            DomainStrategy::Ipv4Only => (Some(self.lookup_type(&rules, &domain, QTYPE_A, options).await), None),
+            DomainStrategy::Ipv6Only => (None, Some(self.lookup_type(&rules, &domain, QTYPE_AAAA, options).await)),
             _ => {
-                let (a, aaaa) =
-                    tokio::join!(self.query(&domain, QTYPE_A, options), self.query(&domain, QTYPE_AAAA, options));
+                let (a, aaaa) = tokio::join!(
+                    self.lookup_type(&rules, &domain, QTYPE_A, options),
+                    self.lookup_type(&rules, &domain, QTYPE_AAAA, options)
+                );
                 (Some(a), Some(aaaa))
             }
         };
-        let mut addresses = Vec::new();
-        let mut strategy = wanted;
-        let mut last_error = None;
-        for result in [a, aaaa].into_iter().flatten() {
-            match result {
-                Ok((found, rule_strategy)) => {
-                    addresses.extend(found);
-                    if rule_strategy != DomainStrategy::AsIs {
-                        strategy = rule_strategy;
-                    }
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        let addresses = apply_strategy(addresses, strategy);
-        if addresses.is_empty() {
-            return Err(last_error
-                .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{domain}: no addresses"))));
-        }
-        Ok(addresses)
+        combine(&domain, a, aaaa, strategy)
     }
 
     async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
