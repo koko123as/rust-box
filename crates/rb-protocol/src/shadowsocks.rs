@@ -16,7 +16,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,11 +49,13 @@ pub struct ShadowsocksOutbound {
     networks: Vec<Network>,
     /// The UoT version when `udp_over_tcp` is enabled.
     uot: Option<u8>,
+    /// The sing-mux client when `multiplex` is enabled (and UoT is not).
+    mux: Option<rb_mux::Client>,
 }
 
 impl ShadowsocksOutbound {
     /// sing-box `shadowsocks.NewOutbound`.
-    pub fn new(options: &OutboundOptions, tag: String, env: &DialerEnv) -> Result<Self, String> {
+    pub fn new(options: &OutboundOptions, tag: String, env: &DialerEnv) -> Result<Arc<Self>, String> {
         let method = ClientMethod::new(&options.method, &options.password)?;
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
         let dialer = new_outbound_dialer(
@@ -66,16 +68,24 @@ impl ShadowsocksOutbound {
             return Err("`plugin` is not supported by rust-box yet".into());
         }
         let uot = options.udp_over_tcp.as_ref().filter(|uot| uot.enabled).map(|uot| uot.version);
-        if uot.is_none() && options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        // sing-box ignores `multiplex` with UoT.
+        let multiplex =
+            if uot.is_none() { crate::multiplex::client_options(options.multiplex.as_ref())? } else { None };
         let networks = options
             .network
             .build()
             .iter()
             .map(|network| if network == "udp" { Network::Udp } else { Network::Tcp })
             .collect();
-        Ok(ShadowsocksOutbound { tag, dialer, method, server, networks, uot })
+        Ok(Arc::new_cyclic(|this| ShadowsocksOutbound {
+            tag,
+            dialer,
+            method,
+            server,
+            networks,
+            uot,
+            mux: crate::multiplex::new_client(this, multiplex),
+        }))
     }
 
     /// A shadowsocks TCP connection to `destination` through the server,
@@ -110,10 +120,16 @@ impl Outbound for ShadowsocksOutbound {
     }
 
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
-        self.connect(&context.destination).await
+        match &self.mux {
+            Some(mux) => mux.dial_tcp(&context.destination).await,
+            None => self.connect(&context.destination).await,
+        }
     }
 
     async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
+        if let Some(mux) = &self.mux {
+            return mux.listen_packet(&context.destination).await;
+        }
         if let Some(version) = self.uot {
             let request = UotRequest { is_connect: context.udp_connect, destination: context.destination.clone() };
             if request.is_connect {
@@ -179,6 +195,13 @@ enum NatKey {
     Session(u64),
 }
 
+#[async_trait]
+impl crate::multiplex::MuxConnect for ShadowsocksOutbound {
+    async fn connect_mux(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
+        self.connect(destination).await
+    }
+}
+
 /// The `shadowsocks` inbound.
 pub struct ShadowsocksInbound {
     tag: String,
@@ -195,6 +218,10 @@ pub struct ShadowsocksInbound {
     udp_timeout: Duration,
     router: Arc<dyn ConnectionRouter>,
     nat: KeyedNat<NatKey>,
+    /// The sing-mux server when `multiplex` is enabled.
+    multiplex: Option<rb_mux::ServerOptions>,
+    /// The inbound itself, for the streams of multiplexed connections.
+    this: OnceLock<Weak<Self>>,
     local_addr: OnceLock<SocketAddr>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -208,9 +235,7 @@ impl ShadowsocksInbound {
         if options.managed && (!options.users.is_empty() || !options.destinations.is_empty()) {
             return Err("users and destinations options are not supported in managed servers".into());
         }
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         let listen = options.listen_options();
         let udp_timeout = if listen.udp_timeout.0 .0.is_zero() { DEFAULT_UDP_TIMEOUT } else { listen.udp_timeout.0 .0 };
         let (kind, service, names, destinations) = if !options.users.is_empty() || options.managed {
@@ -245,6 +270,8 @@ impl ShadowsocksInbound {
             udp_timeout,
             nat: KeyedNat::new(router.clone()),
             router,
+            multiplex,
+            this: OnceLock::new(),
             local_addr: OnceLock::new(),
             tasks: Mutex::new(Vec::new()),
         })
@@ -302,7 +329,14 @@ impl ShadowsocksInbound {
         context.user = routed;
         // sing-box sets the inbound detour of multi-user and relay
         // connections again here (the listener already did for TCP).
-        if let Err(error) = self.route(context, destination, client, &logged).await {
+        if let Some(options) = self.multiplex.as_ref().filter(|_| rb_mux::is_destination(&destination)) {
+            self.log_target(&logged, "inbound connection to", &destination);
+            if let Some(this) = self.this.get().and_then(Weak::upgrade) {
+                crate::multiplex::serve(this, options, context, client, self.log_prefix()).await;
+            }
+            return;
+        }
+        if let Err(error) = self.route(context, destination, client, &logged, true).await {
             error!("{}: process connection from {source}: {error}", self.log_prefix());
         }
     }
@@ -314,11 +348,14 @@ impl ShadowsocksInbound {
         destination: Socksaddr,
         mut client: BoxStream,
         logged: &Option<String>,
+        log_destination: bool,
     ) -> io::Result<()> {
         let source = context.source;
         let request = match destination.domain() {
             Some(uot::MAGIC_ADDRESS) => {
-                self.log_target(logged, "inbound connection to", &destination);
+                if log_destination {
+                    self.log_target(logged, "inbound connection to", &destination);
+                }
                 let request = UotRequest::read(&mut client)
                     .await
                     .map_err(|error| io::Error::other(format!("read UoT request: {error}")))?;
@@ -330,7 +367,9 @@ impl ShadowsocksInbound {
                 Some(request)
             }
             Some(uot::LEGACY_MAGIC_ADDRESS) => {
-                self.log_target(logged, "inbound connection to", &destination);
+                if log_destination {
+                    self.log_target(logged, "inbound connection to", &destination);
+                }
                 info!("{}: inbound legacy UoT connection", self.log_prefix());
                 Some(UotRequest { is_connect: false, destination: Socksaddr::from_host_port("0.0.0.0", 0) })
             }
@@ -346,7 +385,9 @@ impl ShadowsocksInbound {
                 self.router.route_packet_connection(context, conn).await
             }
             None => {
-                self.log_target(logged, "inbound connection to", &destination);
+                if log_destination {
+                    self.log_target(logged, "inbound connection to", &destination);
+                }
                 context.destination = destination;
                 self.router.route_connection(context, client).await
             }
@@ -401,6 +442,27 @@ impl ShadowsocksInbound {
     }
 }
 
+#[async_trait]
+impl crate::multiplex::MuxRouteTarget for ShadowsocksInbound {
+    async fn route_mux_stream(&self, context: InboundContext, destination: Socksaddr, stream: BoxStream) {
+        let source = context.source;
+        if let Err(error) = self.route(context, destination, stream, &None, false).await {
+            error!("{}: process connection from {source}: {error}", self.log_prefix());
+        }
+    }
+
+    async fn route_mux_packets(&self, mut context: InboundContext, destination: Socksaddr, conn: SharedPacketConn) {
+        let source = context.source;
+        context.network = Network::Udp;
+        context.destination = destination;
+        context.inbound_udp_timeout = Some(self.udp_timeout);
+        match self.router.route_packet_connection(context, conn).await {
+            Ok(()) | Err(RouteError::Rejected) => {}
+            Err(error) => warn!("{}: {source}: {error}", self.log_prefix()),
+        }
+    }
+}
+
 /// Replies of one UDP session, encoded for its client.
 struct ReplyWriter {
     socket: Arc<UdpSocket>,
@@ -447,6 +509,7 @@ impl Inbound for ShadowsocksInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let _ = self.this.set(Arc::downgrade(&self));
         let mut tasks = Vec::new();
         if self.tcp {
             let listener = self.listener.listen_tcp()?;

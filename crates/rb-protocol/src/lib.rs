@@ -8,6 +8,7 @@
 pub mod framed;
 pub mod http;
 pub mod inbound;
+mod multiplex;
 pub mod outbound;
 pub mod proxy_outbound;
 pub mod shadowsocks;

@@ -33,6 +33,7 @@ clap.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+rb-mux.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true

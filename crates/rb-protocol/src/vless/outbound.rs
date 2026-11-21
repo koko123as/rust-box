@@ -37,6 +37,8 @@ pub struct VlessOutbound {
     vision: bool,
     packet_encoding: PacketEncoding,
     networks: Vec<Network>,
+    /// The sing-mux client when `multiplex` is enabled.
+    mux: Option<rb_mux::Client>,
 }
 
 /// A connection to the server: TLS kept typed for Vision.
@@ -61,7 +63,7 @@ impl VlessOutbound {
         tag: String,
         env: &DialerEnv,
         certificates: &Arc<rb_certificate::Store>,
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
         let dialer = new_outbound_dialer(
             &options.dialer_options(),
@@ -88,16 +90,14 @@ impl VlessOutbound {
             FLOW_VISION => true,
             flow => return Err(format!("unsupported flow: {flow}")),
         };
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
         let networks = options
             .network
             .build()
             .iter()
             .map(|network| if network == "udp" { Network::Udp } else { Network::Tcp })
             .collect();
-        Ok(VlessOutbound {
+        Ok(Arc::new_cyclic(|this| VlessOutbound {
             tag,
             dialer,
             tls,
@@ -106,7 +106,8 @@ impl VlessOutbound {
             vision,
             packet_encoding,
             networks,
-        })
+            mux: crate::multiplex::new_client(this, multiplex),
+        }))
     }
 
     async fn dial_server(&self) -> io::Result<ServerConn> {
@@ -205,10 +206,23 @@ impl Outbound for VlessOutbound {
     }
 
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
-        self.connect(&context.destination).await
+        match &self.mux {
+            Some(mux) => mux.dial_tcp(&context.destination).await,
+            None => self.connect(&context.destination).await,
+        }
     }
 
     async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
-        self.connect_packet(&context.destination).await
+        match &self.mux {
+            Some(mux) => mux.listen_packet(&context.destination).await,
+            None => self.connect_packet(&context.destination).await,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::multiplex::MuxConnect for VlessOutbound {
+    async fn connect_mux(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
+        self.connect(destination).await
     }
 }

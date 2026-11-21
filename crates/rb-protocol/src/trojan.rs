@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -167,6 +167,8 @@ pub struct TrojanOutbound {
     server: Socksaddr,
     key: [u8; KEY_LENGTH],
     networks: Vec<Network>,
+    /// The sing-mux client when `multiplex` is enabled.
+    mux: Option<rb_mux::Client>,
 }
 
 impl TrojanOutbound {
@@ -176,7 +178,7 @@ impl TrojanOutbound {
         tag: String,
         env: &DialerEnv,
         certificates: &Arc<rb_certificate::Store>,
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
         let mut dialer = new_outbound_dialer(
             &options.dialer_options(),
@@ -191,16 +193,21 @@ impl TrojanOutbound {
         if options.transport.is_some() {
             return Err("`transport` is not supported by rust-box yet".into());
         }
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
         let networks = options
             .network
             .build()
             .iter()
             .map(|network| if network == "udp" { Network::Udp } else { Network::Tcp })
             .collect();
-        Ok(TrojanOutbound { tag, dialer, server, key: key(&options.password), networks })
+        Ok(Arc::new_cyclic(|this| TrojanOutbound {
+            tag,
+            dialer,
+            server,
+            key: key(&options.password),
+            networks,
+            mux: crate::multiplex::new_client(this, multiplex),
+        }))
     }
 
     /// A trojan TCP connection to `destination`, its request sent (sing-box
@@ -238,11 +245,24 @@ impl Outbound for TrojanOutbound {
     }
 
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
-        self.connect(&context.destination).await
+        match &self.mux {
+            Some(mux) => mux.dial_tcp(&context.destination).await,
+            None => self.connect(&context.destination).await,
+        }
     }
 
-    async fn listen_packet(&self, _context: &InboundContext) -> io::Result<SharedPacketConn> {
-        Ok(Arc::new(self.connect_packet().await?))
+    async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
+        match &self.mux {
+            Some(mux) => mux.listen_packet(&context.destination).await,
+            None => Ok(Arc::new(self.connect_packet().await?)),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::multiplex::MuxConnect for TrojanOutbound {
+    async fn connect_mux(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
+        self.connect(destination).await
     }
 }
 
@@ -259,6 +279,10 @@ pub struct TrojanInbound {
     fallback_for_alpn: HashMap<String, Socksaddr>,
     detour: Option<String>,
     router: Arc<dyn ConnectionRouter>,
+    /// The sing-mux server when `multiplex` is enabled.
+    multiplex: Option<rb_mux::ServerOptions>,
+    /// The inbound itself, for the streams of multiplexed connections.
+    this: OnceLock<Weak<Self>>,
     local_addr: OnceLock<SocketAddr>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -300,9 +324,7 @@ impl TrojanInbound {
         if options.transport.is_some() {
             return Err("`transport` is not supported by rust-box yet".into());
         }
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         let listen = options.listen_options();
         Ok(TrojanInbound {
             tag,
@@ -315,6 +337,8 @@ impl TrojanInbound {
             fallback_for_alpn,
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             router,
+            multiplex,
+            this: OnceLock::new(),
             local_addr: OnceLock::new(),
             task: Mutex::new(None),
         })
@@ -372,13 +396,7 @@ impl TrojanInbound {
         match command {
             COMMAND_TCP => self.route(context, user, destination, stream).await,
             COMMAND_UDP => self.route_packet(context, user, destination, stream).await,
-            // trojan-go's smux multiplex: comes with the sing-mux step.
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "trojan-go multiplex is not supported by rust-box yet",
-                ))
-            }
+            _ => return self.serve_trojan_go_mux(stream, context, user).await,
         }
         Ok(())
     }
@@ -398,9 +416,49 @@ impl TrojanInbound {
         context.inbound = self.tag.clone();
         context.inbound_type = "trojan";
         context.network = Network::Tcp;
-        context.destination = destination;
         context.user = routed;
+        if let Some(options) = self.multiplex.as_ref().filter(|_| rb_mux::is_destination(&destination)) {
+            if let Some(this) = self.this.get().and_then(Weak::upgrade) {
+                crate::multiplex::serve(this, options, context, stream, self.log_prefix()).await;
+            }
+            return;
+        }
+        context.destination = destination;
         self.finish(context.source, self.router.route_connection(context, stream).await);
+    }
+
+    /// trojan-go multiplex (sing-box `transport/trojan/mux.go`): an smux
+    /// session whose streams start with a command and an address.
+    async fn serve_trojan_go_mux(&self, stream: BoxStream, context: InboundContext, user: usize) -> io::Result<()> {
+        let session = rb_mux::session::Session::smux(stream, false);
+        loop {
+            let mut stream: BoxStream = Box::new(session.accept().await?);
+            let Some(this) = self.this.get().and_then(Weak::upgrade) else { return Ok(()) };
+            let context = context.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let command = stream.read_u8().await.map_err(|error| cause(error, "read command"))?;
+                    let destination = rb_shadowsocks::read_address_from(&mut stream)
+                        .await
+                        .map_err(|error| cause(error, "read destination"))?;
+                    match command {
+                        COMMAND_TCP => this.route(context, user, destination, stream).await,
+                        COMMAND_UDP => this.route_packet(context, user, destination, stream).await,
+                        command => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unknown command {command}"),
+                            ))
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    error!("{}: process trojan-go multiplex connection: {error}", this.log_prefix());
+                }
+            });
+        }
     }
 
     async fn route_packet(&self, mut context: InboundContext, user: usize, destination: Socksaddr, stream: BoxStream) {
@@ -468,6 +526,21 @@ impl TrojanInbound {
     }
 }
 
+#[async_trait]
+impl crate::multiplex::MuxRouteTarget for TrojanInbound {
+    async fn route_mux_stream(&self, mut context: InboundContext, destination: Socksaddr, stream: BoxStream) {
+        context.network = Network::Tcp;
+        context.destination = destination;
+        self.finish(context.source, self.router.route_connection(context, stream).await);
+    }
+
+    async fn route_mux_packets(&self, mut context: InboundContext, destination: Socksaddr, conn: SharedPacketConn) {
+        context.network = Network::Udp;
+        context.destination = destination;
+        self.finish(context.source, self.router.route_packet_connection(context, conn).await);
+    }
+}
+
 fn canonical(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(address.ip().to_canonical(), address.port())
 }
@@ -487,6 +560,7 @@ impl Inbound for TrojanInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let _ = self.this.set(Arc::downgrade(&self));
         if let Some(tls) = &self.tls {
             tls.start().map_err(|error| io::Error::other(format!("create TLS config: {error}")))?;
         }

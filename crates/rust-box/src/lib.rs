@@ -131,22 +131,26 @@ impl RustBox {
                     HttpOutbound::new(http, tag, &dialer_env, &certificates)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
-                OutboundOptions::Shadowsocks(shadowsocks) => Arc::new(
-                    ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
-                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
-                ),
-                OutboundOptions::Trojan(trojan) => Arc::new(
-                    TrojanOutbound::new(trojan, tag, &dialer_env, &certificates)
-                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
-                ),
-                OutboundOptions::Vless(vless) => Arc::new(
-                    VlessOutbound::new(vless, tag, &dialer_env, &certificates)
-                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
-                ),
-                OutboundOptions::Vmess(vmess) => Arc::new(
-                    VmessOutbound::new(vmess, tag, &dialer_env, &certificates)
-                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
-                ),
+                OutboundOptions::Shadowsocks(shadowsocks) => {
+                    let built: Arc<dyn Outbound> = ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Trojan(trojan) => {
+                    let built: Arc<dyn Outbound> = TrojanOutbound::new(trojan, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Vless(vless) => {
+                    let built: Arc<dyn Outbound> = VlessOutbound::new(vless, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Vmess(vmess) => {
+                    let built: Arc<dyn Outbound> = VmessOutbound::new(vmess, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
             });
         }
         if outbounds.is_empty() {

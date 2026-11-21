@@ -32,6 +32,8 @@ pub struct VmessOutbound {
     client: ClientConfig,
     packet_encoding: VmessPacketEncoding,
     networks: Vec<Network>,
+    /// The sing-mux client when `multiplex` is enabled.
+    mux: Option<rb_mux::Client>,
 }
 
 impl VmessOutbound {
@@ -41,7 +43,7 @@ impl VmessOutbound {
         tag: String,
         env: &DialerEnv,
         certificates: &Arc<rb_certificate::Store>,
-    ) -> Result<Self, String> {
+    ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
         let dialer = new_outbound_dialer(
             &options.dialer_options(),
@@ -56,9 +58,7 @@ impl VmessOutbound {
         if options.transport.is_some() {
             return Err("`transport` is not supported by rust-box yet".into());
         }
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
         let packet_encoding = match options.packet_encoding.as_str() {
             "" => VmessPacketEncoding::None,
             "packetaddr" => VmessPacketEncoding::PacketAddr,
@@ -83,7 +83,16 @@ impl VmessOutbound {
             .iter()
             .map(|network| if network == "udp" { Network::Udp } else { Network::Tcp })
             .collect();
-        Ok(VmessOutbound { tag, dialer, tls, server, client, packet_encoding, networks })
+        Ok(Arc::new_cyclic(|this| VmessOutbound {
+            tag,
+            dialer,
+            tls,
+            server,
+            client,
+            packet_encoding,
+            networks,
+            mux: crate::multiplex::new_client(this, multiplex),
+        }))
     }
 
     async fn dial_server(&self) -> io::Result<BoxStream> {
@@ -148,10 +157,23 @@ impl Outbound for VmessOutbound {
     }
 
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
-        self.connect(&context.destination).await
+        match &self.mux {
+            Some(mux) => mux.dial_tcp(&context.destination).await,
+            None => self.connect(&context.destination).await,
+        }
     }
 
     async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
-        self.connect_packet(&context.destination).await
+        match &self.mux {
+            Some(mux) => mux.listen_packet(&context.destination).await,
+            None => self.connect_packet(&context.destination).await,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::multiplex::MuxConnect for VmessOutbound {
+    async fn connect_mux(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
+        self.connect(destination).await
     }
 }

@@ -45,6 +45,8 @@ pub(crate) struct Routing {
     pub(crate) tag: String,
     pub(crate) names: Vec<String>,
     pub(crate) router: Arc<dyn ConnectionRouter>,
+    /// The sing-mux server when `multiplex` is enabled.
+    pub(crate) multiplex: Option<rb_mux::ServerOptions>,
 }
 
 impl Routing {
@@ -68,19 +70,29 @@ impl Routing {
         }
     }
 
-    /// sing-box `Inbound.newConnectionEx` and then `uot.Router`.
+    /// sing-box `Inbound.newConnectionEx`, then the multiplex router and
+    /// `uot.Router`.
     pub(crate) async fn route_connection(
-        &self,
+        self: &Arc<Self>,
         mut context: InboundContext,
         user: usize,
         destination: Socksaddr,
-        mut stream: BoxStream,
+        stream: BoxStream,
     ) {
         let (logged, routed) = self.user(user);
         info!("{}: [{logged}] inbound connection to {destination}", self.log_prefix());
         context.inbound = self.tag.clone();
         context.inbound_type = self.kind;
         context.user = routed;
+        if let Some(options) = self.multiplex.as_ref().filter(|_| rb_mux::is_destination(&destination)) {
+            crate::multiplex::serve(self.clone(), options, context, stream, self.log_prefix()).await;
+            return;
+        }
+        self.route_stream(context, destination, stream).await;
+    }
+
+    /// `uot.Router` and the router, for a context with the user set.
+    async fn route_stream(&self, mut context: InboundContext, destination: Socksaddr, mut stream: BoxStream) {
         let source = context.source;
         let request = match destination.domain() {
             Some(uot::MAGIC_ADDRESS) => match UotRequest::read(&mut stream).await {
@@ -126,16 +138,25 @@ impl Routing {
         mut context: InboundContext,
         user: usize,
         destination: Socksaddr,
-        mut conn: SharedPacketConn,
+        conn: SharedPacketConn,
     ) {
         let (logged, routed) = self.user(user);
         context.inbound = self.tag.clone();
         context.inbound_type = self.kind;
-        context.network = Network::Udp;
         context.user = routed;
-        let source = context.source;
         if destination.domain() == Some(PACKET_ADDR_MAGIC) {
             info!("{}: [{logged}] inbound packet addr connection", self.log_prefix());
+        } else {
+            info!("{}: [{logged}] inbound packet connection to {destination}", self.log_prefix());
+        }
+        self.route_packets(context, destination, conn).await;
+    }
+
+    /// Routes a packet connection of a context with the user set.
+    async fn route_packets(&self, mut context: InboundContext, destination: Socksaddr, mut conn: SharedPacketConn) {
+        context.network = Network::Udp;
+        let source = context.source;
+        if destination.domain() == Some(PACKET_ADDR_MAGIC) {
             // sing-box routes with no destination; rust-box needs one and
             // takes the first packet's.
             let addressed: SharedPacketConn =
@@ -152,10 +173,20 @@ impl Routing {
             context.destination = first.clone();
             conn = Arc::new(CachedPacketConn::new(vec![(buffer, first)], addressed));
         } else {
-            info!("{}: [{logged}] inbound packet connection to {destination}", self.log_prefix());
             context.destination = destination;
         }
         self.finish(source, self.router.route_packet_connection(context, conn).await);
+    }
+}
+
+#[async_trait]
+impl crate::multiplex::MuxRouteTarget for Routing {
+    async fn route_mux_stream(&self, context: InboundContext, destination: Socksaddr, stream: BoxStream) {
+        self.route_stream(context, destination, stream).await;
+    }
+
+    async fn route_mux_packets(&self, context: InboundContext, destination: Socksaddr, conn: SharedPacketConn) {
+        self.route_packets(context, destination, conn).await;
     }
 }
 
@@ -210,9 +241,7 @@ pub struct VlessInbound {
 impl VlessInbound {
     /// sing-box `vless.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         // sing-vmess `UpdateUsers`: a later user with the same id wins.
         let mut users = HashMap::new();
         for (index, user) in options.users.iter().enumerate() {
@@ -233,6 +262,7 @@ impl VlessInbound {
                 tag: tag.clone(),
                 names: options.users.iter().map(|user| user.name.clone()).collect(),
                 router,
+                multiplex,
             }),
             tag,
             listener: Listener::new(&listen)?,

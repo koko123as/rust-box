@@ -35,9 +35,7 @@ pub struct VmessInbound {
 impl VmessInbound {
     /// sing-box `vmess.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
-        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-            return Err("`multiplex` is not supported by rust-box yet".into());
-        }
+        let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         let users: Vec<([u8; 16], i64)> =
             options.users.iter().map(|user| (parse_uuid(&user.uuid), user.alter_id)).collect();
         let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
@@ -54,6 +52,7 @@ impl VmessInbound {
                 tag: tag.clone(),
                 names: options.users.iter().map(|user| user.name.clone()).collect(),
                 router,
+                multiplex,
             }),
             tag,
             listener: Listener::new(&listen)?,

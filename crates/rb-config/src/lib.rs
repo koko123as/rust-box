@@ -583,8 +583,10 @@ fn check_proxy_outbound(
     if let Some(tls) = tls {
         tls.validate(&format!("{path}.tls"))?;
     }
-    if multiplex.is_some_and(|multiplex| multiplex.enabled) {
-        return Err(field(format!("{path}.multiplex"), "`multiplex` is not supported by rust-box yet".into()));
+    if multiplex
+        .is_some_and(|multiplex| multiplex.enabled && multiplex.brutal.as_ref().is_some_and(|brutal| brutal.enabled))
+    {
+        return Err(field(format!("{path}.multiplex.brutal"), "`brutal` is not supported by rust-box yet".into()));
     }
     if transport.is_some() {
         return Err(field(format!("{path}.transport"), "`transport` is not supported by rust-box yet".into()));
@@ -1054,10 +1056,12 @@ impl Options {
                 Inbound::Vmess(options) => options.multiplex.as_ref(),
                 _ => None,
             };
-            if multiplex.is_some_and(|multiplex| multiplex.enabled) {
+            if multiplex.is_some_and(|multiplex| {
+                multiplex.enabled && multiplex.brutal.as_ref().is_some_and(|brutal| brutal.enabled)
+            }) {
                 return Err(field(
-                    format!("inbounds[{index}].multiplex"),
-                    "`multiplex` is not supported by rust-box yet".into(),
+                    format!("inbounds[{index}].multiplex.brutal"),
+                    "`brutal` is not supported by rust-box yet".into(),
                 ));
             }
             let transport = match inbound {
@@ -1122,10 +1126,14 @@ impl Options {
                         ));
                     }
                     let uot = shadowsocks.udp_over_tcp.as_ref().is_some_and(|uot| uot.enabled);
-                    if !uot && shadowsocks.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
+                    if !uot
+                        && shadowsocks.multiplex.as_ref().is_some_and(|multiplex| {
+                            multiplex.enabled && multiplex.brutal.as_ref().is_some_and(|brutal| brutal.enabled)
+                        })
+                    {
                         return Err(field(
-                            format!("{path}.multiplex"),
-                            "`multiplex` is not supported by rust-box yet".into(),
+                            format!("{path}.multiplex.brutal"),
+                            "`brutal` is not supported by rust-box yet".into(),
                         ));
                     }
                     self.check_dialer(&path, &shadowsocks.dialer_options(), &server_known)?;
@@ -1569,12 +1577,12 @@ mod tests {
                 "outbounds[0].plugin: `plugin` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"shadowsocks","method":"none","multiplex":{"enabled":true}}]}"#,
-                "outbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+                r#"{"outbounds":[{"type":"shadowsocks","method":"none","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                "outbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
-                r#"{"inbounds":[{"type":"shadowsocks","method":"none","multiplex":{"enabled":true}}]}"#,
-                "inbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+                r#"{"inbounds":[{"type":"shadowsocks","method":"none","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (r#"{"inbounds":[{"type":"shadowsocks","method":"none","tls":{}}]}"#, "unknown field `tls`"),
             (r#"{"inbounds":[{"type":"shadowsocks","users":[{"name":"a","uuid":"x"}]}]}"#, "unknown field `uuid`"),
@@ -1626,12 +1634,12 @@ mod tests {
                 "inbounds[0].transport: `transport` is not supported by rust-box yet",
             ),
             (
-                r#"{"inbounds":[{"type":"vmess","multiplex":{"enabled":true}}]}"#,
-                "inbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+                r#"{"inbounds":[{"type":"vmess","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true}}]}"#,
-                "outbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                "outbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
                 r#"{"outbounds":[{"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
@@ -1697,12 +1705,12 @@ mod tests {
                 "outbounds[0].transport: `transport` is not supported by rust-box yet",
             ),
             (
-                r#"{"inbounds":[{"type":"vless","multiplex":{"enabled":true}}]}"#,
-                "inbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+                r#"{"inbounds":[{"type":"vless","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"trojan","multiplex":{"enabled":true,"protocol":"h2mux"}}]}"#,
-                "outbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+                r#"{"outbounds":[{"type":"trojan","multiplex":{"enabled":true,"protocol":"h2mux","brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                "outbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
                 r#"{"inbounds":[{"type":"trojan","fallback_for_alpn":{"h2":{"server":"a","server_port":1}}}]}"#,
