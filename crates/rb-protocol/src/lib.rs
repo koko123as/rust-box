@@ -15,6 +15,7 @@ pub mod shadowsocks;
 pub mod socks;
 pub mod trojan;
 pub mod uot;
+pub mod v2ray;
 pub mod vless;
 pub mod vmess;
 

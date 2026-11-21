@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{BoxStream, ConnectionRouter, Inbound, InboundContext, Network, SharedPacketConn, Socksaddr};
-use rb_config::VmessInbound as InboundOptions;
+use rb_config::{V2RayWebSocketOptions, VmessInbound as InboundOptions};
 use rb_dialer::listener::Listener;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
@@ -27,6 +27,7 @@ pub struct VmessInbound {
     routing: Arc<Routing>,
     users: Arc<ServerUsers>,
     tls: Option<rb_tls::TlsServer>,
+    transport: Option<V2RayWebSocketOptions>,
     detour: Option<String>,
     local_addr: OnceLock<SocketAddr>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -35,6 +36,7 @@ pub struct VmessInbound {
 impl VmessInbound {
     /// sing-box `vmess.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
+        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
         let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         let users: Vec<([u8; 16], i64)> =
             options.users.iter().map(|user| (parse_uuid(&user.uuid), user.alter_id)).collect();
@@ -42,9 +44,6 @@ impl VmessInbound {
             Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
             None => None,
         };
-        if options.transport.is_some() {
-            return Err("`transport` is not supported by rust-box yet".into());
-        }
         let listen = options.listen_options();
         Ok(VmessInbound {
             routing: Arc::new(Routing {
@@ -58,6 +57,7 @@ impl VmessInbound {
             listener: Listener::new(&listen)?,
             users: Arc::new(ServerUsers::new(&users)),
             tls,
+            transport,
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             local_addr: OnceLock::new(),
             tasks: Mutex::new(Vec::new()),
@@ -71,7 +71,7 @@ impl VmessInbound {
     /// Serves one connection (sing-box `Inbound.NewConnection`).
     async fn handle(&self, stream: BoxStream, context: InboundContext) {
         let source = context.source;
-        let stream = match &self.tls {
+        let mut stream = match &self.tls {
             Some(tls) => match tls.handshake(stream).await {
                 Ok(stream) => Box::new(stream) as BoxStream,
                 Err(error) => {
@@ -81,6 +81,15 @@ impl VmessInbound {
             },
             None => stream,
         };
+        if let Some(options) = &self.transport {
+            stream = match crate::v2ray::websocket::server(stream, options).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    error!("{}: process connection from {source}: WebSocket handshake: {error}", self.log_prefix());
+                    return;
+                }
+            };
+        }
         if let Err(error) = self.serve(stream, context).await {
             error!("{}: process connection from {source}: {error}", self.log_prefix());
         }

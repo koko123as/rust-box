@@ -13,13 +13,13 @@ use rb_adapter::{
     BoxStream, CachedPacketConn, ConnectionRouter, Inbound, InboundContext, Network, RouteError, SharedPacketConn,
     Socksaddr, MAX_PACKET_SIZE,
 };
-use rb_config::VlessInbound as InboundOptions;
+use rb_config::{V2RayWebSocketOptions, VlessInbound as InboundOptions};
 use rb_dialer::listener::Listener;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::mux::{self, MuxHandler};
-use super::outbound::VISION_WITHOUT_TLS;
+use super::outbound::{VISION_WITHOUT_TLS, VISION_WITH_WEBSOCKET};
 use super::packet::{PacketAddrConn, ServerPacketConn, PACKET_ADDR_MAGIC};
 use super::protocol::{self, VlessStream, COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, FLOW_VISION};
 use super::vision::{RecordGate, RecordStream, VisionStream};
@@ -213,6 +213,7 @@ enum ClientConn {
     /// With the gate of its record stream (Vision).
     Tls(Box<rb_tls::TlsServerStream>, RecordGate),
     Plain(BoxStream),
+    Transport(BoxStream),
 }
 
 impl ClientConn {
@@ -220,6 +221,7 @@ impl ClientConn {
         match self {
             ClientConn::Tls(stream, _) => stream,
             ClientConn::Plain(stream) => stream,
+            ClientConn::Transport(stream) => stream,
         }
     }
 }
@@ -232,6 +234,7 @@ pub struct VlessInbound {
     users: HashMap<[u8; 16], usize>,
     flows: Vec<String>,
     tls: Option<rb_tls::TlsServer>,
+    transport: Option<V2RayWebSocketOptions>,
     /// Whether TLS runs over a [`RecordStream`] (some user has Vision).
     record_stream: bool,
     detour: Option<String>,
@@ -242,6 +245,7 @@ pub struct VlessInbound {
 impl VlessInbound {
     /// sing-box `vless.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
+        let transport = crate::v2ray::websocket_options(options.transport.as_ref())?;
         let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         // sing-vmess `UpdateUsers`: a later user with the same id wins.
         let mut users = HashMap::new();
@@ -252,9 +256,6 @@ impl VlessInbound {
             Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
             None => None,
         };
-        if options.transport.is_some() {
-            return Err("`transport` is not supported by rust-box yet".into());
-        }
         let listen = options.listen_options();
         let record_stream = tls.is_some() && options.users.iter().any(|user| user.flow == FLOW_VISION);
         Ok(VlessInbound {
@@ -270,6 +271,7 @@ impl VlessInbound {
             users,
             flows: options.users.iter().map(|user| user.flow.clone()).collect(),
             tls,
+            transport,
             record_stream,
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             local_addr: OnceLock::new(),
@@ -303,6 +305,19 @@ impl VlessInbound {
             }
             None => ClientConn::Plain(stream),
         };
+        let conn = match (&self.transport, conn) {
+            (Some(options), conn) => {
+                let stream = match crate::v2ray::websocket::server(conn.boxed(), options).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        error!("{}: process connection from {source}: WebSocket handshake: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                ClientConn::Transport(stream)
+            }
+            (None, conn) => conn,
+        };
         if let Err(error) = self.serve(conn, context).await {
             error!("{}: process connection from {source}: {error}", self.log_prefix());
         }
@@ -311,8 +326,9 @@ impl VlessInbound {
     /// sing-vmess `Service.NewConnection`.
     async fn serve(&self, mut conn: ClientConn, context: InboundContext) -> io::Result<()> {
         let request = match &mut conn {
-            ClientConn::Tls(stream, _) => protocol::read_request(stream.as_mut()).await?,
+            ClientConn::Tls(stream, _) => protocol::read_request(stream).await?,
             ClientConn::Plain(stream) => protocol::read_request(stream).await?,
+            ClientConn::Transport(stream) => protocol::read_request(stream).await?,
         };
         let Some(&user) = self.users.get(&request.uuid) else {
             return Err(invalid(format!("unknown UUID: {}", protocol::uuid_string(&request.uuid))));
@@ -340,6 +356,7 @@ impl VlessInbound {
                     Box::new(VisionStream::new(VlessStream::server(*stream), request.uuid, gate))
                 }
                 ClientConn::Plain(_) => return Err(io::Error::other(VISION_WITHOUT_TLS)),
+                ClientConn::Transport(_) => return Err(io::Error::other(VISION_WITH_WEBSOCKET)),
             },
             "" => Box::new(VlessStream::server(conn.boxed())),
             flow => return Err(invalid(format!("unknown flow: {flow}"))),

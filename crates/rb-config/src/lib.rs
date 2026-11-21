@@ -648,7 +648,7 @@ with_dial_fields! {
 }
 
 /// The `tls`, `multiplex` and `transport` checks of the trojan, vless and
-/// vmess outbounds: multiplex and V2Ray transports are not implemented yet.
+/// vmess outbounds: non-WebSocket V2Ray transports are not implemented yet.
 fn check_proxy_outbound(
     path: &str,
     tls: Option<&OutboundTlsOptions>,
@@ -664,15 +664,32 @@ fn check_proxy_outbound(
     {
         return Err(field(format!("{path}.multiplex.brutal"), "`brutal` is not supported by rust-box yet".into()));
     }
-    if transport.is_some() {
-        return Err(field(format!("{path}.transport"), "`transport` is not supported by rust-box yet".into()));
-    }
+    check_v2ray_transport(&format!("{path}.transport"), transport.as_ref())?;
     Ok(())
 }
 
-/// A V2Ray transport configuration. Runtime support is enabled only when the
-/// corresponding transport is wired into a proxy; until then validation
-/// rejects the whole `transport` field with its path.
+fn check_v2ray_transport(path: &str, transport: Option<&V2RayTransportOptions>) -> Result<(), ConfigError> {
+    let field = |path: String, message: String| ConfigError::Field { path, message };
+    let Some(transport) = transport else { return Ok(()) };
+    match &transport.config {
+        V2RayTransportConfig::WebSocket(options)
+            if options.max_early_data == 0 && options.early_data_header_name.is_empty() =>
+        {
+            Ok(())
+        }
+        V2RayTransportConfig::WebSocket(options) if options.max_early_data > 0 => {
+            Err(field(format!("{path}.max_early_data"), "`max_early_data` is not supported by rust-box yet".into()))
+        }
+        V2RayTransportConfig::WebSocket(_) => Err(field(
+            format!("{path}.early_data_header_name"),
+            "`early_data_header_name` is not supported by rust-box yet".into(),
+        )),
+        _ => Err(field(path.to_string(), "`transport` is not supported by rust-box yet".into())),
+    }
+}
+
+/// A V2Ray transport configuration. WebSocket is wired into the proxy
+/// protocols; other transport types are rejected with their field path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct V2RayTransportOptions {
     pub r#type: String,
@@ -803,7 +820,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket is supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -854,7 +871,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket is supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -892,7 +909,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket is supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -920,7 +937,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket is supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
         /// `xudp` (the default when absent), `packetaddr`, or empty for
@@ -945,7 +962,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket is supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -999,7 +1016,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket is supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -1273,12 +1290,7 @@ impl Options {
                 Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
-            if transport.is_some() {
-                return Err(field(
-                    format!("inbounds[{index}].transport"),
-                    "`transport` is not supported by rust-box yet".into(),
-                ));
-            }
+            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport)?;
             if let Inbound::Trojan(trojan) = inbound {
                 trojan.validate_fallback(&format!("inbounds[{index}]"))?;
             }
@@ -2078,22 +2090,26 @@ mod tests {
             r#"{"inbounds":[
                   {"type":"vmess","tag":"m","listen_port":10086,
                    "users":[{"name":"a","uuid":"bf000d23-0752-40b4-affe-68f7707a9661","alterId":4},{"uuid":"x"}],
-                   "tls":{"enabled":false},"multiplex":{"enabled":false}}],
+                   "tls":{"enabled":false},"multiplex":{"enabled":false},
+                   "transport":{"type":"ws","path":"/proxy"}}],
                 "outbounds":[
                   {"type":"vmess","tag":"mo","server":"127.0.0.1","server_port":10086,
                    "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","security":"chacha20-poly1305","alter_id":1,
                    "global_padding":true,"authenticated_length":true,"network":"udp","packet_encoding":"xudp",
-                   "tls":{"enabled":true,"server_name":"example.com"}},
+                   "tls":{"enabled":true,"server_name":"example.com"},
+                   "transport":{"type":"ws","path":"/proxy"}},
                   {"type":"vmess","tag":"mn"}]}"#,
         )
         .unwrap();
         let Inbound::Vmess(vmess) = &options.inbounds[0] else { panic!() };
+        assert!(vmess.transport.is_some());
         assert_eq!(
             vmess.users[0],
             VmessUser { name: "a".into(), uuid: "bf000d23-0752-40b4-affe-68f7707a9661".into(), alter_id: 4 }
         );
         assert_eq!(vmess.users[1].alter_id, 0);
         let Outbound::Vmess(outbound) = &options.outbounds[0] else { panic!() };
+        assert!(outbound.transport.is_some());
         assert_eq!(outbound.security, "chacha20-poly1305");
         assert_eq!(outbound.alter_id, 1);
         assert!(outbound.global_padding && outbound.authenticated_length);
@@ -2104,7 +2120,7 @@ mod tests {
 
         for (config, needle) in [
             (
-                r#"{"inbounds":[{"type":"vmess","transport":{"type":"ws","path":"/"}}]}"#,
+                r#"{"inbounds":[{"type":"vmess","transport":{"type":"http","path":"/"}}]}"#,
                 "inbounds[0].transport: `transport` is not supported by rust-box yet",
             ),
             (
@@ -2118,6 +2134,14 @@ mod tests {
             (
                 r#"{"outbounds":[{"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
                 "outbounds[0].transport: `transport` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"ws","max_early_data":1}}]}"#,
+                "outbounds[0].transport.max_early_data: `max_early_data` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"ws","early_data_header_name":"Sec-WebSocket-Protocol"}}]}"#,
+                "outbounds[0].transport.early_data_header_name: `early_data_header_name` is not supported by rust-box yet",
             ),
             (r#"{"outbounds":[{"type":"vmess","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
             (r#"{"inbounds":[{"type":"vmess","users":[{"alter_id":1}]}]}"#, "unknown field `alter_id`"),
