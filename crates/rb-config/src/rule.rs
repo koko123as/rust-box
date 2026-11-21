@@ -618,7 +618,7 @@ fn parse_rule<M: DeserializeOwned, A: ActionParser>(value: Value, nested: bool) 
     };
     let action = if nested {
         if object.contains_key("action") {
-            return Err("nested rules cannot have an action".into());
+            return Err("DNS rule action is not supported in nested rules".into());
         }
         None
     } else {

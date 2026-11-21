@@ -5,7 +5,7 @@
 //! or a route `strategy` need the legacy mode; `ip_version`, `query_type` or
 //! a rule-set with `query_type` rules rule it out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rb_config::deprecated::{LEGACY_DNS_ADDRESS_FILTER, LEGACY_DNS_RULE_STRATEGY, RULE_SET_IP_CIDR_ACCEPT_EMPTY};
 use rb_config::{DnsRule, DnsRuleAction, DnsRuleMatch, DomainStrategy, Rule};
@@ -153,6 +153,130 @@ pub(crate) fn validate_disabled_rules(rules: &[DnsRule], lookup: &MetadataLookup
     for (index, rule) in rules.iter().enumerate() {
         validate_disabled_tree(rule, lookup).map_err(|error| format!("validate dns rule[{index}]: {error}"))?;
     }
+    validate_evaluate_rules(rules)
+}
+
+fn collect_matchers<'a>(rule: &'a DnsRule, matchers: &mut Vec<&'a DnsRuleMatch>) {
+    match rule {
+        Rule::Default { matcher, .. } => matchers.push(matcher),
+        Rule::Logical { rules, .. } => {
+            for rule in rules {
+                collect_matchers(rule, matchers);
+            }
+        }
+    }
+}
+
+fn validate_nested_actions(rule: &DnsRule) -> Result<(), String> {
+    if let Rule::Logical { rules, .. } = rule {
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.action().is_some() {
+                return Err(format!("sub rule[{index}]: DNS rule action is not supported in nested rules"));
+            }
+            validate_nested_actions(rule).map_err(|error| format!("sub rule[{index}]: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks evaluate references and action-only constraints. sing-box runs
+/// these checks only when legacy DNS mode is disabled.
+pub(crate) fn validate_evaluate_rules(rules: &[DnsRule]) -> Result<(), String> {
+    let mut named_tags = HashMap::<String, usize>::new();
+    let mut referenced_tags = HashSet::<String>::new();
+    let mut anonymous_evaluate: Option<(usize, bool)> = None;
+
+    for (index, rule) in rules.iter().enumerate() {
+        let rule_error = |message: String| format!("dns rule[{index}]: {message}");
+        validate_nested_actions(rule).map_err(rule_error)?;
+
+        let is_logical = matches!(rule, Rule::Logical { .. });
+        let mut matchers = Vec::new();
+        collect_matchers(rule, &mut matchers);
+        for matcher in &matchers {
+            if !matcher.match_response.enabled {
+                continue;
+            }
+            if matcher.match_response.tag.is_empty() {
+                if anonymous_evaluate.is_none() {
+                    let message = if named_tags.is_empty() {
+                        "response-based matching requires a preceding evaluate action"
+                    } else {
+                        "response-based matching requires a preceding evaluate action without `tag`; use `match_response` with an evaluate tag to reference a tagged result"
+                    };
+                    return Err(rule_error(message.into()));
+                }
+                if let Some((_, used)) = anonymous_evaluate.as_mut() {
+                    *used = true;
+                }
+            } else {
+                let tag = matcher.match_response.tag.as_str();
+                if !named_tags.contains_key(tag) {
+                    return Err(rule_error(format!("undefined evaluate tag: {tag}")));
+                }
+                referenced_tags.insert(tag.to_string());
+            }
+        }
+
+        if let Some(DnsRuleAction::Respond { .. }) = rule.action() {
+            if is_logical
+                && matchers
+                    .iter()
+                    .any(|matcher| matcher.match_response.enabled && !matcher.match_response.tag.is_empty())
+            {
+                return Err(rule_error(
+                    "respond on a logical rule cannot bind a `match_response` tag from its sub rules; use a non-logical rule"
+                        .into(),
+                ));
+            }
+        }
+
+        let (race, speculative, final_action) = match rule.action() {
+            Some(DnsRuleAction::Route { race, speculative, .. }) => (*race, *speculative, true),
+            Some(DnsRuleAction::Evaluate { race, speculative, .. }) => (*race, *speculative, false),
+            Some(DnsRuleAction::Respond { race }) | Some(DnsRuleAction::Reject { race, .. }) => (*race, false, true),
+            None => (false, false, false),
+        };
+        if race {
+            if !final_action {
+                return Err(rule_error("`race` requires a final action".into()));
+            }
+            if speculative {
+                return Err(rule_error("`race` and `speculative` cannot be combined on the same rule".into()));
+            }
+            if !matchers.iter().any(|matcher| matcher.match_response.enabled) {
+                let requirement = if is_logical {
+                    "`race` requires `match_response` in sub-rules"
+                } else {
+                    "`race` requires `match_response`"
+                };
+                return Err(rule_error(requirement.into()));
+            }
+        }
+
+        if let Some(DnsRuleAction::Evaluate { tag, .. }) = rule.action() {
+            if tag.is_empty() {
+                if let Some((previous_index, used)) = anonymous_evaluate {
+                    if !used {
+                        tracing::warn!(
+                            rule = previous_index,
+                            replaced_by = index,
+                            "evaluated response is overwritten before any use"
+                        );
+                    }
+                }
+                anonymous_evaluate = Some((index, false));
+            } else if named_tags.insert(tag.clone(), index).is_some() {
+                return Err(rule_error(format!("duplicate evaluate tag: {tag}")));
+            }
+        }
+    }
+
+    for tag in named_tags.keys() {
+        if !referenced_tags.contains(tag) {
+            tracing::warn!(tag, "evaluate tag is never referenced");
+        }
+    }
     Ok(())
 }
 
@@ -185,4 +309,75 @@ pub(crate) fn validate_update(
         return Err(LEGACY_DNS_ADDRESS_FILTER.message_with_link());
     }
     validate_disabled_rules(rules, lookup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rules(json: &str) -> Vec<DnsRule> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn evaluate_tags_must_be_defined_before_their_references() {
+        let valid = rules(
+            r#"[{"action":"evaluate","server":"local","tag":"answer"},
+                {"match_response":"answer","action":"respond"}]"#,
+        );
+        assert!(validate_evaluate_rules(&valid).is_ok());
+
+        for (json, expected) in [
+            (
+                r#"[{"match_response":"later","action":"respond"},
+                    {"action":"evaluate","server":"local","tag":"later"}]"#,
+                "undefined evaluate tag: later",
+            ),
+            (
+                r#"[{"action":"evaluate","server":"local","tag":"same"},
+                    {"action":"evaluate","server":"local","tag":"same"}]"#,
+                "duplicate evaluate tag: same",
+            ),
+            (
+                r#"[{"match_response":true,"action":"respond"}]"#,
+                "response-based matching requires a preceding evaluate action",
+            ),
+            (
+                r#"[{"action":"evaluate","server":"local","tag":"named"},
+                    {"match_response":true,"action":"respond"}]"#,
+                "preceding evaluate action without `tag`",
+            ),
+        ] {
+            let error = validate_evaluate_rules(&rules(json)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
+    }
+
+    #[test]
+    fn race_and_logical_respond_constraints_match_sing_box() {
+        for (json, expected) in [
+            (r#"[{"action":"evaluate","server":"local","race":true}]"#, "`race` requires a final action"),
+            (
+                r#"[{"action":"route","server":"local","race":true,"speculative":true,
+                    "match_response":true}]"#,
+                "`race` and `speculative` cannot be combined",
+            ),
+            (r#"[{"action":"route","server":"local","race":true}]"#, "`race` requires `match_response`"),
+            (
+                r#"[{"action":"evaluate","server":"local","tag":"answer"},
+                    {"type":"logical","mode":"and","rules":[{"match_response":"answer"}],
+                     "action":"respond"}]"#,
+                "respond on a logical rule cannot bind a `match_response` tag",
+            ),
+            (
+                r#"[{"action":"evaluate","server":"local","tag":"answer"},
+                    {"type":"logical","mode":"and","rules":[{"match_response":"answer"}],
+                     "action":"route","server":"local","race":true}]"#,
+                "`race` requires `match_response` in sub-rules",
+            ),
+        ] {
+            let error = validate_evaluate_rules(&rules(json)).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
+    }
 }
