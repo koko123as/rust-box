@@ -7,6 +7,7 @@
 
 pub mod framed;
 pub mod http;
+pub mod hysteria2;
 pub mod inbound;
 mod multiplex;
 pub mod outbound;
@@ -14,6 +15,7 @@ pub mod proxy_outbound;
 pub mod shadowsocks;
 pub mod socks;
 pub mod trojan;
+pub mod tuic;
 pub mod uot;
 pub mod v2ray;
 pub mod vless;
