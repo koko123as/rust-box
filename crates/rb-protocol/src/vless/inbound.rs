@@ -39,16 +39,17 @@ fn flow_name(flow: &str) -> &str {
 }
 
 /// What routing a request needs, shared with the sessions of a mux
-/// connection.
-struct Routing {
-    tag: String,
-    names: Vec<String>,
-    router: Arc<dyn ConnectionRouter>,
+/// connection (also the vmess inbound's).
+pub(crate) struct Routing {
+    pub(crate) kind: &'static str,
+    pub(crate) tag: String,
+    pub(crate) names: Vec<String>,
+    pub(crate) router: Arc<dyn ConnectionRouter>,
 }
 
 impl Routing {
     fn log_prefix(&self) -> String {
-        format!("inbound/vless[{}]", self.tag)
+        format!("inbound/{}[{}]", self.kind, self.tag)
     }
 
     /// The logged name of a user and the one routing sees (only a
@@ -60,7 +61,7 @@ impl Routing {
         }
     }
 
-    fn finish(&self, source: SocketAddr, result: Result<(), RouteError>) {
+    pub(crate) fn finish(&self, source: SocketAddr, result: Result<(), RouteError>) {
         match result {
             Ok(()) | Err(RouteError::Rejected) => {}
             Err(error) => warn!("{}: {source}: {error}", self.log_prefix()),
@@ -68,7 +69,7 @@ impl Routing {
     }
 
     /// sing-box `Inbound.newConnectionEx` and then `uot.Router`.
-    async fn route_connection(
+    pub(crate) async fn route_connection(
         &self,
         mut context: InboundContext,
         user: usize,
@@ -78,7 +79,7 @@ impl Routing {
         let (logged, routed) = self.user(user);
         info!("{}: [{logged}] inbound connection to {destination}", self.log_prefix());
         context.inbound = self.tag.clone();
-        context.inbound_type = "vless";
+        context.inbound_type = self.kind;
         context.user = routed;
         let source = context.source;
         let request = match destination.domain() {
@@ -120,7 +121,7 @@ impl Routing {
     }
 
     /// sing-box `Inbound.newPacketConnectionEx`.
-    async fn route_packet_connection(
+    pub(crate) async fn route_packet_connection(
         &self,
         mut context: InboundContext,
         user: usize,
@@ -129,7 +130,7 @@ impl Routing {
     ) {
         let (logged, routed) = self.user(user);
         context.inbound = self.tag.clone();
-        context.inbound_type = "vless";
+        context.inbound_type = self.kind;
         context.network = Network::Udp;
         context.user = routed;
         let source = context.source;
@@ -159,10 +160,10 @@ impl Routing {
 }
 
 /// The sessions of one mux connection.
-struct MuxSessions {
-    routing: Arc<Routing>,
-    context: InboundContext,
-    user: usize,
+pub(crate) struct MuxSessions {
+    pub(crate) routing: Arc<Routing>,
+    pub(crate) context: InboundContext,
+    pub(crate) user: usize,
 }
 
 #[async_trait]
@@ -228,6 +229,7 @@ impl VlessInbound {
         let record_stream = tls.is_some() && options.users.iter().any(|user| user.flow == FLOW_VISION);
         Ok(VlessInbound {
             routing: Arc::new(Routing {
+                kind: "vless",
                 tag: tag.clone(),
                 names: options.users.iter().map(|user| user.name.clone()).collect(),
                 router,

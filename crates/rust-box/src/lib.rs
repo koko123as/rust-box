@@ -19,7 +19,7 @@ use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_protocol::{
     Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
-    TrojanInbound, TrojanOutbound, VlessInbound, VlessOutbound,
+    TrojanInbound, TrojanOutbound, VlessInbound, VlessOutbound, VmessInbound, VmessOutbound,
 };
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
@@ -143,6 +143,10 @@ impl RustBox {
                     VlessOutbound::new(vless, tag, &dialer_env, &certificates)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
+                OutboundOptions::Vmess(vmess) => Arc::new(
+                    VmessOutbound::new(vmess, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
             });
         }
         if outbounds.is_empty() {
@@ -184,6 +188,10 @@ impl RustBox {
                 ),
                 InboundOptions::Vless(vless) => Arc::new(
                     VlessInbound::new(vless, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Vmess(vmess) => Arc::new(
+                    VmessInbound::new(vmess, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
             };

@@ -2,7 +2,7 @@
 //! wire format of sing-vmess `vless`: TCP, UDP (plain, packetaddr, XUDP)
 //! and `xtls-rprx-vision`.
 
-mod inbound;
+pub(crate) mod inbound;
 pub mod mux;
 mod outbound;
 pub mod packet;

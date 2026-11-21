@@ -5,7 +5,7 @@
 
 use std::io;
 
-use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, KeyIvInit};
 use aes::Aes128;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::Aes128Gcm;
@@ -155,13 +155,13 @@ pub fn kdf(key: &[u8], salt: &str, path: &[&[u8]]) -> [u8; 32] {
     nested_hash(&keys, keys.len(), key)
 }
 
-fn kdf16(key: &[u8], salt: &str, path: &[&[u8]]) -> [u8; 16] {
+pub(crate) fn kdf16(key: &[u8], salt: &str, path: &[&[u8]]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&kdf(key, salt, path)[..16]);
     out
 }
 
-fn kdf12(key: &[u8], salt: &str, path: &[&[u8]]) -> [u8; 12] {
+pub(crate) fn kdf12(key: &[u8], salt: &str, path: &[&[u8]]) -> [u8; 12] {
     let mut out = [0u8; 12];
     out.copy_from_slice(&kdf(key, salt, path)[..12]);
     out
@@ -183,6 +183,19 @@ pub fn auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 16] 
     let mut block = aes::Block::from(block);
     auth_id_cipher(cmd_key).encrypt_block(&mut block);
     block.into()
+}
+
+/// Decrypts an auth id with a user's cipher and checks it (sing-vmess
+/// `Service.NewConnection`): the timestamp when its CRC32 matches.
+pub fn open_auth_id(cipher: &Aes128, auth_id: &[u8; 16]) -> Option<([u8; 16], i64)> {
+    let mut block = aes::Block::from(*auth_id);
+    cipher.decrypt_block(&mut block);
+    let decoded: [u8; 16] = block.into();
+    let checksum = u32::from_be_bytes(decoded[12..].try_into().unwrap());
+    if crc32fast::hash(&decoded[..12]) != checksum {
+        return None;
+    }
+    Some((decoded, i64::from_be_bytes(decoded[..8].try_into().unwrap())))
 }
 
 fn gcm(key: &[u8; 16]) -> Aes128Gcm {
@@ -337,7 +350,12 @@ pub fn response_keys(legacy: bool, request_key: &[u8; 16], request_nonce: &[u8; 
 
 /// The AEAD response header (sing-vmess `rawServerConn.writeResponse`):
 /// the sealed length (4) and the sealed `[response header, option, 0, 0]`.
-pub fn seal_aead_response(response_key: &[u8; 16], response_nonce: &[u8; 16], response_header: u8, option: u8) -> Vec<u8> {
+pub fn seal_aead_response(
+    response_key: &[u8; 16],
+    response_nonce: &[u8; 16],
+    response_header: u8,
+    option: u8,
+) -> Vec<u8> {
     let mut response = gcm_seal(
         &kdf16(response_key, KDF_SALT_AEAD_RESP_HEADER_LEN_KEY, &[]),
         &kdf12(response_nonce, KDF_SALT_AEAD_RESP_HEADER_LEN_IV, &[]),
@@ -368,7 +386,11 @@ pub fn open_aead_response_length(response_key: &[u8; 16], response_nonce: &[u8; 
 }
 
 /// Opens the header of an AEAD response (`length` + 16 bytes).
-pub fn open_aead_response_header(response_key: &[u8; 16], response_nonce: &[u8; 16], data: &[u8]) -> io::Result<Vec<u8>> {
+pub fn open_aead_response_header(
+    response_key: &[u8; 16],
+    response_nonce: &[u8; 16],
+    data: &[u8],
+) -> io::Result<Vec<u8>> {
     gcm_open(
         &kdf16(response_key, KDF_SALT_AEAD_RESP_HEADER_PAYLOAD_KEY, &[]),
         &kdf12(response_nonce, KDF_SALT_AEAD_RESP_HEADER_PAYLOAD_IV, &[]),
