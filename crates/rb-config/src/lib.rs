@@ -240,6 +240,8 @@ pub enum Inbound {
     Trojan(TrojanInbound),
     #[serde(rename = "vless")]
     Vless(VlessInbound),
+    #[serde(rename = "vmess")]
+    Vmess(VmessInbound),
 }
 
 impl Inbound {
@@ -249,6 +251,7 @@ impl Inbound {
             Inbound::Shadowsocks(options) => &options.tag,
             Inbound::Trojan(options) => &options.tag,
             Inbound::Vless(options) => &options.tag,
+            Inbound::Vmess(options) => &options.tag,
         }
     }
     pub fn kind(&self) -> &'static str {
@@ -259,6 +262,7 @@ impl Inbound {
             Inbound::Shadowsocks(_) => "shadowsocks",
             Inbound::Trojan(_) => "trojan",
             Inbound::Vless(_) => "vless",
+            Inbound::Vmess(_) => "vmess",
         }
     }
 
@@ -269,6 +273,7 @@ impl Inbound {
             Inbound::Shadowsocks(options) => options.listen_options(),
             Inbound::Trojan(options) => options.listen_options(),
             Inbound::Vless(options) => options.listen_options(),
+            Inbound::Vmess(options) => options.listen_options(),
         }
     }
 
@@ -279,6 +284,7 @@ impl Inbound {
             Inbound::Shadowsocks(options) => options.removed_field_error(),
             Inbound::Trojan(options) => options.removed_field_error(),
             Inbound::Vless(options) => options.removed_field_error(),
+            Inbound::Vmess(options) => options.removed_field_error(),
         }
     }
 }
@@ -416,6 +422,8 @@ pub enum Outbound {
     Trojan(TrojanOutbound),
     #[serde(rename = "vless")]
     Vless(VlessOutbound),
+    #[serde(rename = "vmess")]
+    Vmess(VmessOutbound),
 }
 
 impl Outbound {
@@ -428,6 +436,7 @@ impl Outbound {
             Outbound::Shadowsocks(options) => &options.tag,
             Outbound::Trojan(options) => &options.tag,
             Outbound::Vless(options) => &options.tag,
+            Outbound::Vmess(options) => &options.tag,
         }
     }
 
@@ -442,6 +451,7 @@ impl Outbound {
             Outbound::Shadowsocks(options) => Some(options.dialer_options()),
             Outbound::Trojan(options) => Some(options.dialer_options()),
             Outbound::Vless(options) => Some(options.dialer_options()),
+            Outbound::Vmess(options) => Some(options.dialer_options()),
         }
     }
 }
@@ -561,8 +571,8 @@ with_dial_fields! {
     }
 }
 
-/// The `tls`, `multiplex` and `transport` checks of the trojan and vless
-/// outbounds: multiplex and V2Ray transports are not implemented yet.
+/// The `tls`, `multiplex` and `transport` checks of the trojan, vless and
+/// vmess outbounds: multiplex and V2Ray transports are not implemented yet.
 fn check_proxy_outbound(
     path: &str,
     tls: Option<&OutboundTlsOptions>,
@@ -769,6 +779,80 @@ with_dial_fields! {
     }
 }
 
+with_listen_fields! {
+    /// sing-box `VMessInboundOptions`.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct VmessInbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub users: Vec<VmessUser>,
+        #[serde(default)]
+        pub tls: Option<InboundTlsOptions>,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<InboundMultiplexOptions>,
+        /// V2Ray transports are not supported yet: rejected when set.
+        #[serde(default)]
+        pub transport: Option<V2RayTransportOptions>,
+    }
+}
+
+/// sing-box `VMessUser` (`alterId` is camel case, as in sing-box; Go's
+/// `int`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmessUser {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(default, rename = "alterId")]
+    pub alter_id: i64,
+}
+
+with_dial_fields! {
+    /// sing-box `VMessOutboundOptions` (`DialerOptions` + `ServerOptions`).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct VmessOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub uuid: String,
+        /// `auto` (also when empty), `none`, `zero`, `aes-128-cfb`,
+        /// `aes-128-gcm`, `chacha20-poly1305`; anything else fails when the
+        /// outbound is built ("vmess: unsupported security type: X").
+        #[serde(default)]
+        pub security: String,
+        #[serde(default)]
+        pub alter_id: i64,
+        #[serde(default)]
+        pub global_padding: bool,
+        #[serde(default)]
+        pub authenticated_length: bool,
+        #[serde(default)]
+        pub network: NetworkList,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+        /// Empty (none, the default), `packetaddr` or `xudp`; anything else
+        /// fails when the outbound is built.
+        #[serde(default)]
+        pub packet_encoding: String,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<OutboundMultiplexOptions>,
+        /// V2Ray transports are not supported yet: rejected when set.
+        #[serde(default)]
+        pub transport: Option<V2RayTransportOptions>,
+    }
+}
+
 with_dial_fields! {
     /// sing-box `HTTPOutboundOptions` (`DialerOptions` + `ServerOptions`).
     #[derive(Debug, Clone, Default, Deserialize)]
@@ -967,6 +1051,7 @@ impl Options {
                 Inbound::Shadowsocks(options) => options.multiplex.as_ref(),
                 Inbound::Trojan(options) => options.multiplex.as_ref(),
                 Inbound::Vless(options) => options.multiplex.as_ref(),
+                Inbound::Vmess(options) => options.multiplex.as_ref(),
                 _ => None,
             };
             if multiplex.is_some_and(|multiplex| multiplex.enabled) {
@@ -978,6 +1063,7 @@ impl Options {
             let transport = match inbound {
                 Inbound::Trojan(options) => options.transport.as_ref(),
                 Inbound::Vless(options) => options.transport.as_ref(),
+                Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
             if transport.is_some() {
@@ -994,6 +1080,7 @@ impl Options {
                 Inbound::Shadowsocks(_) => None,
                 Inbound::Trojan(options) => options.tls.as_ref(),
                 Inbound::Vless(options) => options.tls.as_ref(),
+                Inbound::Vmess(options) => options.tls.as_ref(),
             };
             if let Some(tls) = tls {
                 // sing-box's socks inbound has no `tls` field.
@@ -1050,6 +1137,10 @@ impl Options {
                 Outbound::Vless(vless) => {
                     check_proxy_outbound(&path, vless.tls.as_ref(), vless.multiplex.as_ref(), &vless.transport)?;
                     self.check_dialer(&path, &vless.dialer_options(), &server_known)?;
+                }
+                Outbound::Vmess(vmess) => {
+                    check_proxy_outbound(&path, vmess.tls.as_ref(), vmess.multiplex.as_ref(), &vmess.transport)?;
+                    self.check_dialer(&path, &vmess.dialer_options(), &server_known)?;
                 }
                 _ => {}
             }
@@ -1492,6 +1583,69 @@ mod tests {
             (
                 r#"{"outbounds":[{"type":"shadowsocks","multiplex":{"protocol":"smux","foo":1}}]}"#,
                 "unknown field `foo`",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn vmess_options() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"vmess","tag":"m","listen_port":10086,
+                   "users":[{"name":"a","uuid":"bf000d23-0752-40b4-affe-68f7707a9661","alterId":4},{"uuid":"x"}],
+                   "tls":{"enabled":false},"multiplex":{"enabled":false}}],
+                "outbounds":[
+                  {"type":"vmess","tag":"mo","server":"127.0.0.1","server_port":10086,
+                   "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","security":"chacha20-poly1305","alter_id":1,
+                   "global_padding":true,"authenticated_length":true,"network":"udp","packet_encoding":"xudp",
+                   "tls":{"enabled":true,"server_name":"example.com"}},
+                  {"type":"vmess","tag":"mn"}]}"#,
+        )
+        .unwrap();
+        let Inbound::Vmess(vmess) = &options.inbounds[0] else { panic!() };
+        assert_eq!(
+            vmess.users[0],
+            VmessUser { name: "a".into(), uuid: "bf000d23-0752-40b4-affe-68f7707a9661".into(), alter_id: 4 }
+        );
+        assert_eq!(vmess.users[1].alter_id, 0);
+        let Outbound::Vmess(outbound) = &options.outbounds[0] else { panic!() };
+        assert_eq!(outbound.security, "chacha20-poly1305");
+        assert_eq!(outbound.alter_id, 1);
+        assert!(outbound.global_padding && outbound.authenticated_length);
+        assert_eq!(outbound.packet_encoding, "xudp");
+        assert_eq!(outbound.network.build(), vec!["udp"]);
+        let Outbound::Vmess(outbound) = &options.outbounds[1] else { panic!() };
+        assert_eq!((outbound.security.as_str(), outbound.packet_encoding.as_str()), ("", ""));
+
+        for (config, needle) in [
+            (
+                r#"{"inbounds":[{"type":"vmess","transport":{"type":"ws","path":"/"}}]}"#,
+                "inbounds[0].transport: `transport` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"vmess","multiplex":{"enabled":true}}]}"#,
+                "inbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true}}]}"#,
+                "outbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
+                "outbounds[0].transport: `transport` is not supported by rust-box yet",
+            ),
+            (r#"{"outbounds":[{"type":"vmess","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
+            (r#"{"inbounds":[{"type":"vmess","users":[{"alter_id":1}]}]}"#, "unknown field `alter_id`"),
+            (r#"{"inbounds":[{"type":"vmess","users":[{"flow":"x"}]}]}"#, "unknown field `flow`"),
+            (r#"{"outbounds":[{"type":"vmess","alterId":1}]}"#, "unknown field `alterId`"),
+            (r#"{"outbounds":[{"type":"vmess","flow":"x"}]}"#, "unknown field `flow`"),
+            (r#"{"outbounds":[{"type":"vmess","alter_id":"1"}]}"#, "invalid type"),
+            (
+                r#"{"outbounds":[{"type":"vmess","tls":{"enabled":true,"reality":{"enabled":true}}}]}"#,
+                "outbounds[0].tls.reality",
             ),
         ] {
             let error = parse(config).unwrap_err().to_string();
