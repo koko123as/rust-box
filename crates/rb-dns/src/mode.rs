@@ -383,8 +383,9 @@ mod tests {
         for (json, expected) in [
             (r#"[{"action":"evaluate","server":"local","race":true}]"#, "`race` requires a final action"),
             (
-                r#"[{"action":"route","server":"local","race":true,"speculative":true,
-                    "match_response":true}]"#,
+                r#"[{"action":"evaluate","server":"local","tag":"answer"},
+                    {"action":"route","server":"local","race":true,"speculative":true,
+                     "match_response":"answer"}]"#,
                 "`race` and `speculative` cannot be combined",
             ),
             (r#"[{"action":"route","server":"local","race":true}]"#, "`race` requires `match_response`"),

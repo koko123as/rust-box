@@ -225,6 +225,12 @@ impl DnsEvaluationState {
         }
     }
 
+    async fn wait_for_completion(&mut self) {
+        if let Some((index, result)) = self.receiver.recv().await {
+            self.settle_one(index, result);
+        }
+    }
+
     fn resolved(&self, index: usize) -> bool {
         self.futures.get(index).is_none_or(|future| future.resolved)
     }
@@ -1059,8 +1065,8 @@ impl DnsRouter {
                 .iter()
                 .flat_map(|rule| rule.futures.iter().copied())
                 .find(|future| !evaluation.resolved(*future));
-            let future = next?;
-            evaluation.wait_for(future).await;
+            next?;
+            evaluation.wait_for_completion().await;
         }
     }
 

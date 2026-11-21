@@ -363,17 +363,35 @@ fn direct_dns_options_validate_evaluate_server_references() {
 }
 
 #[test]
-fn nested_dns_rule_actions_are_rejected_in_legacy_mode() {
-    let options: rb_config::DnsOptions = serde_json::from_str(
-        r#"{"servers":[{"type":"local","tag":"local"}],
-            "rules":[{"type":"logical","mode":"and","rules":[{"action":"route","server":"local"}]}]}"#,
-    )
-    .unwrap();
-    let error = match try_router(&options) {
-        Ok(_) => panic!("nested DNS rule actions must be rejected in every rule mode"),
-        Err(error) => error.to_string(),
-    };
-    assert_eq!(error, "dns rule[0]: sub rule[0]: DNS rule action is not supported in nested rules");
+fn nested_dns_rule_actions_are_rejected_in_every_mode() {
+    for legacy in [false, true] {
+        let route_action = || DnsRuleAction::Route {
+            server: "local".into(),
+            options: Default::default(),
+            speculative: false,
+            race: false,
+        };
+        let nested = rb_config::DnsRule::Default {
+            matcher: rb_config::DnsRuleMatch { ip_is_private: legacy, ..Default::default() },
+            action: Some(route_action()),
+        };
+        let logical = rb_config::DnsRule::Logical {
+            mode: rb_config::LogicalMode::And,
+            rules: vec![nested],
+            invert: false,
+            action: Some(route_action()),
+        };
+        let options = rb_config::DnsOptions {
+            servers: vec![DnsServer::Local { tag: "local".into() }],
+            rules: vec![logical],
+            ..Default::default()
+        };
+        let error = match try_router(&options) {
+            Ok(_) => panic!("nested DNS rule actions must be rejected in every rule mode"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(error, "dns rule[0]: sub rule[0]: DNS rule action is not supported in nested rules");
+    }
 }
 
 #[tokio::test]
