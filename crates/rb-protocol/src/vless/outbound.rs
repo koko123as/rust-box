@@ -49,13 +49,14 @@ enum ServerConn {
     /// With the gate of its record stream (Vision).
     Tls(Box<rb_tls::TlsClientStream>, RecordGate),
     Plain(BoxStream),
+    Transport(BoxStream),
 }
 
 impl ServerConn {
     fn boxed(self) -> BoxStream {
         match self {
             ServerConn::Tls(stream, _) => stream,
-            ServerConn::Plain(stream) => stream,
+            ServerConn::Plain(stream) | ServerConn::Transport(stream) => stream,
         }
     }
 }
@@ -141,6 +142,11 @@ impl VlessOutbound {
                     let stream = crate::v2ray::websocket::client(conn.boxed(), &self.server, options).await?;
                     return Ok(ServerConn::Plain(stream));
                 }
+                crate::v2ray::StreamTransport::Http(options) => {
+                    let stream =
+                        crate::v2ray::http::client(conn.boxed(), &self.server, options, self.tls.is_some()).await?;
+                    return Ok(ServerConn::Transport(stream));
+                }
                 crate::v2ray::StreamTransport::HttpUpgrade(options) => {
                     let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
                     match &mut conn {
@@ -162,13 +168,22 @@ impl VlessOutbound {
                             )
                             .await?;
                         }
+                        ServerConn::Transport(stream) => {
+                            crate::v2ray::httpupgrade::client_in_place(
+                                &mut *stream,
+                                &self.server,
+                                options,
+                                tls_server_name,
+                            )
+                            .await?;
+                        }
                     }
                 }
                 crate::v2ray::StreamTransport::Grpc(options) => {
                     let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
                     let stream = match conn {
                         ServerConn::Tls(stream, _) => Box::new(*stream) as BoxStream,
-                        ServerConn::Plain(stream) => stream,
+                        ServerConn::Plain(stream) | ServerConn::Transport(stream) => stream,
                     };
                     let stream =
                         crate::v2ray::grpc_lite::client(stream, &self.server, tls_server_name, options).await?;

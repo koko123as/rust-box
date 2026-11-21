@@ -108,7 +108,9 @@ impl VmessOutbound {
         };
         if let Some(transport) = &self.transport {
             let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
-            stream = crate::v2ray::transport_client(stream, &self.server, transport, tls_server_name).await?;
+            stream =
+                crate::v2ray::transport_client(stream, &self.server, transport, tls_server_name, self.tls.is_some())
+                    .await?;
         }
         Ok(stream)
     }

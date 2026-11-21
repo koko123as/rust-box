@@ -288,7 +288,7 @@ impl VlessInbound {
     /// Serves one connection (sing-box `Inbound.NewConnection`).
     async fn handle(&self, stream: BoxStream, context: InboundContext) {
         let source = context.source;
-        let conn = match &self.tls {
+        let (conn, alpn) = match &self.tls {
             Some(tls) => {
                 let (stream, gate): (BoxStream, RecordGate) = if self.record_stream {
                     let stream = RecordStream::new(stream);
@@ -298,15 +298,62 @@ impl VlessInbound {
                     (stream, RecordGate::default())
                 };
                 match tls.handshake(stream).await {
-                    Ok(stream) => ClientConn::Tls(Box::new(stream), gate),
+                    Ok(stream) => {
+                        let alpn =
+                            stream.get_ref().1.alpn_protocol().map(|alpn| String::from_utf8_lossy(alpn).into_owned());
+                        (ClientConn::Tls(Box::new(stream), gate), alpn)
+                    }
                     Err(error) => {
                         error!("{}: process connection from {source}: TLS handshake: {error}", self.log_prefix());
                         return;
                     }
                 }
             }
-            None => ClientConn::Plain(stream),
+            None => (ClientConn::Plain(stream), None),
         };
+        if let Some(crate::v2ray::StreamTransport::Http(options)) = &self.transport {
+            let session =
+                match crate::v2ray::http::server_session(conn.boxed(), options, self.tls.is_some(), alpn.as_deref())
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(error) => {
+                        error!("{}: process HTTP connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+            match session {
+                crate::v2ray::http::ServerSession::Http1(stream) => {
+                    if let Err(error) = self.serve(ClientConn::Transport(stream), context).await {
+                        error!("{}: process HTTP/1.1 stream from {source}: {error}", self.log_prefix());
+                    }
+                }
+                crate::v2ray::http::ServerSession::Http2(server) => {
+                    let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                        error!("{}: HTTP handler is not initialized", self.log_prefix());
+                        return;
+                    };
+                    loop {
+                        let stream = match server.accept().await {
+                            Ok(Some(stream)) => stream,
+                            Ok(None) => return,
+                            Err(error) => {
+                                error!("{}: process HTTP/2 connection from {source}: {error}", self.log_prefix());
+                                return;
+                            }
+                        };
+                        let inbound = inbound.clone();
+                        let context = context.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = inbound.serve(ClientConn::Transport(stream), context).await {
+                                error!("{}: process HTTP/2 stream from {source}: {error}", inbound.log_prefix());
+                            }
+                        });
+                    }
+                }
+            }
+            return;
+        }
         if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
             if self.record_stream {
                 error!(
@@ -378,6 +425,7 @@ impl VlessInbound {
                 );
                 return;
             }
+            (Some(crate::v2ray::StreamTransport::Http(_)), conn) => conn,
             (None, conn) => conn,
         };
         if let Err(error) = self.serve(conn, context).await {

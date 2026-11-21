@@ -168,6 +168,7 @@ pub struct TrojanOutbound {
     key: [u8; KEY_LENGTH],
     transport: Option<crate::v2ray::StreamTransport>,
     tls_server_name: Option<String>,
+    tls_enabled: bool,
     networks: Vec<Network>,
     /// The sing-mux client when `multiplex` is enabled.
     mux: Option<rb_mux::Client>,
@@ -184,6 +185,7 @@ impl TrojanOutbound {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
         let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let mut tls_server_name = None;
+        let mut tls_enabled = false;
         let mut dialer = new_outbound_dialer(
             &options.dialer_options(),
             server.domain().is_some(),
@@ -191,6 +193,7 @@ impl TrojanOutbound {
             &format!("outbound/trojan[{tag}]"),
         )?;
         if let Some(tls) = options.tls.as_ref().filter(|tls| tls.enabled) {
+            tls_enabled = true;
             let client = rb_tls::TlsClient::new(tls, &options.server, certificates)?;
             tls_server_name = Some(client.server_name().to_owned());
             let client = if transport.is_some() {
@@ -214,6 +217,7 @@ impl TrojanOutbound {
             key: key(&options.password),
             transport,
             tls_server_name,
+            tls_enabled,
             networks,
             mux: crate::multiplex::new_client(this, multiplex),
         }))
@@ -225,8 +229,14 @@ impl TrojanOutbound {
     pub async fn connect(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
         let mut stream = self.dialer.dial_tcp(&self.server).await?;
         if let Some(transport) = &self.transport {
-            stream = crate::v2ray::transport_client(stream, &self.server, transport, self.tls_server_name.as_deref())
-                .await?;
+            stream = crate::v2ray::transport_client(
+                stream,
+                &self.server,
+                transport,
+                self.tls_server_name.as_deref(),
+                self.tls_enabled,
+            )
+            .await?;
         }
         let request =
             encode_request(&self.key, COMMAND_TCP, destination, &[]).map_err(|error| cause(error, "write request"))?;
@@ -240,8 +250,14 @@ impl TrojanOutbound {
     pub async fn connect_packet(&self) -> io::Result<TrojanPacketConn> {
         let mut stream = self.dialer.dial_tcp(&self.server).await?;
         if let Some(transport) = &self.transport {
-            stream = crate::v2ray::transport_client(stream, &self.server, transport, self.tls_server_name.as_deref())
-                .await?;
+            stream = crate::v2ray::transport_client(
+                stream,
+                &self.server,
+                transport,
+                self.tls_server_name.as_deref(),
+                self.tls_enabled,
+            )
+            .await?;
         }
         Ok(TrojanPacketConn::client(stream, self.key))
     }
@@ -382,6 +398,48 @@ impl TrojanInbound {
             },
             None => (stream, None),
         };
+        if let Some(crate::v2ray::StreamTransport::Http(options)) = &self.transport {
+            let session =
+                match crate::v2ray::http::server_session(stream, options, self.tls.is_some(), alpn.as_deref()).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        error!("{}: process HTTP connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+            match session {
+                crate::v2ray::http::ServerSession::Http1(stream) => {
+                    if let Err(error) = self.serve(stream, context, alpn).await {
+                        error!("{}: process HTTP/1.1 stream from {source}: {error}", self.log_prefix());
+                    }
+                }
+                crate::v2ray::http::ServerSession::Http2(server) => {
+                    let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                        error!("{}: HTTP handler is not initialized", self.log_prefix());
+                        return;
+                    };
+                    loop {
+                        let stream = match server.accept().await {
+                            Ok(Some(stream)) => stream,
+                            Ok(None) => return,
+                            Err(error) => {
+                                error!("{}: process HTTP/2 connection from {source}: {error}", self.log_prefix());
+                                return;
+                            }
+                        };
+                        let inbound = inbound.clone();
+                        let context = context.clone();
+                        let alpn = alpn.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = inbound.serve(stream, context, alpn).await {
+                                error!("{}: process HTTP/2 stream from {source}: {error}", inbound.log_prefix());
+                            }
+                        });
+                    }
+                }
+            }
+            return;
+        }
         if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
             let server = crate::v2ray::grpc_lite::GrpcLiteServer::new(stream, options);
             let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
