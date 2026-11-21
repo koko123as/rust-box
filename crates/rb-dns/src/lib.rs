@@ -472,7 +472,15 @@ impl DnsRouter {
             let check = index.filter(|index| rules.rules[*index].matcher.with_address_limit());
             let metadata = Self::base_metadata(domain, options);
             let result = self
-                .lookup_server(rules, check.map(|index| (index, &metadata)), &server, disable_cache, domain, strategy, options)
+                .lookup_server(
+                    rules,
+                    check.map(|index| (index, &metadata)),
+                    &server,
+                    disable_cache,
+                    domain,
+                    strategy,
+                    options,
+                )
                 .await;
             match (check, result) {
                 (Some(index), Err(error)) => {
@@ -515,7 +523,16 @@ impl DnsRouter {
             };
             let check = index.filter(|index| rules.legacy && rules.rules[*index].matcher.with_address_limit());
             let (result, addresses) = self
-                .exchange_with_server(request, &question, &domain, query_type, &server, strategy, disable_cache, options)
+                .exchange_with_server(
+                    request,
+                    &question,
+                    &domain,
+                    query_type,
+                    &server,
+                    strategy,
+                    disable_cache,
+                    options,
+                )
                 .await?;
             if let Some(index) = check {
                 if !rules.rules[index].matcher.match_address_limit(&metadata, &addresses) {
@@ -632,7 +649,9 @@ fn combine(
     let v4 = take(a);
     let v6 = take(aaaa);
     if v4.is_empty() && v6.is_empty() {
-        return Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{domain}: no addresses"))));
+        return Err(
+            last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{domain}: no addresses")))
+        );
     }
     let mut addresses = if strategy == DomainStrategy::PreferIpv6 { [v6, v4].concat() } else { [v4, v6].concat() };
     addresses = apply_strategy(addresses, strategy);

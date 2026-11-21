@@ -87,18 +87,20 @@ impl RustBox {
             }
         }
         let rule_sets = Arc::new(rule_sets);
-        let dns_router =
-            Arc::new(DnsRouter::new(&options.dns, &defaults, &outbound_registry, &rule_sets).context("initialize DNS")?);
+        let dns_router = Arc::new(
+            DnsRouter::new(&options.dns, &defaults, &outbound_registry, &rule_sets).context("initialize DNS")?,
+        );
         {
             // Rule-set updates go through the DNS router's check.
             let dns = Arc::downgrade(&dns_router);
             let sets = Arc::downgrade(&rule_sets);
-            let _ = rule_set_env.validator.set(Box::new(move |tag: &str, metadata: &rb_rule::RuleSetMetadata| {
-                match (dns.upgrade(), sets.upgrade()) {
-                    (Some(dns), Some(sets)) => dns.validate_rule_set_update(&sets, tag, metadata),
-                    _ => Ok(()),
-                }
-            }));
+            let _ =
+                rule_set_env.validator.set(Box::new(move |tag: &str, metadata: &rb_rule::RuleSetMetadata| {
+                    match (dns.upgrade(), sets.upgrade()) {
+                        (Some(dns), Some(sets)) => dns.validate_rule_set_update(&sets, tag, metadata),
+                        _ => Ok(()),
+                    }
+                }));
         }
         let dns: Arc<dyn DnsResolver> = dns_router.clone();
         let default_resolver = options.route.default_domain_resolver.as_ref();

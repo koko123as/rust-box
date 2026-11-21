@@ -208,7 +208,8 @@ impl SuccinctSet {
                 }
                 continue;
             }
-            let (Some(label), Some((next_node, next_index))) = (self.label(bitmap_index, node), self.child(bitmap_index))
+            let (Some(label), Some((next_node, next_index))) =
+                (self.label(bitmap_index, node), self.child(bitmap_index))
             else {
                 break;
             };
@@ -412,7 +413,8 @@ impl Matcher {
         let mut domain_list: Vec<Vec<u8>> = domains.into_iter().collect();
         domain_list.sort();
         suffix_list.sort();
-        let text = |list: Vec<Vec<u8>>| list.into_iter().map(|key| String::from_utf8_lossy(&key).into_owned()).collect();
+        let text =
+            |list: Vec<Vec<u8>>| list.into_iter().map(|key| String::from_utf8_lossy(&key).into_owned()).collect();
         (text(domain_list), text(suffix_list))
     }
 }

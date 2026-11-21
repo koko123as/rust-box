@@ -266,8 +266,8 @@ fn headless_platform_items() {
     let sets = RuleSets::new();
     let in_box = compile_headless(&rule, &Context::new(&sets)).unwrap();
     assert!(!in_box.matches(&mut test_metadata("a")));
-    let standalone = compile_headless(&rule, &Context { rule_sets: &sets, legacy_dns_mode: false, network_manager: false })
-        .unwrap();
+    let standalone =
+        compile_headless(&rule, &Context { rule_sets: &sets, legacy_dns_mode: false, network_manager: false }).unwrap();
     assert!(standalone.matches(&mut test_metadata("a")));
     let rule = HeadlessRule::from_value(serde_json::json!({"process_name": "curl"})).unwrap();
     assert!(!compile_headless(&rule, &Context::new(&sets)).unwrap().matches(&mut test_metadata("a")));
@@ -282,7 +282,9 @@ fn rule_set_metadata_flags() {
         .map(|rule| HeadlessRule::from_value(serde_json::from_str(rule).unwrap()).unwrap())
         .collect();
     let metadata = rule_set_metadata(&rules);
-    assert!(metadata.contains_ip_cidr_rule && metadata.contains_dns_query_type_rule && metadata.contains_non_ip_cidr_rule);
+    assert!(
+        metadata.contains_ip_cidr_rule && metadata.contains_dns_query_type_rule && metadata.contains_non_ip_cidr_rule
+    );
     let pure = rule_set_metadata(&rules[..1]);
     assert!(pure.contains_ip_cidr_rule && !pure.contains_non_ip_cidr_rule);
 }

@@ -1158,6 +1158,7 @@ dependencies = [
  "rb-rule",
  "rb-rule-set",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

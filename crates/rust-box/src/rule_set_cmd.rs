@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Subcommand;
 use rb_common::gojson;
-use rb_config::rule_set::{FORMAT_BINARY, FORMAT_SOURCE, RULE_SET_VERSION_1, RULE_SET_VERSION_2, RULE_SET_VERSION_CURRENT};
+use rb_config::rule_set::{
+    FORMAT_BINARY, FORMAT_SOURCE, RULE_SET_VERSION_1, RULE_SET_VERSION_2, RULE_SET_VERSION_CURRENT,
+};
 use rb_config::{srs, HeadlessRule, PlainRuleSet, PlainRuleSetCompat};
 use serde_json::Value;
 

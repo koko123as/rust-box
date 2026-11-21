@@ -312,7 +312,9 @@ mod tests {
     #[test]
     fn domain_names() {
         assert!(is_domain_name("example.com") && is_domain_name("a_b.c") && is_domain_name("x."));
-        assert!(!is_domain_name("1.2.3.4") && !is_domain_name("a..b") && !is_domain_name("-a.b") && !is_domain_name(""));
+        assert!(
+            !is_domain_name("1.2.3.4") && !is_domain_name("a..b") && !is_domain_name("-a.b") && !is_domain_name("")
+        );
     }
 
     #[test]
@@ -320,14 +322,14 @@ mod tests {
         let rules = to_options("example.com\n0.0.0.0 ads.test\n").unwrap();
         let HeadlessRule::Default(rule) = &rules[0] else { panic!() };
         assert_eq!(rule.domain.0, vec!["example.com", "ads.test"]);
-        let content = "! comment\n||ads.example.org^\n@@||good.example.org^\n||vip.test^$important\n/ad[0-9]+\\.test/\n\
+        let content =
+            "! comment\n||ads.example.org^\n@@||good.example.org^\n||vip.test^$important\n/ad[0-9]+\\.test/\n\
                        ||x.test/path\nexample.net$third-party\n";
         let rules = to_options(content).unwrap();
-        let json = rb_common::gojson::to_string(&crate::rule_set::PlainRuleSetCompat {
-            version: 2,
-            options: crate::rule_set::PlainRuleSet { rules },
-        }
-        .to_json());
+        let json = rb_common::gojson::to_string(
+            &crate::rule_set::PlainRuleSetCompat { version: 2, options: crate::rule_set::PlainRuleSet { rules } }
+                .to_json(),
+        );
         assert_eq!(
             json,
             r#"{"version":2,"rules":[{"type":"logical","mode":"or","rules":[{},{"type":"logical","mode":"and","rules":[{"invert":true},{"domain_regex":"ad[0-9]+\\.test"}]}]}]}"#

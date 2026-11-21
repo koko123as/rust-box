@@ -120,8 +120,7 @@ impl ManagedRuleSet {
                 (Source::Inline, compile(rules)?)
             }
             RuleSetKind::Local { path } => {
-                let path = std::path::absolute(path.replace(TAG_PLACEHOLDER, tag))
-                    .map_err(|e| error(e.to_string()))?;
+                let path = std::path::absolute(path.replace(TAG_PLACEHOLDER, tag)).map_err(|e| error(e.to_string()))?;
                 let content = load_file(&path, &options.format)?;
                 (Source::Local { path, format: options.format.clone(), watcher: Mutex::new(None) }, content)
             }
@@ -198,7 +197,8 @@ impl ManagedRuleSet {
                 Ok(())
             }
             Source::Remote(remote) => {
-                let client = self.client(remote, env).map_err(|e| error(format!("create rule-set http client: {e}")))?;
+                let client =
+                    self.client(remote, env).map_err(|e| error(format!("create rule-set http client: {e}")))?;
                 remote.state.lock().unwrap().client = Some(client);
                 if let Some(path) = &remote.initial_path {
                     let loaded = std::fs::read(path)
@@ -208,11 +208,9 @@ impl ManagedRuleSet {
                         .and_then(|content| self.replace(content));
                     match loaded {
                         Ok(()) => return Ok(()),
-                        Err(e) => tracing::warn!(
-                            "rule-set {}: load initial rule-set from {}: {e}",
-                            self.tag,
-                            path.display()
-                        ),
+                        Err(e) => {
+                            tracing::warn!("rule-set {}: load initial rule-set from {}: {e}", self.tag, path.display())
+                        }
                     }
                 }
                 self.fetch(remote).await.map_err(|e| error(format!("initial rule-set: {}: {e}", self.tag)))

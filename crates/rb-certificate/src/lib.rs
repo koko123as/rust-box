@@ -225,7 +225,8 @@ impl Store {
             .map_err(|error| CertificateError(format!("fswatch: create fsnotify watcher: {error}")))?;
             *store.watcher.write().unwrap() = Some(watcher);
         }
-        let pool = store.load().map_err(|error| CertificateError(format!("initializing certificate store: {error}")))?;
+        let pool =
+            store.load().map_err(|error| CertificateError(format!("initializing certificate store: {error}")))?;
         *store.current.write().unwrap() = Arc::new(pool);
         Ok(store)
     }

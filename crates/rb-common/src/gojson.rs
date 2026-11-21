@@ -199,7 +199,10 @@ mod tests {
             to_string_indent(&value),
             "{\n  \"version\": 3,\n  \"rules\": [\n    {\n      \"domain\": \"a\\u003cb\\u003e\\u0026c\\u2028\\u0001\",\n      \"port\": [],\n      \"x\": {}\n    }\n  ]\n}\n"
         );
-        assert_eq!(to_string(&value), "{\"version\":3,\"rules\":[{\"domain\":\"a\\u003cb\\u003e\\u0026c\\u2028\\u0001\",\"port\":[],\"x\":{}}]}");
+        assert_eq!(
+            to_string(&value),
+            "{\"version\":3,\"rules\":[{\"domain\":\"a\\u003cb\\u003e\\u0026c\\u2028\\u0001\",\"port\":[],\"x\":{}}]}"
+        );
         let mut output = String::new();
         escape_bytes(&mut output, b"a\xffb");
         assert_eq!(output, "\"a\\ufffdb\"");

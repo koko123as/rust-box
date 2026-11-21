@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use rb_config::{DefaultHeadlessRule, DnsRuleMatch, HeadlessRule, LogicalMode, Rule, RuleMatch};
 
-pub use items::{is_private, parse_port_ranges};
 use items::Item;
+pub use items::{is_private, parse_port_ranges};
 pub use rule_set::{
     rule_set_metadata, RuleSet, RuleSetContent, RuleSetItem, RuleSetMetadata, RuleSets, StaticRuleSet, UpdateValidator,
 };
@@ -343,11 +343,8 @@ impl Matcher {
 
     /// `MatchAddressLimit`: the rule against the addresses of a response.
     pub fn match_address_limit(&self, metadata: &Metadata, response_addresses: &[IpAddr]) -> bool {
-        let mut metadata = Metadata {
-            response_addresses,
-            destination_address_match_from_response: true,
-            ..metadata.clone()
-        };
+        let mut metadata =
+            Metadata { response_addresses, destination_address_match_from_response: true, ..metadata.clone() };
         metadata.reset_rule_cache();
         self.matches(&mut metadata)
     }
@@ -489,7 +486,11 @@ fn add_ports(
         );
     }
     if !port.is_empty() {
-        matcher.push(|m| &mut m.destination_port, Item::port(port, false), describe("port", &numbers(port), ListStyle::All));
+        matcher.push(
+            |m| &mut m.destination_port,
+            Item::port(port, false),
+            describe("port", &numbers(port), ListStyle::All),
+        );
     }
     if !port_range.is_empty() {
         matcher.push(
@@ -555,7 +556,13 @@ pub fn compile_route_match(options: &RuleMatch, context: &Context) -> Result<Def
     if options.ip_is_private {
         matcher.push(|m| &mut m.destination_ip_cidr, Item::IpIsPrivate { source: false }, "ip_is_private=true".into());
     }
-    add_ports(&mut matcher, &options.source_port.0, &options.source_port_range.0, &options.port.0, &options.port_range.0)?;
+    add_ports(
+        &mut matcher,
+        &options.source_port.0,
+        &options.source_port_range.0,
+        &options.port.0,
+        &options.port_range.0,
+    )?;
     if !options.rule_set.is_empty() {
         if options.rule_set_ipcidr_match_source {
             return Err(error(
@@ -604,7 +611,13 @@ pub fn compile_dns_match(options: &DnsRuleMatch, context: &Context) -> Result<De
     if options.ip_accept_any {
         matcher.push(|m| &mut m.destination_ip_cidr, Item::IpAcceptAny, "ip_accept_any=true".into());
     }
-    add_ports(&mut matcher, &options.source_port.0, &options.source_port_range.0, &options.port.0, &options.port_range.0)?;
+    add_ports(
+        &mut matcher,
+        &options.source_port.0,
+        &options.source_port_range.0,
+        &options.port.0,
+        &options.port_range.0,
+    )?;
     if options.rule_set_ip_cidr_accept_empty && !context.legacy_dns_mode {
         return Err(error(rb_config::deprecated::RULE_SET_IP_CIDR_ACCEPT_EMPTY.message_with_link()));
     }
@@ -729,7 +742,8 @@ pub fn compile_default_headless(options: &DefaultHeadlessRule, context: &Context
         matcher.push(|m| &mut m.items, Item::Never, describe("process_path", &options.process_path.0, ListStyle::All));
     }
     if !options.process_path_regex.is_empty() {
-        check_regexes(&options.process_path_regex.0).map_err(|error| RuleError(format!("process_path_regex: {error}")))?;
+        check_regexes(&options.process_path_regex.0)
+            .map_err(|error| RuleError(format!("process_path_regex: {error}")))?;
         matcher.push(
             |m| &mut m.items,
             Item::Never,
@@ -740,7 +754,8 @@ pub fn compile_default_headless(options: &DefaultHeadlessRule, context: &Context
         matcher.push(|m| &mut m.items, Item::Never, describe("package_name", &options.package_name.0, ListStyle::All));
     }
     if !options.package_name_regex.is_empty() {
-        check_regexes(&options.package_name_regex.0).map_err(|error| RuleError(format!("package_name_regex: {error}")))?;
+        check_regexes(&options.package_name_regex.0)
+            .map_err(|error| RuleError(format!("package_name_regex: {error}")))?;
         matcher.push(
             |m| &mut m.items,
             Item::Never,
@@ -841,7 +856,8 @@ pub fn compile<M, A: Clone>(
                     .iter()
                     .enumerate()
                     .map(|(index, rule)| {
-                        matcher_of(rule, compile_match).map_err(|error| RuleError(format!("sub rule[{index}]: {error}")))
+                        matcher_of(rule, compile_match)
+                            .map_err(|error| RuleError(format!("sub rule[{index}]: {error}")))
                     })
                     .collect::<Result<_, _>>()?,
                 invert: *invert,

@@ -150,11 +150,12 @@ impl Client {
         let destination = Socksaddr::from_host_port(&url.host, url.port);
         let stream = self.dialer.dial_tcp(&destination).await?;
         let mut stream: Box<dyn Connection> = if url.https {
-            let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .map_err(io::Error::other)?
-                .with_root_certificates(self.roots.clone())
-                .with_no_client_auth();
+            let config =
+                rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                    .with_safe_default_protocol_versions()
+                    .map_err(io::Error::other)?
+                    .with_root_certificates(self.roots.clone())
+                    .with_no_client_auth();
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
             let name = rustls_pki_types::ServerName::try_from(url.host.clone())
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
@@ -283,7 +284,10 @@ mod tests {
     #[test]
     fn urls() {
         let url = Url::parse("https://example.com/a/b.srs?x=1#f").unwrap();
-        assert_eq!(url, Url { https: true, host: "example.com".into(), port: 443, request_target: "/a/b.srs?x=1".into() });
+        assert_eq!(
+            url,
+            Url { https: true, host: "example.com".into(), port: 443, request_target: "/a/b.srs?x=1".into() }
+        );
         let url = Url::parse("http://[::1]:8080").unwrap();
         assert_eq!((url.host.as_str(), url.port, url.request_target.as_str()), ("::1", 8080, "/"));
         assert_eq!(url.host_header(), "[::1]:8080");

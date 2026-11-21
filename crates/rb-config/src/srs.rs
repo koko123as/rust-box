@@ -93,7 +93,8 @@ pub fn read(content: &[u8], recover: bool) -> Result<PlainRuleSetCompat, SrsErro
     let mut rules = Vec::new();
     let mut index = 0u64;
     while index < length {
-        let rule = read_rule(&mut reader, recover, 0).map_err(|error| SrsError(format!("read rule[{index}]: {error}")))?;
+        let rule =
+            read_rule(&mut reader, recover, 0).map_err(|error| SrsError(format!("read rule[{index}]: {error}")))?;
         rules.push(rule);
         index += 1;
     }
@@ -246,7 +247,10 @@ fn read_default_rule(reader: &mut Reader, recover: bool) -> Result<DefaultHeadle
                         .map_err(|code| SrsError(format!("unknown interface type: {code}")))?;
                     let value = read_prefixes(reader)?;
                     // TypedMap.Put replaces an existing key in place.
-                    match entries.iter_mut().find(|(existing, _): &&mut (InterfaceType, Vec<Prefixable>)| *existing == key) {
+                    match entries
+                        .iter_mut()
+                        .find(|(existing, _): &&mut (InterfaceType, Vec<Prefixable>)| *existing == key)
+                    {
                         Some(entry) => entry.1 = value,
                         None => entries.push((key, value)),
                     }
@@ -509,8 +513,7 @@ fn write_logical_rule(buffer: &mut Vec<u8>, rule: &LogicalHeadlessRule, version:
 pub fn downgrade_version(version: u8, rule_set: &PlainRuleSet) -> u8 {
     let mut version = version;
     let rules = &rule_set.rules;
-    if version == RULE_SET_VERSION_5 && !HeadlessRule::any_default(rules, &|rule| !rule.package_name_regex.is_empty())
-    {
+    if version == RULE_SET_VERSION_5 && !HeadlessRule::any_default(rules, &|rule| !rule.package_name_regex.is_empty()) {
         version = RULE_SET_VERSION_4;
     }
     if version == RULE_SET_VERSION_4
@@ -554,15 +557,22 @@ mod tests {
         let default_rule = [0u8];
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("huge_rule_count", uvarint(1 << 40)),
-            ("huge_string_count", [uvarint(1), default_rule.to_vec(), vec![ITEM_DOMAIN_KEYWORD], uvarint(1 << 40)].concat()),
+            (
+                "huge_string_count",
+                [uvarint(1), default_rule.to_vec(), vec![ITEM_DOMAIN_KEYWORD], uvarint(1 << 40)].concat(),
+            ),
             (
                 "huge_string_length",
                 [uvarint(1), default_rule.to_vec(), vec![ITEM_DOMAIN_KEYWORD], uvarint(1), uvarint(1 << 40)].concat(),
             ),
-            ("huge_uint16_count", [uvarint(1), default_rule.to_vec(), vec![ITEM_QUERY_TYPE], uvarint(1 << 40)].concat()),
+            (
+                "huge_uint16_count",
+                [uvarint(1), default_rule.to_vec(), vec![ITEM_QUERY_TYPE], uvarint(1 << 40)].concat(),
+            ),
             (
                 "huge_ip_range_count",
-                [uvarint(1), default_rule.to_vec(), vec![ITEM_IP_CIDR, 1], (1u64 << 40).to_be_bytes().to_vec()].concat(),
+                [uvarint(1), default_rule.to_vec(), vec![ITEM_IP_CIDR, 1], (1u64 << 40).to_be_bytes().to_vec()]
+                    .concat(),
             ),
             (
                 "bad_ip_range_address_length",
@@ -578,7 +588,10 @@ mod tests {
                 "empty_domain_matcher",
                 [uvarint(1), default_rule.to_vec(), vec![ITEM_DOMAIN, 0], uvarint(0), uvarint(0), uvarint(0)].concat(),
             ),
-            ("huge_domain_matcher_bitmap", [uvarint(1), default_rule.to_vec(), vec![ITEM_DOMAIN, 0], uvarint(1 << 40)].concat()),
+            (
+                "huge_domain_matcher_bitmap",
+                [uvarint(1), default_rule.to_vec(), vec![ITEM_DOMAIN, 0], uvarint(1 << 40)].concat(),
+            ),
             ("deep_logical_nesting", [uvarint(1), [1u8, 0, 1].repeat(10000)].concat()),
         ];
         for (name, body) in cases {

@@ -235,8 +235,8 @@ mod tests {
 
     #[test]
     fn builder_merges_like_netipx() {
-        let set = IpSet::parse(&["10.0.1.0/24", "10.0.0.0/24", "10.0.0.5", "192.168.0.0/16", "::1", "fe80::/10"])
-            .unwrap();
+        let set =
+            IpSet::parse(&["10.0.1.0/24", "10.0.0.0/24", "10.0.0.5", "192.168.0.0/16", "::1", "fe80::/10"]).unwrap();
         assert_eq!(set.ranges().len(), 4);
         assert_eq!(prefixes(&set), vec!["10.0.0.0/23", "192.168.0.0/16", "::1/128", "fe80::/10"]);
         assert!(set.contains("10.0.1.255".parse().unwrap()));

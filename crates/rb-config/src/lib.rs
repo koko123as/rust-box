@@ -43,15 +43,8 @@ pub enum ConfigError {
 }
 
 /// Top-level sections sing-box has and rust-box does not implement yet.
-const UNSUPPORTED_SECTIONS: &[&str] = &[
-    "ntp",
-    "certificate_providers",
-    "endpoints",
-    "services",
-    "experimental",
-    "http_clients",
-    "network_namespaces",
-];
+const UNSUPPORTED_SECTIONS: &[&str] =
+    &["ntp", "certificate_providers", "endpoints", "services", "experimental", "http_clients", "network_namespaces"];
 
 /// sing-box `option.Options`.
 #[derive(Debug, Clone, Default, Deserialize)]

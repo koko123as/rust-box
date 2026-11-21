@@ -56,7 +56,13 @@ fn decompile_matches_sing_box() {
     let directory = tempfile::tempdir().unwrap();
     for name in SOURCES {
         let output = directory.path().join(format!("{name}.json"));
-        ok(&["rule-set", "decompile", data(&format!("{name}.sing.srs")).to_str().unwrap(), "-o", output.to_str().unwrap()]);
+        ok(&[
+            "rule-set",
+            "decompile",
+            data(&format!("{name}.sing.srs")).to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ]);
         let ours = std::fs::read_to_string(&output).unwrap();
         assert_eq!(ours, String::from_utf8(read(&format!("{name}.decompiled.json"))).unwrap(), "{name}");
     }
@@ -148,7 +154,15 @@ fn match_matches_sing_box() {
 fn convert_matches_sing_box() {
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("adguard.srs");
-    ok(&["rule-set", "convert", "-t", "adguard", data("adguard.txt").to_str().unwrap(), "-o", output.to_str().unwrap()]);
+    ok(&[
+        "rule-set",
+        "convert",
+        "-t",
+        "adguard",
+        data("adguard.txt").to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ]);
     assert_eq!(decompressed(&std::fs::read(&output).unwrap()), decompressed(&read("adguard.sing.srs")));
     let output = rust_box(&["rule-set", "convert", data("adguard.txt").to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("source type is required"));

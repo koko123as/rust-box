@@ -173,8 +173,8 @@ fn interface_address_map<'de, D: serde::Deserializer<'de>>(
     };
     let mut entries = Vec::with_capacity(object.len());
     for (key, value) in object {
-        let key: InterfaceType =
-            serde_json::from_value(Value::String(key.clone())).map_err(|_| D::Error::custom(format!("unknown interface type: {key}")))?;
+        let key: InterfaceType = serde_json::from_value(Value::String(key.clone()))
+            .map_err(|_| D::Error::custom(format!("unknown interface type: {key}")))?;
         let value: Listable<Prefixable> = serde_json::from_value(value).map_err(D::Error::custom)?;
         entries.push((key, value.0));
     }
@@ -307,7 +307,10 @@ impl HeadlessRule {
     /// Parses a rule (`HeadlessRule.UnmarshalJSON`).
     pub fn from_value(value: Value) -> Result<Self, String> {
         let Value::Object(mut object) = value else {
-            return Err(format!("json: cannot unmarshal {} into Go value of type option._HeadlessRule", kind_of(&value)));
+            return Err(format!(
+                "json: cannot unmarshal {} into Go value of type option._HeadlessRule",
+                kind_of(&value)
+            ));
         };
         let kind = take_string(&mut object, "type", "option._HeadlessRule.type")?;
         match kind.as_str() {
@@ -349,7 +352,8 @@ impl HeadlessRule {
         match self {
             HeadlessRule::Default(rule) => rule.to_json(),
             HeadlessRule::Logical(rule) => {
-                let mut fields = vec![("type".to_string(), Json::string("logical")), ("mode".into(), Json::string(&rule.mode))];
+                let mut fields =
+                    vec![("type".to_string(), Json::string("logical")), ("mode".into(), Json::string(&rule.mode))];
                 if !rule.rules.is_empty() {
                     fields.push(("rules".into(), Json::Array(rule.rules.iter().map(HeadlessRule::to_json).collect())));
                 }
@@ -619,7 +623,8 @@ impl RuleSetOptions {
                     #[serde(default)]
                     download_detour: Option<String>,
                 }
-                let remote: Remote = serde_json::from_value(Value::Object(object)).map_err(|error| error.to_string())?;
+                let remote: Remote =
+                    serde_json::from_value(Value::Object(object)).map_err(|error| error.to_string())?;
                 match &remote.http_client {
                     None | Some(Value::Null) => {}
                     Some(Value::Object(object)) if object.is_empty() => {}
@@ -686,7 +691,8 @@ mod tests {
         let local = rule_set(r#"{"type":"local","tag":"b","path":"rules/b.srs"}"#).unwrap();
         assert_eq!(local.format, "binary");
         let remote =
-            rule_set(r#"{"type":"remote","tag":"c","url":"https://x.test/c.json?x=1","update_interval":"1h"}"#).unwrap();
+            rule_set(r#"{"type":"remote","tag":"c","url":"https://x.test/c.json?x=1","update_interval":"1h"}"#)
+                .unwrap();
         assert_eq!(remote.format, "source");
         let RuleSetKind::Remote(remote) = remote.kind else { panic!() };
         assert_eq!(remote.update_interval.0, std::time::Duration::from_secs(3600));
@@ -701,7 +707,10 @@ mod tests {
             "missing {tag} placeholder in path"
         );
         assert!(rule_set(r#"{"type":"local","tag":["a","b"],"path":"{tag}.srs"}"#).is_ok());
-        assert_eq!(rule_set(r#"{"tag":["a","b"],"rules":[]}"#).unwrap_err(), "inline rule-set does not support multiple tags");
+        assert_eq!(
+            rule_set(r#"{"tag":["a","b"],"rules":[]}"#).unwrap_err(),
+            "inline rule-set does not support multiple tags"
+        );
         assert!(rule_set(r#"{"type":"local","tag":"a","path":"a.srs","url":"x"}"#).is_err());
         assert_eq!(rule_set(r#"{"type":"web","tag":"a"}"#).unwrap_err(), "unknown rule-set type: web");
         assert_eq!(default_format("https://h/x.srs#frag"), "binary");
@@ -728,7 +737,9 @@ mod tests {
         }
         let kept = PlainRuleSetCompat::parse(br#"{"version":3,"rules":[{},{"domain":"a"}]}"#).unwrap();
         assert_eq!(kept.options.rules.len(), 2);
-        let logical = PlainRuleSetCompat::parse(br#"{"version":3,"rules":[{"type":"logical","mode":"and","rules":[{}]}]}"#).unwrap();
+        let logical =
+            PlainRuleSetCompat::parse(br#"{"version":3,"rules":[{"type":"logical","mode":"and","rules":[{}]}]}"#)
+                .unwrap();
         assert!(matches!(&logical.options.rules[0], HeadlessRule::Logical(rule) if rule.rules.is_empty()));
         assert!(!rule.is_valid());
     }

@@ -22,11 +22,22 @@ pub(crate) enum Item {
     DomainKeyword(Vec<String>),
     DomainRegex(Vec<Regex>),
     AdGuard(Arc<AdGuardMatcher>),
-    IpCidr { set: Arc<IpSet>, source: bool },
-    IpIsPrivate { source: bool },
+    IpCidr {
+        set: Arc<IpSet>,
+        source: bool,
+    },
+    IpIsPrivate {
+        source: bool,
+    },
     IpAcceptAny,
-    Port { ports: HashSet<u16>, source: bool },
-    PortRange { ranges: Vec<(u16, u16)>, source: bool },
+    Port {
+        ports: HashSet<u16>,
+        source: bool,
+    },
+    PortRange {
+        ranges: Vec<(u16, u16)>,
+        source: bool,
+    },
     /// Items that need what rust-box does not have (a process searcher, a
     /// platform network monitor): they never match.
     Never,
@@ -112,7 +123,9 @@ impl Item {
             Item::Network(set) => metadata.network.is_some_and(|network| set.contains(network)),
             Item::AuthUser(set) => metadata.user.is_some_and(|user| set.contains(user)),
             Item::Protocol(set) => metadata.protocol.is_some_and(|protocol| set.contains(protocol)),
-            Item::QueryType(set) => metadata.query_type.is_some_and(|query_type| query_type != 0 && set.contains(&query_type)),
+            Item::QueryType(set) => {
+                metadata.query_type.is_some_and(|query_type| query_type != 0 && set.contains(&query_type))
+            }
             Item::Domain(matcher) => destination_host(metadata).is_some_and(|host| matcher.matches(&host)),
             Item::DomainKeyword(keywords) => destination_host(metadata)
                 .is_some_and(|host| keywords.iter().any(|keyword| host.contains(keyword.as_str()))),
