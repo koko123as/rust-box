@@ -311,7 +311,9 @@ impl LogicalMatcher {
     }
 }
 
-/// A rule's match part: default or logical.
+/// A rule's match part: default or logical. Unboxed: matchers are built
+/// once per load and matched in place.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Matcher {
     Default(DefaultMatcher),

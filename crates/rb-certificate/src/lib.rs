@@ -265,15 +265,11 @@ impl Store {
     fn load(&self) -> Result<Pool, CertificateError> {
         let mut pool = self.system.clone().unwrap_or_default();
         match self.kind.as_str() {
-            STORE_MOZILLA => {
-                if !pool.append_pem(MOZILLA_PEM.as_bytes()) {
-                    return Err(CertificateError("invalid Mozilla included certificate PEM".into()));
-                }
+            STORE_MOZILLA if !pool.append_pem(MOZILLA_PEM.as_bytes()) => {
+                return Err(CertificateError("invalid Mozilla included certificate PEM".into()));
             }
-            STORE_CHROME => {
-                if !pool.append_pem(CHROME_PEM.as_bytes()) {
-                    return Err(CertificateError("invalid Chrome included certificate PEM".into()));
-                }
+            STORE_CHROME if !pool.append_pem(CHROME_PEM.as_bytes()) => {
+                return Err(CertificateError("invalid Chrome included certificate PEM".into()));
             }
             _ => {}
         }

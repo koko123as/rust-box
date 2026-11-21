@@ -154,12 +154,13 @@ pub fn to_options(content: &str) -> Result<Vec<HeadlessRule>, String> {
                             ignore = true;
                             entry.is_important = true;
                         }
-                        "dnsrewrite" => {
+                        "dnsrewrite"
                             if parts.len() == 2
-                                && rb_common::ipset::parse_addr(parts[1]).ok().is_some_and(|addr| addr.is_unspecified())
-                            {
-                                ignore = true;
-                            }
+                                && rb_common::ipset::parse_addr(parts[1])
+                                    .ok()
+                                    .is_some_and(|addr| addr.is_unspecified()) =>
+                        {
+                            ignore = true;
                         }
                         _ => {}
                     }

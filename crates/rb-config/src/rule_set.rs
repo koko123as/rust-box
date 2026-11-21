@@ -289,7 +289,9 @@ impl LogicalHeadlessRule {
     }
 }
 
-/// `option.HeadlessRule`.
+/// `option.HeadlessRule`. Kept unboxed like the Go struct; rules are
+/// built once per load, so the size difference does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeadlessRule {
     Default(DefaultHeadlessRule),
