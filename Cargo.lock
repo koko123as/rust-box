@@ -1155,6 +1155,7 @@ dependencies = [
  "rb-route",
  "rb-shadowsocks",
  "rb-tls",
+ "rustls",
  "serde_json",
  "sha1",
  "sha2",

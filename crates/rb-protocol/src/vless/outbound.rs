@@ -1,0 +1,214 @@
+//! The `vless` outbound (sing-box `protocol/vless/outbound.go` with
+//! sing-vmess `vless.Client`).
+
+use std::io;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use rb_adapter::{BoxStream, InboundContext, Network, Outbound, SharedPacketConn, Socksaddr};
+use rb_config::VlessOutbound as OutboundOptions;
+use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
+
+use super::packet::{PacketAddrConn, VlessPacketConn, XudpPacketConn, PACKET_ADDR_MAGIC};
+use super::protocol::{self, Request, VlessStream, COMMAND_MUX, COMMAND_TCP, FLOW_VISION};
+use super::vision::{RecordStream, VisionStream};
+
+/// How UDP goes (`packet_encoding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketEncoding {
+    /// A plain UDP request: every packet to the first destination.
+    None,
+    PacketAddr,
+    Xudp,
+}
+
+/// sing-vmess's error for Vision without TLS (`NewVisionConn` with a
+/// plain TCP connection).
+pub(crate) const VISION_WITHOUT_TLS: &str =
+    "initialize vision: vision: not a valid supported TLS connection: *net.TCPConn";
+
+/// The `vless` outbound.
+pub struct VlessOutbound {
+    tag: String,
+    dialer: Arc<dyn Dialer>,
+    tls: Option<rb_tls::TlsClient>,
+    server: Socksaddr,
+    uuid: [u8; 16],
+    vision: bool,
+    packet_encoding: PacketEncoding,
+    networks: Vec<Network>,
+}
+
+/// A connection to the server: TLS kept typed for Vision.
+enum ServerConn {
+    Tls(Box<rb_tls::TlsClientStream>),
+    Plain(BoxStream),
+}
+
+impl ServerConn {
+    fn boxed(self) -> BoxStream {
+        match self {
+            ServerConn::Tls(stream) => stream,
+            ServerConn::Plain(stream) => stream,
+        }
+    }
+}
+
+impl VlessOutbound {
+    /// sing-box `vless.NewOutbound`.
+    pub fn new(
+        options: &OutboundOptions,
+        tag: String,
+        env: &DialerEnv,
+        certificates: &Arc<rb_certificate::Store>,
+    ) -> Result<Self, String> {
+        let server = Socksaddr::from_host_port(&options.server, options.server_port);
+        let dialer = new_outbound_dialer(
+            &options.dialer_options(),
+            server.domain().is_some(),
+            env,
+            &format!("outbound/vless[{tag}]"),
+        )?;
+        let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
+            Some(tls) => Some(rb_tls::TlsClient::new(tls, &options.server, certificates)?),
+            None => None,
+        };
+        if options.transport.is_some() {
+            return Err("`transport` is not supported by rust-box yet".into());
+        }
+        let packet_encoding = match options.packet_encoding.as_deref() {
+            None | Some("xudp") => PacketEncoding::Xudp,
+            Some("") => PacketEncoding::None,
+            Some("packetaddr") => PacketEncoding::PacketAddr,
+            Some(other) => return Err(format!("unknown packet encoding: {other}")),
+        };
+        // sing-vmess `NewClient`.
+        let vision = match options.flow.as_str() {
+            "" => false,
+            FLOW_VISION => true,
+            flow => return Err(format!("unsupported flow: {flow}")),
+        };
+        if options.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
+            return Err("`multiplex` is not supported by rust-box yet".into());
+        }
+        let networks = options
+            .network
+            .build()
+            .iter()
+            .map(|network| if network == "udp" { Network::Udp } else { Network::Tcp })
+            .collect();
+        Ok(VlessOutbound {
+            tag,
+            dialer,
+            tls,
+            server,
+            uuid: protocol::parse_uuid(&options.uuid),
+            vision,
+            packet_encoding,
+            networks,
+        })
+    }
+
+    async fn dial_server(&self) -> io::Result<ServerConn> {
+        let stream = self.dialer.dial_tcp(&self.server).await?;
+        match &self.tls {
+            Some(tls) => {
+                // Vision needs the raw bytes past the current TLS record
+                // kept out of rustls.
+                let stream: BoxStream = if self.vision { Box::new(RecordStream::new(stream)) } else { stream };
+                Ok(ServerConn::Tls(Box::new(tls.handshake(stream).await?)))
+            }
+            None => Ok(ServerConn::Plain(stream)),
+        }
+    }
+
+    fn request(&self, command: u8, destination: &Socksaddr) -> io::Result<Vec<u8>> {
+        protocol::encode_request(&Request {
+            uuid: self.uuid,
+            command,
+            destination: Some(destination.clone()),
+            flow: if self.vision { FLOW_VISION.into() } else { String::new() },
+        })
+    }
+
+    /// A VLESS TCP connection to `destination` with its request sent
+    /// (sing-vmess `DialEarlyConn`, kicked as sing-box's
+    /// `kickWriteHandshake` does: with Vision an empty padded block goes
+    /// with the request). A multiplex client dials its sessions with this.
+    pub async fn connect(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
+        let conn = self.dial_server().await?;
+        let request = self.request(COMMAND_TCP, destination)?;
+        if self.vision {
+            let ServerConn::Tls(tls) = conn else { return Err(io::Error::other(VISION_WITHOUT_TLS)) };
+            let mut stream = VisionStream::new(VlessStream::client(*tls, request), self.uuid);
+            stream.kick().await?;
+            return Ok(Box::new(stream));
+        }
+        let mut stream = VlessStream::client(conn.boxed(), request);
+        stream.write_header().await?;
+        Ok(Box::new(stream))
+    }
+
+    /// The UDP of `destination` (sing-box `vlessDialer.ListenPacket`).
+    pub async fn connect_packet(&self, destination: &Socksaddr) -> io::Result<SharedPacketConn> {
+        if self.packet_encoding == PacketEncoding::PacketAddr && destination.domain().is_some() {
+            return Err(io::Error::other("packetaddr: domain destination is not supported"));
+        }
+        let conn = self.dial_server().await?;
+        match self.packet_encoding {
+            PacketEncoding::Xudp => {
+                // sing-vmess `DialEarlyXUDPPacketConn`: the mux request
+                // goes out alone (not through Vision), then the frames.
+                let request = protocol::encode_request(&Request {
+                    uuid: self.uuid,
+                    command: COMMAND_MUX,
+                    destination: None,
+                    flow: if self.vision { FLOW_VISION.into() } else { String::new() },
+                })?;
+                let stream: BoxStream = if self.vision {
+                    let ServerConn::Tls(tls) = conn else { return Err(io::Error::other(VISION_WITHOUT_TLS)) };
+                    let mut vless = VlessStream::client(*tls, request);
+                    vless.write_header().await?;
+                    Box::new(VisionStream::new(vless, self.uuid))
+                } else {
+                    let mut vless = VlessStream::client(conn.boxed(), request);
+                    vless.write_header().await?;
+                    Box::new(vless)
+                };
+                Ok(Arc::new(XudpPacketConn::new(stream, destination.clone())))
+            }
+            PacketEncoding::PacketAddr => {
+                let magic = Socksaddr::from_host_port(PACKET_ADDR_MAGIC, 0);
+                let inner: SharedPacketConn =
+                    Arc::new(VlessPacketConn::client(conn.boxed(), &self.uuid, magic.clone())?);
+                Ok(Arc::new(PacketAddrConn::new(inner, magic)))
+            }
+            PacketEncoding::None => {
+                Ok(Arc::new(VlessPacketConn::client(conn.boxed(), &self.uuid, destination.clone())?))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Outbound for VlessOutbound {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn kind(&self) -> &'static str {
+        "vless"
+    }
+
+    fn networks(&self) -> &[Network] {
+        &self.networks
+    }
+
+    async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
+        self.connect(&context.destination).await
+    }
+
+    async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
+        self.connect_packet(&context.destination).await
+    }
+}

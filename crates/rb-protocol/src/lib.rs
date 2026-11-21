@@ -14,9 +14,11 @@ pub mod shadowsocks;
 pub mod socks;
 pub mod trojan;
 pub mod uot;
+pub mod vless;
 
 pub use inbound::{ProxyInbound, ProxyKind};
 pub use outbound::{Block, Direct};
 pub use proxy_outbound::{HttpOutbound, SocksOutbound};
 pub use shadowsocks::{ShadowsocksInbound, ShadowsocksOutbound};
 pub use trojan::{TrojanInbound, TrojanOutbound};
+pub use vless::{VlessInbound, VlessOutbound};
