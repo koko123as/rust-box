@@ -102,6 +102,8 @@ async fn local_file_reload() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(matches(&rule_set, "a.two.test"));
     // An update the validator refuses is not used either.
+    rule_set.close();
+    std::fs::write(&path, SOURCE_V2).unwrap();
     let refused = env.clone();
     refused.validator.set(Box::new(|tag: &str, _: &RuleSetMetadata| Err(format!("refused {tag}")))).ok().unwrap();
     let rule_set = ManagedRuleSet::new(&options(&json), "l", &refused).unwrap();

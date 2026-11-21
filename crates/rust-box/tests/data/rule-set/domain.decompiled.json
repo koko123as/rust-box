@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [
+        "a.com",
+        "b.com"
+      ],
+      "domain_suffix": "c.com"
+    },
+    {
+      "ip_cidr": [
+        "1.0.0.0/23",
+        "8.8.8.8/32"
+      ]
+    }
+  ]
+}

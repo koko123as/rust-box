@@ -34,3 +34,4 @@ anyhow.workspace = true
 
 [dev-dependencies]
 rb-config.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,46 @@
+== example.com
+match rules.[0]: domain=[example.com Example.ORG a.b.c.d.example.net] domain_suffix=[.cn google.com x.test] domain_keyword=[ads track] domain_regex=[^stun\..+ (^|\.)baidu\.com$]
+match rules.[1]: !(ip_cidr=[10.0.0.0/8 192.168.1.1 2001:db8::/32...])
+match rules.[5]: 
+match rules.[6]: 
+B match rules.[0]: domain/domain_suffix=<binary> domain_keyword=[ads track] domain_regex=[^stun\..+ (^|\.)baidu\.com$]
+B match rules.[1]: !(ip_cidr=<binary>)
+B match rules.[5]: 
+B match rules.[6]: 
+== www.google.com
+match rules.[0]: domain=[example.com Example.ORG a.b.c.d.example.net] domain_suffix=[.cn google.com x.test] domain_keyword=[ads track] domain_regex=[^stun\..+ (^|\.)baidu\.com$]
+match rules.[1]: !(ip_cidr=[10.0.0.0/8 192.168.1.1 2001:db8::/32...])
+match rules.[5]: 
+match rules.[6]: 
+B match rules.[0]: domain/domain_suffix=<binary> domain_keyword=[ads track] domain_regex=[^stun\..+ (^|\.)baidu\.com$]
+B match rules.[1]: !(ip_cidr=<binary>)
+B match rules.[5]: 
+B match rules.[6]: 
+== 10.1.2.3
+match rules.[5]: 
+match rules.[6]: 
+B match rules.[5]: 
+B match rules.[6]: 
+== 1.1.1.1
+match rules.[1]: !(ip_cidr=[10.0.0.0/8 192.168.1.1 2001:db8::/32...])
+match rules.[5]: 
+match rules.[6]: 
+B match rules.[1]: !(ip_cidr=<binary>)
+B match rules.[5]: 
+B match rules.[6]: 
+== none.invalid
+match rules.[1]: !(ip_cidr=[10.0.0.0/8 192.168.1.1 2001:db8::/32...])
+match rules.[5]: 
+match rules.[6]: 
+B match rules.[1]: !(ip_cidr=<binary>)
+B match rules.[5]: 
+B match rules.[6]: 
+== logical.test
+match rules.[1]: !(ip_cidr=[10.0.0.0/8 192.168.1.1 2001:db8::/32...])
+match rules.[5]: 
+match rules.[6]: 
+match rules.[7]: domain_suffix=logical.test && !(port=8080 || ip_cidr=1.1.1.1/32)
+B match rules.[1]: !(ip_cidr=<binary>)
+B match rules.[5]: 
+B match rules.[6]: 
+B match rules.[7]: domain/domain_suffix=<binary> && !(port=8080 || ip_cidr=<binary>)

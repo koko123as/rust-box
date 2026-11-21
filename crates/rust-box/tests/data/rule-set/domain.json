@@ -1,0 +1,1 @@
+{"version":3,"rules":[{"domain":["a.com","b.com"],"domain_suffix":"c.com"},{"ip_cidr":["1.0.0.0/24","1.0.1.0/24","8.8.8.8"]}]}

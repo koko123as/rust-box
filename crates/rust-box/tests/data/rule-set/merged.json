@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "rules": [
+    {
+      "domain": [
+        "a.com",
+        "b.com"
+      ],
+      "domain_suffix": "c.com"
+    },
+    {
+      "ip_cidr": [
+        "1.0.0.0/24",
+        "1.0.1.0/24",
+        "8.8.8.8"
+      ]
+    },
+    {
+      "domain_suffix": "v1.test",
+      "ip_cidr": "203.0.113.0/24"
+    },
+    {
+      "domain": "only.v2.test"
+    },
+    {
+      "type": "logical",
+      "mode": "or",
+      "rules": [
+        {
+          "network": "udp"
+        },
+        {
+          "port": 53
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "version": 5,
+  "rules": [
+    {
+      "domain": [
+        "Example.ORG",
+        "a.b.c.d.example.net",
+        "example.com"
+      ],
+      "domain_suffix": [
+        ".cn",
+        "google.com",
+        "x.test"
+      ],
+      "domain_keyword": [
+        "ads",
+        "track"
+      ],
+      "domain_regex": [
+        "^stun\\..+",
+        "(^|\\.)baidu\\.com$"
+      ]
+    },
+    {
+      "ip_cidr": [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.1.1/32",
+        "::1/128",
+        "2001:db8::/32"
+      ],
+      "invert": true
+    },
+    {
+      "source_ip_cidr": "100.64.0.0/10",
+      "source_port": 53,
+      "source_port_range": "10000:",
+      "port": [
+        80,
+        443
+      ],
+      "port_range": [
+        "1000:2000",
+        ":3000",
+        "4000:"
+      ]
+    },
+    {
+      "query_type": [
+        "A",
+        "AAAA",
+        "SVCB",
+        "HTTPS"
+      ],
+      "network": [
+        "tcp",
+        "udp"
+      ]
+    },
+    {
+      "process_name": "curl",
+      "process_path": "/usr/bin/curl",
+      "process_path_regex": "^/opt/.+",
+      "package_name": "com.example.app",
+      "package_name_regex": "^com\\.google\\."
+    },
+    {
+      "network_type": [
+        "wifi",
+        "cellular"
+      ],
+      "network_is_expensive": true,
+      "network_is_constrained": true,
+      "wifi_ssid": "home",
+      "wifi_bssid": "00:11:22:33:44:55"
+    },
+    {
+      "network_interface_address": {
+        "wifi": "192.168.0.0/16",
+        "ethernet": "10.0.0.0/8"
+      },
+      "default_interface_address": [
+        "fe80::/10",
+        "172.17.0.1"
+      ]
+    },
+    {
+      "type": "logical",
+      "mode": "and",
+      "rules": [
+        {
+          "domain_suffix": "logical.test"
+        },
+        {
+          "type": "logical",
+          "mode": "or",
+          "rules": [
+            {
+              "port": 8080
+            },
+            {
+              "ip_cidr": "1.1.1.1/32"
+            }
+          ],
+          "invert": true
+        }
+      ]
+    }
+  ]
+}
