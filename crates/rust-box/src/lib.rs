@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use rb_adapter::{ConnectionRouter, DnsResolver, Inbound, Outbound};
+use anyhow::{anyhow, Context, Result};
+use rb_adapter::{ConnectionRouter, DnsResolver, Inbound, InboundRegistry, Outbound, OutboundRegistry};
 use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions};
+use rb_dialer::NetworkDefaults;
 use rb_dns::DnsRouter;
 use rb_protocol::{Block, Direct, ProxyInbound, ProxyKind};
 use rb_route::Router;
@@ -25,36 +26,55 @@ pub struct RustBox {
 
 impl RustBox {
     pub fn new(options: &Options) -> Result<Self> {
-        let dns: Arc<dyn DnsResolver> = Arc::new(DnsRouter::new(&options.dns).context("initialize DNS")?);
+        // Dial defaults from the route section (sing-box's network manager).
+        let defaults = NetworkDefaults {
+            default_interface: options.route.default_interface.clone(),
+            default_mark: options.route.default_mark.0,
+        };
+        defaults.check().map_err(|error| anyhow!("route: {error}"))?;
+        // Parts built before the outbounds and inbounds get handles that
+        // are filled once those exist (DNS server detours, inbound detours).
+        let outbound_registry = OutboundRegistry::new();
+        let inbound_registry = InboundRegistry::new();
+        let dns: Arc<dyn DnsResolver> =
+            Arc::new(DnsRouter::new(&options.dns, &defaults, &outbound_registry).context("initialize DNS")?);
         let default_resolver = options.route.default_domain_resolver.as_ref();
         let mut outbounds: Vec<Arc<dyn Outbound>> = Vec::new();
         for (index, outbound) in options.outbounds.iter().enumerate() {
             let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
             outbounds.push(match outbound {
-                OutboundOptions::Direct(direct) => Arc::new(Direct::new(direct, tag, dns.clone(), default_resolver)),
+                OutboundOptions::Direct(direct) => Arc::new(
+                    Direct::new(direct, tag, dns.clone(), default_resolver, &defaults)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
                 OutboundOptions::Block(_) => Arc::new(Block::new(tag)),
             });
         }
         if outbounds.is_empty() {
             // sing-box adds a default direct outbound when none is configured.
-            outbounds.push(Arc::new(Direct::new(&Default::default(), "direct".into(), dns.clone(), default_resolver)));
+            outbounds.push(Arc::new(
+                Direct::new(&Default::default(), "direct".into(), dns.clone(), default_resolver, &defaults)
+                    .map_err(|error| anyhow!("default outbound: {error}"))?,
+            ));
         }
-        let router = Arc::new(Router::new(&options.route, outbounds, dns).context("initialize router")?);
+        outbound_registry.set(&outbounds);
+        let router = Arc::new(
+            Router::new(&options.route, outbounds, dns, inbound_registry.clone()).context("initialize router")?,
+        );
         let connection_router: Arc<dyn ConnectionRouter> = router.clone();
-        let inbounds = options
-            .inbounds
-            .iter()
-            .enumerate()
-            .map(|(index, inbound)| {
-                let tag = if inbound.tag().is_empty() { index.to_string() } else { inbound.tag().to_string() };
-                let (kind, proxy) = match inbound {
-                    InboundOptions::Mixed(proxy) => (ProxyKind::Mixed, proxy),
-                    InboundOptions::Socks(proxy) => (ProxyKind::Socks, proxy),
-                    InboundOptions::Http(proxy) => (ProxyKind::Http, proxy),
-                };
-                Arc::new(ProxyInbound::new(kind, proxy, tag, connection_router.clone())) as Arc<dyn Inbound>
-            })
-            .collect();
+        let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
+        for (index, inbound) in options.inbounds.iter().enumerate() {
+            let tag = if inbound.tag().is_empty() { index.to_string() } else { inbound.tag().to_string() };
+            let (kind, proxy) = match inbound {
+                InboundOptions::Mixed(proxy) => (ProxyKind::Mixed, proxy),
+                InboundOptions::Socks(proxy) => (ProxyKind::Socks, proxy),
+                InboundOptions::Http(proxy) => (ProxyKind::Http, proxy),
+            };
+            let inbound = ProxyInbound::new(kind, proxy, tag, connection_router.clone())
+                .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?;
+            inbounds.push(Arc::new(inbound));
+        }
+        inbound_registry.set(&inbounds);
         Ok(RustBox { inbounds, router })
     }
 

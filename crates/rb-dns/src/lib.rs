@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{RData, Record};
-use rb_adapter::{apply_strategy, DnsResolver, LookupOptions};
+use rb_adapter::{apply_strategy, DnsResolver, LookupOptions, OutboundRegistry};
 use rb_config::{DnsOptions, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
+use rb_dialer::NetworkDefaults;
 use rb_rule::{compile, compile_dns_match, Compiled, Metadata};
 
 pub use transport::{Answer, Transport, QTYPE_A, QTYPE_AAAA};
@@ -103,15 +104,30 @@ impl std::fmt::Display for DnsError {
 impl std::error::Error for DnsError {}
 
 impl DnsRouter {
-    pub fn new(options: &DnsOptions) -> Result<Self, DnsError> {
+    /// `defaults` are the route-level dial defaults and `outbounds` the
+    /// handle a server's `detour` dials through (filled once the outbounds
+    /// are built).
+    pub fn new(
+        options: &DnsOptions,
+        defaults: &NetworkDefaults,
+        outbounds: &Arc<OutboundRegistry>,
+    ) -> Result<Self, DnsError> {
         let mut servers = HashMap::new();
         let mut first = None;
         for (index, server) in options.servers.iter().enumerate() {
             let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
+            let dialer = |remote: &rb_config::RemoteDnsServer| {
+                rb_dialer::new_dialer(&remote.dialer_options(), defaults, outbounds, false)
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))
+            };
             let transport = match server {
                 DnsServer::Local { .. } => Transport::Local,
-                DnsServer::Udp(remote) => Transport::Udp((remote.server, port_or_default(remote.server_port)).into()),
-                DnsServer::Tcp(remote) => Transport::Tcp((remote.server, port_or_default(remote.server_port)).into()),
+                DnsServer::Udp(remote) => {
+                    Transport::Udp((remote.server, port_or_default(remote.server_port)).into(), dialer(remote)?)
+                }
+                DnsServer::Tcp(remote) => {
+                    Transport::Tcp((remote.server, port_or_default(remote.server_port)).into(), dialer(remote)?)
+                }
             };
             first.get_or_insert_with(|| tag.clone());
             servers.insert(tag, Arc::new(transport));
@@ -220,9 +236,14 @@ impl DnsRouter {
             }
         }
         let timeout = options.timeout.unwrap_or(self.timeout);
-        let answer = tokio::time::timeout(timeout, transport.query(domain, query_type, timeout))
+        let mut answer = tokio::time::timeout(timeout, transport.query(domain, query_type, timeout))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{domain}: DNS query timed out")))??;
+        if let Some(ttl) = options.rewrite_ttl {
+            if !answer.addresses.is_empty() {
+                answer.ttl = ttl;
+            }
+        }
         if !disable_cache {
             if let Some(cache) = &self.cache {
                 cache.lock().unwrap().put(key, answer.addresses.clone(), answer.ttl);

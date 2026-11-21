@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{
-    BoxStream, CachedPacketConn, ConnectionRouter, DnsResolver, InboundContext, LookupOptions, Network, Outbound,
-    PrefixedStream, RouteError, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE,
+    BoxStream, CachedPacketConn, ConnectionRouter, DnsResolver, InboundContext, InboundRegistry, LookupOptions,
+    Network, Outbound, PacketConn, PrefixedStream, RouteError, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE,
 };
 use rb_config::{RejectMethod, RouteActionOptions, RouteOptions, RuleAction};
+use rb_dialer::tls_fragment::TlsFragmentStream;
 use rb_rule::{compile, compile_route_match, Compiled, Metadata};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
@@ -74,6 +75,7 @@ pub struct Router {
     outbounds: HashMap<String, Arc<dyn Outbound>>,
     final_outbound: String,
     dns: Arc<dyn DnsResolver>,
+    inbounds: Arc<InboundRegistry>,
 }
 
 #[derive(Debug)]
@@ -104,7 +106,25 @@ pub enum Input<'a> {
     Packet { conn: &'a SharedPacketConn, cached: &'a mut Vec<(Vec<u8>, Socksaddr)> },
 }
 
+/// Applies the route options of a matched `route`, `route-options` or
+/// `bypass` action (sing-box `Router.matchRule`).
 fn apply_route_options(context: &mut InboundContext, options: &RouteActionOptions) {
+    let override_address = (!options.override_address.is_empty()).then_some(&options.override_address);
+    if (override_address.is_some() || options.override_port > 0) && context.route_original_destination.is_none() {
+        context.route_original_destination = Some(context.destination.clone());
+    }
+    if let Some(address) = override_address {
+        context.destination_addresses.clear();
+        let host = Socksaddr::from_host_port(address, 0).host;
+        context.destination = Socksaddr::new(host, context.destination.port);
+    }
+    if options.override_port > 0 {
+        context.destination.port = options.override_port;
+    }
+    if options.fallback_delay != 0 {
+        // Nanoseconds: sing-box converts the uint32 with time.Duration().
+        context.fallback_delay = Some(Duration::from_nanos(u64::from(options.fallback_delay)));
+    }
     if options.udp_disable_domain_unmapping {
         context.udp_disable_domain_unmapping = true;
     }
@@ -113,6 +133,14 @@ fn apply_route_options(context: &mut InboundContext, options: &RouteActionOption
     }
     if !options.udp_timeout.0.is_zero() {
         context.udp_timeout = Some(options.udp_timeout.0);
+    }
+    if options.tls_fragment {
+        context.tls_fragment = true;
+        context.tls_fragment_fallback_delay =
+            (!options.tls_fragment_fallback_delay.0.is_zero()).then_some(options.tls_fragment_fallback_delay.0);
+    }
+    if options.tls_record_fragment {
+        context.tls_record_fragment = true;
     }
 }
 
@@ -129,10 +157,13 @@ fn sniffer_names<'a>(configured: &'a [String], available: &[&'static str]) -> Ve
 impl Router {
     /// `outbounds` in configuration order; the first one is the default when
     /// `route.final` is empty (sing-box `outbound.Manager`).
+    /// `inbounds` is the handle the inbound `detour` looks inbounds up in;
+    /// it is filled once the inbounds are built.
     pub fn new(
         options: &RouteOptions,
         outbounds: Vec<Arc<dyn Outbound>>,
         dns: Arc<dyn DnsResolver>,
+        inbounds: Arc<InboundRegistry>,
     ) -> Result<Self, RouterError> {
         let final_outbound = if !options.r#final.is_empty() {
             options.r#final.clone()
@@ -152,7 +183,7 @@ impl Router {
             })
             .collect::<Result<_, _>>()?;
         let outbounds = outbounds.into_iter().map(|outbound| (outbound.tag().to_string(), outbound)).collect();
-        Ok(Router { rules, outbounds, final_outbound, dns })
+        Ok(Router { rules, outbounds, final_outbound, dns, inbounds })
     }
 
     /// Matches the rules for a TCP connection (see [`Router::decide_input`]).
@@ -191,6 +222,15 @@ impl Router {
                 RuleAction::RouteOptions(options) => {
                     debug!(rule = index, "match: route-options");
                     apply_route_options(context, options);
+                }
+                // Without an outbound, bypass only matters to TUN pre-matching.
+                RuleAction::Bypass { outbound, .. } if outbound.is_empty() => {
+                    debug!(rule = index, "match: bypass without outbound, skipped");
+                }
+                RuleAction::Bypass { outbound, options } => {
+                    debug!(rule = index, outbound, "match: bypass");
+                    apply_route_options(context, options);
+                    return Ok(Decision::Route(outbound.clone()));
                 }
                 RuleAction::Reject(reject) => {
                     debug!(rule = index, "match: reject");
@@ -262,6 +302,21 @@ impl Router {
         Ok(Decision::Route(self.final_outbound.clone()))
     }
 
+    /// The inbound a connection's `detour` names (sing-box
+    /// `Router.RouteConnectionEx`): unknown inbounds and a detour back to
+    /// the inbound that handed the connection over are errors.
+    fn detour_inbound(
+        &self,
+        context: &InboundContext,
+        detour: &str,
+    ) -> Result<Arc<dyn rb_adapter::Inbound>, RouteError> {
+        let error = |message: String| RouteError::Io(io::Error::other(message));
+        if context.last_inbound.as_deref() == Some(detour) {
+            return Err(error(format!("routing loop on detour: {detour}")));
+        }
+        self.inbounds.get(detour).ok_or_else(|| error(format!("inbound detour not found: {detour}")))
+    }
+
     fn outbound(&self, tag: &str) -> Result<&Arc<dyn Outbound>, RouteError> {
         self.outbounds.get(tag).ok_or_else(|| {
             RouteError::Dial(io::Error::new(io::ErrorKind::NotFound, format!("outbound not found: {tag}")))
@@ -324,6 +379,27 @@ impl Router {
                 _ = activity.idle(Some(timeout)) => return Ok(()),
             }
         }
+    }
+}
+
+/// Redirects packets for `original` to `destination` and reports replies
+/// from `destination` as `original` (sing `bufio.DestinationNATPacketConn`).
+struct DestinationNat {
+    inner: SharedPacketConn,
+    destination: Socksaddr,
+    original: Socksaddr,
+}
+
+#[async_trait]
+impl PacketConn for DestinationNat {
+    async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
+        let (length, source) = self.inner.read_packet(buffer).await?;
+        Ok((length, if source == self.destination { self.original.clone() } else { source }))
+    }
+
+    async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
+        let address = if *address == self.original { &self.destination } else { address };
+        self.inner.write_packet(data, address).await
     }
 }
 
@@ -486,6 +562,11 @@ async fn sniff_packets(
 #[async_trait]
 impl ConnectionRouter for Router {
     async fn route_connection(&self, mut context: InboundContext, client: BoxStream) -> Result<(), RouteError> {
+        if let Some(detour) = context.inbound_detour.take() {
+            let inbound = self.detour_inbound(&context, &detour)?;
+            context.last_inbound = Some(std::mem::replace(&mut context.inbound, detour));
+            return inbound.new_connection(context, client).await.map_err(RouteError::Io);
+        }
         let mut client = Some(client);
         let decision = self.decide(&mut context, &mut client).await?;
         let mut client = client.expect("client stream is always given back");
@@ -514,6 +595,14 @@ impl ConnectionRouter for Router {
                 .unwrap_or_else(|| context.destination.to_string())
         );
         let mut remote = outbound.dial_tcp(&context).await.map_err(RouteError::Dial)?;
+        if context.tls_fragment || context.tls_record_fragment {
+            remote = Box::new(TlsFragmentStream::new(
+                remote,
+                context.tls_fragment,
+                context.tls_record_fragment,
+                context.tls_fragment_fallback_delay,
+            ));
+        }
         match tokio::io::copy_bidirectional(&mut client, &mut remote).await {
             Ok((up, down)) => debug!(destination = %context.destination, up, down, "connection closed"),
             Err(error) => debug!(destination = %context.destination, %error, "connection closed"),
@@ -526,6 +615,11 @@ impl ConnectionRouter for Router {
         mut context: InboundContext,
         client: SharedPacketConn,
     ) -> Result<(), RouteError> {
+        if let Some(detour) = context.inbound_detour.take() {
+            let inbound = self.detour_inbound(&context, &detour)?;
+            context.last_inbound = Some(std::mem::replace(&mut context.inbound, detour));
+            return inbound.new_packet_connection(context, client).await.map_err(RouteError::Io);
+        }
         context.network = Network::Udp;
         let mut cached = Vec::new();
         let decision = self.decide_input(&mut context, Input::Packet { conn: &client, cached: &mut cached }).await?;
@@ -555,7 +649,19 @@ impl ConnectionRouter for Router {
                 .map(|host| format!("{host}:{}", context.destination.port))
                 .unwrap_or_else(|| context.destination.to_string())
         );
-        let remote = outbound.listen_packet(&context).await.map_err(RouteError::Dial)?;
+        let mut remote = outbound.listen_packet(&context).await.map_err(RouteError::Dial)?;
+        // With override_address/override_port, packets the client sends to
+        // the original destination go to the new one and replies come back
+        // from the original (sing `bufio.NewDestinationNATPacketConn`).
+        if let Some(original) = &context.route_original_destination {
+            if *original != context.destination {
+                remote = Arc::new(DestinationNat {
+                    inner: remote,
+                    destination: context.destination.clone(),
+                    original: original.clone(),
+                });
+            }
+        }
         relay_packets(client, remote, udp_timeout(&context)).await;
         Ok(())
     }

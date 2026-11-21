@@ -156,6 +156,11 @@ pub struct DomainResolveOptions {
     pub disable_cache: bool,
     pub timeout: Duration,
     pub rewrite_ttl: Option<u32>,
+    /// rust-box has no optimistic cache, so this is always in effect.
+    pub disable_optimistic_cache: bool,
+    /// Not supported yet (EDNS client subnet); rejected by
+    /// [`crate::Options::validate`].
+    pub client_subnet: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for DomainResolveOptions {
@@ -172,6 +177,10 @@ impl<'de> Deserialize<'de> for DomainResolveOptions {
             timeout: Duration,
             #[serde(default)]
             rewrite_ttl: Option<u32>,
+            #[serde(default)]
+            disable_optimistic_cache: bool,
+            #[serde(default)]
+            client_subnet: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -191,6 +200,8 @@ impl<'de> Deserialize<'de> for DomainResolveOptions {
                     disable_cache: object.disable_cache,
                     timeout: object.timeout,
                     rewrite_ttl: object.rewrite_ttl,
+                    disable_optimistic_cache: object.disable_optimistic_cache,
+                    client_subnet: object.client_subnet,
                 })
             }
         }

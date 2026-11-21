@@ -4,12 +4,14 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
+use rb_adapter::Socksaddr;
+use rb_dialer::Dialer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
 
 pub const QTYPE_A: u16 = 1;
 pub const QTYPE_AAAA: u16 = 28;
@@ -17,11 +19,23 @@ pub const QTYPE_AAAA: u16 = 28;
 /// TTL given to answers of the local resolver, which reports none.
 const LOCAL_TTL: u32 = 10;
 
-#[derive(Debug, Clone)]
+/// A DNS server. `udp` and `tcp` dial through the dialer their dial fields
+/// describe (sing-box `dns.NewRemoteDialer`).
+#[derive(Clone)]
 pub enum Transport {
     Local,
-    Udp(SocketAddr),
-    Tcp(SocketAddr),
+    Udp(SocketAddr, Arc<dyn Dialer>),
+    Tcp(SocketAddr, Arc<dyn Dialer>),
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Local => f.write_str("Local"),
+            Transport::Udp(server, _) => write!(f, "Udp({server})"),
+            Transport::Tcp(server, _) => write!(f, "Tcp({server})"),
+        }
+    }
 }
 
 /// Addresses of one query, with the smallest TTL of the records.
@@ -87,17 +101,17 @@ impl Transport {
     pub async fn query(&self, domain: &str, query_type: u16, timeout: Duration) -> io::Result<Answer> {
         match self {
             Transport::Local => query_local(domain, query_type).await,
-            Transport::Udp(server) => {
+            Transport::Udp(server, dialer) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
-                let socket = udp_socket(*server).await?;
-                socket.send(&query).await?;
+                let socket = dialer.dial_udp(&Socksaddr::from(*server)).await?;
+                socket.write_packet(&query, &Socksaddr::from(*server)).await?;
                 let mut buffer = vec![0u8; 65535];
                 loop {
-                    let size = socket.recv(&mut buffer).await?;
+                    let (size, _) = socket.read_packet(&mut buffer).await?;
                     match parse_response(&buffer[..size], id) {
                         // A response truncated over UDP is asked again over TCP.
-                        Ok((_, true)) => return exchange_tcp(*server, &query, id, timeout).await,
+                        Ok((_, true)) => return exchange_tcp(dialer.as_ref(), *server, &query, id, timeout).await,
                         Ok((answer, false)) => return Ok(answer),
                         // Not our response (a late one, or spoofed): keep waiting.
                         Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
@@ -105,10 +119,10 @@ impl Transport {
                     }
                 }
             }
-            Transport::Tcp(server) => {
+            Transport::Tcp(server, dialer) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
-                exchange_tcp(*server, &query, id, timeout).await
+                exchange_tcp(dialer.as_ref(), *server, &query, id, timeout).await
             }
         }
     }
@@ -128,23 +142,23 @@ impl Transport {
         message[..2].copy_from_slice(&id.to_be_bytes());
         let mut response = match self {
             Transport::Local => return Ok(None),
-            Transport::Udp(server) => {
-                let socket = udp_socket(*server).await?;
-                socket.send(&message).await?;
+            Transport::Udp(server, dialer) => {
+                let socket = dialer.dial_udp(&Socksaddr::from(*server)).await?;
+                socket.write_packet(&message, &Socksaddr::from(*server)).await?;
                 let mut buffer = vec![0u8; 65535];
                 loop {
-                    let size = socket.recv(&mut buffer).await?;
+                    let (size, _) = socket.read_packet(&mut buffer).await?;
                     if size < 12 || buffer[..2] != id.to_be_bytes() {
                         continue;
                     }
                     // TC: ask again over TCP.
                     if buffer[2] & 0x02 != 0 {
-                        break exchange_tcp_raw(*server, &message, timeout).await?;
+                        break exchange_tcp_raw(dialer.as_ref(), *server, &message, timeout).await?;
                     }
                     break buffer[..size].to_vec();
                 }
             }
-            Transport::Tcp(server) => exchange_tcp_raw(*server, &message, timeout).await?,
+            Transport::Tcp(server, dialer) => exchange_tcp_raw(dialer.as_ref(), *server, &message, timeout).await?,
         };
         if response.len() < 12 || response[..2] != id.to_be_bytes() {
             return Err(invalid("DNS response id mismatch"));
@@ -154,15 +168,13 @@ impl Transport {
     }
 }
 
-async fn udp_socket(server: SocketAddr) -> io::Result<UdpSocket> {
-    let bind: SocketAddr = if server.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
-    let socket = UdpSocket::bind(bind).await?;
-    socket.connect(server).await?;
-    Ok(socket)
-}
-
-async fn exchange_tcp_raw(server: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(server))
+async fn exchange_tcp_raw(
+    dialer: &dyn Dialer,
+    server: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let mut stream = tokio::time::timeout(timeout, dialer.dial_tcp(&Socksaddr::from(server)))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS over TCP: connect timed out"))??;
     let mut frame = Vec::with_capacity(query.len() + 2);
@@ -175,8 +187,14 @@ async fn exchange_tcp_raw(server: SocketAddr, query: &[u8], timeout: Duration) -
     Ok(response)
 }
 
-async fn exchange_tcp(server: SocketAddr, query: &[u8], id: u16, timeout: Duration) -> io::Result<Answer> {
-    let response = exchange_tcp_raw(server, query, timeout).await?;
+async fn exchange_tcp(
+    dialer: &dyn Dialer,
+    server: SocketAddr,
+    query: &[u8],
+    id: u16,
+    timeout: Duration,
+) -> io::Result<Answer> {
+    let response = exchange_tcp_raw(dialer, server, query, timeout).await?;
     parse_response(&response, id).map(|(answer, _)| answer)
 }
 

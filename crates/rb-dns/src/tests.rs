@@ -39,7 +39,7 @@ async fn fake_server(v4: [u8; 4], v6: std::net::Ipv6Addr) -> (std::net::SocketAd
 
 fn router(json: String) -> DnsRouter {
     let options: rb_config::DnsOptions = serde_json::from_str(&json).unwrap();
-    DnsRouter::new(&options).unwrap()
+    DnsRouter::new(&options, &Default::default(), &rb_adapter::OutboundRegistry::new()).unwrap()
 }
 
 #[tokio::test]

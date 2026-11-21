@@ -94,15 +94,93 @@ async fn http_connect_and_plain() {
     stream.read_exact(&mut buffer).await.unwrap();
     assert_eq!(&buffer, b"ping");
 
-    // A plain request is rewritten to origin form; the echo server sends it back.
+    // A plain request is rewritten to origin form; the HTTP server sends
+    // the request head back as its body.
+    let http = http_server().await;
     let mut stream = TcpStream::connect(proxy).await.unwrap();
-    let request = format!("GET http://127.0.0.1:{}/x HTTP/1.1\r\nProxy-Connection: keep-alive\r\n\r\n", echo.port());
+    let request = format!("GET http://127.0.0.1:{}/x HTTP/1.1\r\nProxy-Connection: keep-alive\r\n\r\n", http.port());
     stream.write_all(request.as_bytes()).await.unwrap();
-    let mut buffer = vec![0u8; 512];
-    let read = stream.read(&mut buffer).await.unwrap();
-    let echoed = String::from_utf8_lossy(&buffer[..read]);
-    assert!(echoed.starts_with("GET /x HTTP/1.1\r\n"), "{echoed}");
-    assert!(!echoed.contains("Proxy-Connection"));
+    let (head, body) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(body.starts_with("GET /x HTTP/1.1\r\n"), "{body}");
+    assert!(!body.contains("Proxy-Connection"));
+}
+
+/// An HTTP/1.1 server that answers every request with its own head as the
+/// body, keeping connections open.
+async fn http_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut data = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head: Vec<u8> = data.drain(..end + 4).collect();
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", head.len());
+                        if stream.write_all(response.as_bytes()).await.is_err()
+                            || stream.write_all(&head).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => data.extend_from_slice(&chunk[..read]),
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+/// Reads one response with a Content-Length body.
+async fn read_response(stream: &mut TcpStream) -> (String, String) {
+    let mut data = Vec::new();
+    let mut byte = [0u8; 1];
+    while !data.ends_with(b"\r\n\r\n") {
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 1, "connection closed in head: {data:?}");
+        data.push(byte[0]);
+    }
+    let head = String::from_utf8(data).unwrap();
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .map(|value| value.trim().parse().unwrap())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.unwrap();
+    (head, String::from_utf8(body).unwrap())
+}
+
+#[tokio::test]
+async fn http_keep_alive_reuses_the_client_connection() {
+    let http = http_server().await;
+    let (_instance, proxy) = start(CONFIG).await;
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    // Two requests, to different paths, then a third without keep-alive.
+    for (index, path) in ["/first", "/second"].iter().enumerate() {
+        let request = format!(
+            "GET http://localhost:{}{path} HTTP/1.1\r\nHost: localhost\r\nProxy-Connection: keep-alive\r\n\r\n",
+            http.port()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let (head, body) = read_response(&mut stream).await;
+        assert!(head.contains("Proxy-Connection: keep-alive"), "request {index}: {head}");
+        assert!(body.starts_with(&format!("GET {path} HTTP/1.1\r\nHost: localhost:{}\r\n", http.port())), "{body}");
+    }
+    let request = format!("POST http://localhost:{}/last HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody", http.port());
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let (head, body) = read_response(&mut stream).await;
+    assert!(head.contains("Connection: close"), "{head}");
+    assert!(body.starts_with("POST /last HTTP/1.1\r\n"), "{body}");
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "the proxy closes after a request without keep-alive");
 }
 
 #[tokio::test]

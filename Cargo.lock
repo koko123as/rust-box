@@ -443,6 +443,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "icu_collections"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -816,6 +822,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-dialer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "rand",
+ "rb-adapter",
+ "rb-config",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rb-dns"
 version = "0.1.0"
 dependencies = [
@@ -823,6 +844,7 @@ dependencies = [
  "hickory-proto",
  "rb-adapter",
  "rb-config",
+ "rb-dialer",
  "rb-rule",
  "serde_json",
  "tokio",
@@ -835,8 +857,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "httparse",
  "rb-adapter",
  "rb-config",
+ "rb-dialer",
  "serde_json",
  "tokio",
  "tracing",
@@ -853,6 +877,7 @@ dependencies = [
  "hkdf",
  "rb-adapter",
  "rb-config",
+ "rb-dialer",
  "rb-rule",
  "serde_json",
  "sha2",
@@ -931,6 +956,7 @@ dependencies = [
  "clap",
  "rb-adapter",
  "rb-config",
+ "rb-dialer",
  "rb-dns",
  "rb-protocol",
  "rb-route",

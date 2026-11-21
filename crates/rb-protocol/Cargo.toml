@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 rb-config.workspace = true
 rb-adapter.workspace = true
+rb-dialer.workspace = true
+httparse.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

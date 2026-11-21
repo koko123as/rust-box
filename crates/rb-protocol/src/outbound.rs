@@ -1,5 +1,14 @@
 //! The `direct` outbound (sing-box `protocol/direct/outbound.go`) and the
 //! legacy `block` outbound (`protocol/block`).
+//!
+//! `direct` dials through [`rb_dialer::DefaultDialer`] with its dial fields.
+//! A destination that is an IP, or whose addresses a `resolve` action
+//! found, is dialed like sing-box's `DialParallelNetwork`: the two address
+//! families race with the route's `fallback_delay`, else the outbound's,
+//! else 300ms. A domain is resolved first (`domain_resolver`, else
+//! `route.default_domain_resolver`) and dialed the same way with the
+//! outbound's `fallback_delay`, or one address after another with
+//! `tcp_fast_open` (sing-box's resolve dialer is serial then).
 
 use std::collections::HashMap;
 use std::io;
@@ -11,43 +20,73 @@ use async_trait::async_trait;
 use rb_adapter::{
     BoxStream, DnsResolver, Host, InboundContext, LookupOptions, Outbound, PacketConn, SharedPacketConn, Socksaddr,
 };
-use rb_config::{DirectOutbound, DomainResolveOptions};
-use tokio::net::{TcpStream, UdpSocket};
-use tracing::debug;
+use rb_config::{DirectOutbound, DomainResolveOptions, DomainStrategy};
+use rb_dialer::{dial_parallel, dial_serial, socket_address, DefaultDialer, NetworkDefaults};
+use tokio::net::UdpSocket;
+use tracing::{debug, warn};
 
-/// sing-box `C.TCPConnectTimeout`.
-pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub use rb_dialer::DEFAULT_CONNECT_TIMEOUT;
 
 pub struct Direct {
     tag: String,
     dns: Arc<dyn DnsResolver>,
     resolve: LookupOptions,
-    connect_timeout: Duration,
+    dialer: DefaultDialer,
+    fallback_delay: Duration,
+    is_empty: bool,
+}
+
+/// Lookup options from a `domain_resolver` object.
+pub fn resolve_options(resolver: &DomainResolveOptions) -> LookupOptions {
+    LookupOptions {
+        server: Some(resolver.server.clone()),
+        strategy: resolver.strategy,
+        disable_cache: resolver.disable_cache,
+        timeout: (!resolver.timeout.0.is_zero()).then_some(resolver.timeout.0),
+        rewrite_ttl: resolver.rewrite_ttl,
+        ..Default::default()
+    }
 }
 
 impl Direct {
     /// `default_resolver` is `route.default_domain_resolver`, used when the
-    /// outbound has no `domain_resolver` of its own.
+    /// outbound has no `domain_resolver` of its own; `defaults` are the
+    /// route's dial defaults.
     pub fn new(
         options: &DirectOutbound,
         tag: String,
         dns: Arc<dyn DnsResolver>,
         default_resolver: Option<&DomainResolveOptions>,
-    ) -> Self {
-        let resolver = options.domain_resolver.as_ref().or(default_resolver);
-        let resolve = match resolver {
-            Some(resolver) => LookupOptions {
-                server: Some(resolver.server.clone()),
-                strategy: resolver.strategy,
-                disable_cache: resolver.disable_cache,
-                timeout: (!resolver.timeout.0.is_zero()).then_some(resolver.timeout.0),
-                ..Default::default()
-            },
+        defaults: &NetworkDefaults,
+    ) -> Result<Self, String> {
+        let dial = options.dialer_options();
+        if !dial.detour.is_empty() {
+            return Err("`detour` is not supported in direct context".into());
+        }
+        // `udp_fragment` defaults to on for direct (sing-box `UDPFragmentDefault`).
+        let dialer = DefaultDialer::new(&dial, defaults, true)?;
+        let own = dial.domain_resolver.as_ref().filter(|resolver| !resolver.server.is_empty());
+        let mut resolve = match own.or(default_resolver) {
+            Some(resolver) => resolve_options(resolver),
             None => LookupOptions::default(),
         };
-        let connect_timeout =
-            if options.connect_timeout.0.is_zero() { DEFAULT_CONNECT_TIMEOUT } else { options.connect_timeout.0 };
-        Direct { tag, dns, resolve, connect_timeout }
+        // The deprecated `domain_strategy` still sets the strategy when the
+        // resolver has none (sing-box `dialer.NewWithOptions`).
+        if dial.domain_strategy != DomainStrategy::AsIs
+            && own.is_none_or(|resolver| resolver.strategy == DomainStrategy::AsIs)
+        {
+            warn!(
+                "outbound/direct[{tag}]: `domain_strategy` is deprecated in sing-box 1.12.0, use `domain_resolver` instead"
+            );
+            resolve.strategy = dial.domain_strategy;
+        }
+        Ok(Direct { tag, dns, resolve, dialer, fallback_delay: dial.fallback_delay.0, is_empty: dial.is_empty() })
+    }
+
+    /// Whether the outbound has no dial fields set (sing-box
+    /// `DirectDialer.IsEmpty`).
+    pub fn is_empty(&self) -> bool {
+        self.is_empty
     }
 }
 
@@ -63,24 +102,33 @@ impl Outbound for Direct {
 
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
         let destination = &context.destination;
-        let addresses = self.addresses(context).await?;
-        // Addresses in the order the strategy left them, one after another
-        // (sing-box dials them with a fallback delay; parallel dialing is a
-        // later step).
-        let mut last_error = io::Error::new(io::ErrorKind::NotFound, format!("{destination}: no addresses"));
-        for address in addresses {
-            let target = SocketAddr::new(address, destination.port);
-            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(target)).await {
-                Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
-                    debug!(%target, "direct: connected");
-                    return Ok(Box::new(stream));
-                }
-                Ok(Err(error)) => last_error = io::Error::new(error.kind(), format!("{target}: {error}")),
-                Err(_) => last_error = io::Error::new(io::ErrorKind::TimedOut, format!("{target}: connect timed out")),
+        let port = destination.port;
+        let server_first = rb_adapter::server_first_port(port);
+        let connect = |address: IpAddr| self.dialer.dial_tcp_stream(SocketAddr::new(address, port), server_first);
+        let stream = match &destination.host {
+            // sing-box `DialParallelNetwork`: the route's fallback delay wins.
+            Host::Ip(ip) => connect(*ip).await,
+            Host::Domain(_) if !context.destination_addresses.is_empty() => {
+                let addresses = &context.destination_addresses;
+                let delay = context.fallback_delay.unwrap_or(self.fallback_delay);
+                dial_parallel(addresses, addresses[0].is_ipv6(), delay, &connect).await
             }
-        }
-        Err(last_error)
+            // The resolve dialer: parallel with the outbound's delay, serial
+            // with TCP Fast Open.
+            Host::Domain(domain) => {
+                let addresses = self.dns.lookup(domain, &self.lookup_options(context)).await?;
+                if addresses.is_empty() {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, format!("{destination}: no addresses")));
+                }
+                if self.dialer.tcp_fast_open() {
+                    dial_serial(&addresses, &connect).await
+                } else {
+                    dial_parallel(&addresses, addresses[0].is_ipv6(), self.fallback_delay, &connect).await
+                }
+            }
+        }?;
+        debug!(%destination, "direct: connected");
+        Ok(stream)
     }
 
     /// A UDP socket for the session (sing-box `ListenPacket`, or
@@ -90,18 +138,16 @@ impl Outbound for Direct {
     /// `bufio.NATPacketConn` / `UnidirectionalNATPacketConn`).
     async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
         let destination = &context.destination;
-        let address = *self
-            .addresses(context)
-            .await?
+        let addresses = self.addresses(context).await?;
+        let address = *addresses
             .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{destination}: no addresses")))?;
         let target = SocketAddr::new(address, destination.port);
-        let (socket, dual_stack) = bind_udp(address.is_ipv6()).await?;
-        let connected = if context.udp_connect {
-            socket.connect(socket_address(target, dual_stack)).await?;
-            Some(target)
+        let (socket, dual_stack, connected) = if context.udp_connect {
+            (self.dialer.connect_udp(target).await?, false, Some(target))
         } else {
-            None
+            let (socket, dual_stack) = self.dialer.listen_udp(Some(address)).await?;
+            (socket, dual_stack, None)
         };
         debug!(%target, connected = connected.is_some(), "direct: packet connection");
         let mut unmap = HashMap::new();
@@ -149,24 +195,6 @@ impl Direct {
                 self.dns.lookup(domain, &options).await?
             }
         })
-    }
-}
-
-/// Binds an unconnected UDP socket on all addresses: dual stack where the
-/// system has IPv6 (as Go's `ListenPacket("udp", "")`), else IPv4 only.
-async fn bind_udp(need_ipv6: bool) -> io::Result<(UdpSocket, bool)> {
-    match UdpSocket::bind("[::]:0").await {
-        Ok(socket) => Ok((socket, true)),
-        Err(error) if need_ipv6 => Err(error),
-        Err(_) => Ok((UdpSocket::bind("0.0.0.0:0").await?, false)),
-    }
-}
-
-/// An IPv4 address as a dual-stack socket takes it (`::ffff:a.b.c.d`).
-fn socket_address(address: SocketAddr, dual_stack: bool) -> SocketAddr {
-    match address {
-        SocketAddr::V4(v4) if dual_stack => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
-        address => address,
     }
 }
 
@@ -315,7 +343,8 @@ mod tests {
     #[tokio::test]
     async fn direct_udp_domain_mapping() {
         let echo = echo_server().await;
-        let direct = Direct::new(&Default::default(), "direct".into(), Arc::new(Loopback), None);
+        let direct =
+            Direct::new(&Default::default(), "direct".into(), Arc::new(Loopback), None, &Default::default()).unwrap();
         let domain = Socksaddr::from_host_port("echo.test", echo.port());
         let ip = Socksaddr::from(echo);
 

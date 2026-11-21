@@ -6,12 +6,13 @@
 //! holds the [`ConnectionRouter`], the router holds the outbounds and the
 //! [`DnsResolver`], so every dependency shows in a constructor.
 
-use std::collections::VecDeque;
+use std::any::Any;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -123,6 +124,25 @@ pub struct InboundContext {
     pub udp_connect: bool,
     /// `udp_disable_domain_unmapping` from a matched route action.
     pub udp_disable_domain_unmapping: bool,
+    /// The local address the client connected to (sing-box
+    /// `metadata.OriginDestination`).
+    pub origin_destination: Option<SocketAddr>,
+    /// The inbound this connection is handed to after the first inbound's
+    /// handshake (listen field `detour`, sing-box `metadata.InboundDetour`).
+    pub inbound_detour: Option<String>,
+    /// The inbound that handed this connection over (sing-box `metadata.LastInbound`).
+    pub last_inbound: Option<String>,
+    /// The destination before `override_address`/`override_port` (sing-box
+    /// `metadata.RouteOriginalDestination`).
+    pub route_original_destination: Option<Socksaddr>,
+    /// `fallback_delay` from a matched route action.
+    pub fallback_delay: Option<Duration>,
+    /// `tls_fragment` from a matched route action.
+    pub tls_fragment: bool,
+    /// `tls_fragment_fallback_delay` from the route action that set `tls_fragment`.
+    pub tls_fragment_fallback_delay: Option<Duration>,
+    /// `tls_record_fragment` from a matched route action.
+    pub tls_record_fragment: bool,
 }
 
 impl InboundContext {
@@ -147,7 +167,22 @@ impl InboundContext {
             udp_timeout: None,
             udp_connect: false,
             udp_disable_domain_unmapping: false,
+            origin_destination: None,
+            inbound_detour: None,
+            last_inbound: None,
+            route_original_destination: None,
+            fallback_delay: None,
+            tls_fragment: false,
+            tls_fragment_fallback_delay: None,
+            tls_record_fragment: false,
         }
+    }
+
+    /// A context for a connection rust-box opens itself (a DNS query through
+    /// a `detour` outbound), with no inbound behind it.
+    pub fn internal(network: Network, destination: Socksaddr) -> Self {
+        let unspecified = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        InboundContext::new("", "", network, unspecified, destination)
     }
 
     /// The domain rules match: the sniffed one, or else the destination's
@@ -158,8 +193,18 @@ impl InboundContext {
 }
 
 /// A bidirectional byte stream (sing-box `net.Conn` for TCP).
-pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
+pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {
+    /// The concrete stream, so a layer can reach the socket under a boxed
+    /// stream (what sing-box does with `N.UnwrapReader`), as the TLS
+    /// fragmenter does to read `TCP_INFO`.
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Stream for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 pub type BoxStream = Box<dyn Stream>;
 
@@ -359,6 +404,8 @@ pub struct LookupOptions {
     pub source: Option<SocketAddr>,
     pub user: Option<String>,
     pub network: Option<Network>,
+    /// Replaces the TTL of the answers (`rewrite_ttl`).
+    pub rewrite_ttl: Option<u32>,
 }
 
 impl LookupOptions {
@@ -383,6 +430,82 @@ pub trait Inbound: Send + Sync {
     fn local_addr(&self) -> Option<SocketAddr>;
     async fn start(self: Arc<Self>) -> io::Result<()>;
     async fn close(&self);
+
+    /// Takes a connection another inbound accepted, as if this inbound had
+    /// accepted it (sing-box `adapter.TCPInjectableInbound`, used by the
+    /// listen field `detour`). `context` carries the source and the
+    /// first inbound's addresses.
+    async fn new_connection(&self, context: InboundContext, stream: BoxStream) -> io::Result<()> {
+        let _ = (context, stream);
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("inbound detour is not TCP injectable: {}", self.tag())))
+    }
+
+    /// The same for packet connections (sing-box `adapter.UDPInjectableInbound`).
+    async fn new_packet_connection(&self, context: InboundContext, conn: SharedPacketConn) -> io::Result<()> {
+        let _ = (context, conn);
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("inbound detour is not UDP injectable: {}", self.tag())))
+    }
+}
+
+/// The outbounds by tag, filled once they are all built (sing-box
+/// `adapter.OutboundManager`). Parts built before the outbounds (DNS
+/// servers with a `detour`) take this handle in their constructor and look
+/// the outbound up when they first dial, as sing-box's `DetourDialer` does.
+#[derive(Default)]
+pub struct OutboundRegistry {
+    outbounds: OnceLock<HashMap<String, Arc<dyn Outbound>>>,
+}
+
+impl OutboundRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(OutboundRegistry::default())
+    }
+
+    /// Publishes the outbounds; later calls are ignored.
+    pub fn set(&self, outbounds: &[Arc<dyn Outbound>]) {
+        let map = outbounds.iter().map(|outbound| (outbound.tag().to_string(), outbound.clone())).collect();
+        let _ = self.outbounds.set(map);
+    }
+
+    pub fn get(&self, tag: &str) -> io::Result<Arc<dyn Outbound>> {
+        let outbounds = self
+            .outbounds
+            .get()
+            .ok_or_else(|| io::Error::other(format!("outbound {tag} used before the outbounds were built")))?;
+        outbounds
+            .get(tag)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("outbound detour not found: {tag}")))
+    }
+}
+
+/// The inbounds by tag, filled once they are all built (sing-box
+/// `adapter.InboundManager`), for the router's inbound `detour`.
+#[derive(Default)]
+pub struct InboundRegistry {
+    inbounds: OnceLock<HashMap<String, Arc<dyn Inbound>>>,
+}
+
+impl InboundRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(InboundRegistry::default())
+    }
+
+    /// Publishes the inbounds; later calls are ignored.
+    pub fn set(&self, inbounds: &[Arc<dyn Inbound>]) {
+        let map = inbounds.iter().map(|inbound| (inbound.tag().to_string(), inbound.clone())).collect();
+        let _ = self.inbounds.set(map);
+    }
+
+    pub fn get(&self, tag: &str) -> Option<Arc<dyn Inbound>> {
+        self.inbounds.get()?.get(tag).cloned()
+    }
+}
+
+/// Ports of server-first protocols (SMTP, IMAP, POP3), where the client
+/// waits for the server to speak (sing-box `sniff.Skip`).
+pub fn server_first_port(port: u16) -> bool {
+    matches!(port, 25 | 465 | 587 | 143 | 993 | 110 | 995)
 }
 
 /// Sorts or filters addresses by a domain strategy (sing-box

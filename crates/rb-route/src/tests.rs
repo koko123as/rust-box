@@ -114,7 +114,7 @@ fn router_with(rules: &str, dns: Arc<FakeDns>, echo: Arc<EchoOutbound>) -> Route
     let options: RouteOptions = serde_json::from_str(&format!(r#"{{"rules":{rules},"final":"proxy"}}"#)).unwrap();
     let outbounds: Vec<Arc<dyn Outbound>> =
         vec![Arc::new(FakeOutbound("direct")), Arc::new(FakeOutbound("proxy")), echo];
-    Router::new(&options, outbounds, dns).unwrap()
+    Router::new(&options, outbounds, dns, rb_adapter::InboundRegistry::new()).unwrap()
 }
 
 fn udp_context(destination: &str) -> InboundContext {
@@ -270,4 +270,75 @@ async fn resolve_then_match_ip() {
     let mut ctx = context("8.8.8.8", 80);
     assert!(matches!(ctx.destination.host, Host::Ip(_)));
     assert!(matches!(router.decide(&mut ctx, &mut stream).await.unwrap(), Decision::Reject(_)));
+}
+
+#[tokio::test]
+async fn route_options_apply_to_the_context() {
+    let router = router(
+        r#"[{"domain":"a.test","action":"route-options","override_address":"b.test","fallback_delay":300000000,
+             "tls_fragment":true,"tls_fragment_fallback_delay":"20ms"},
+            {"domain":"b.test","outbound":"direct","override_port":8443,"tls_record_fragment":true,
+             "network_strategy":"hybrid"},
+            {"outbound":"proxy"}]"#,
+        Arc::default(),
+    );
+    let mut context = InboundContext::new(
+        "in",
+        "socks",
+        Network::Tcp,
+        "127.0.0.1:1".parse().unwrap(),
+        Socksaddr::from_host_port("a.test", 443),
+    );
+    context.destination_addresses = vec!["10.0.0.1".parse().unwrap()];
+    let decision = router.decide(&mut context, &mut None).await.unwrap();
+    assert_eq!(decision, Decision::Route("direct".into()));
+    // The override changed what later rules match, and the address list.
+    assert_eq!(context.destination.to_string(), "b.test:8443");
+    assert!(context.destination_addresses.is_empty());
+    assert_eq!(context.route_original_destination.as_ref().unwrap().to_string(), "a.test:443");
+    // fallback_delay is a number of nanoseconds (sing-box's uint32).
+    assert_eq!(context.fallback_delay, Some(Duration::from_millis(300)));
+    assert!(context.tls_fragment && context.tls_record_fragment);
+    assert_eq!(context.tls_fragment_fallback_delay, Some(Duration::from_millis(20)));
+}
+
+#[tokio::test]
+async fn bypass_routes_or_is_skipped() {
+    let router = router(
+        r#"[{"port":1,"action":"bypass"},{"port":1,"outbound":"direct"},
+            {"port":2,"action":"bypass","outbound":"echo","override_port":3}]"#,
+        Arc::default(),
+    );
+    let mut context = udp_context("10.0.0.1:1");
+    assert_eq!(router.decide(&mut context, &mut None).await.unwrap(), Decision::Route("direct".into()));
+    let mut context = udp_context("10.0.0.1:2");
+    assert_eq!(router.decide(&mut context, &mut None).await.unwrap(), Decision::Route("echo".into()));
+    assert_eq!(context.destination.port, 3);
+}
+
+#[tokio::test]
+async fn udp_override_maps_replies_back() {
+    let echo = Arc::new(EchoOutbound::default());
+    let router = router_with(
+        r#"[{"network":"udp","action":"route-options","override_address":"10.9.9.9","override_port":99},
+            {"outbound":"echo"}]"#,
+        Arc::default(),
+        echo.clone(),
+    );
+    let client = FakeClient::new(vec![(b"ping".to_vec(), "10.0.0.1:53")]);
+    let _ = router.route_packet_connection(udp_context("10.0.0.1:53"), client.clone()).await;
+    // The outbound saw the new destination; the client sees the original.
+    assert_eq!(echo.0.lock().unwrap().as_ref().unwrap().destination.to_string(), "10.9.9.9:99");
+    assert_eq!(client.written.lock().unwrap().as_slice(), &[(b"ping".to_vec(), "10.0.0.1:53".to_string())]);
+}
+
+#[tokio::test]
+async fn inbound_detour_errors() {
+    let router = router("[]", Arc::default());
+    let mut context = udp_context("10.0.0.1:1");
+    context.network = Network::Tcp;
+    context.inbound_detour = Some("missing".into());
+    let (client, _server) = tokio::io::duplex(64);
+    let error = router.route_connection(context, Box::new(client)).await.unwrap_err();
+    assert!(error.to_string().contains("inbound detour not found: missing"), "{error}");
 }
