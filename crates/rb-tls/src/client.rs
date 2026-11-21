@@ -146,6 +146,12 @@ impl TlsClient {
         self.config.alpn_protocols.iter().map(|protocol| String::from_utf8_lossy(protocol).into_owned()).collect()
     }
 
+    /// Shares the exact rustls configuration with transports such as QUIC,
+    /// preserving the configured verifier, roots, and client certificate.
+    pub fn rustls_config(&self) -> Arc<ClientConfig> {
+        self.config.clone()
+    }
+
     /// A copy offering other ALPN protocols (sing-box `SetNextProtos`).
     pub fn with_alpn(&self, alpn: &[&str]) -> Self {
         let mut config = (*self.config).clone();

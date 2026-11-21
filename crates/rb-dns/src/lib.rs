@@ -12,18 +12,24 @@ mod mode;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::{RData, Record};
-use rb_adapter::{apply_strategy, DnsResolver, LookupOptions, OutboundRegistry};
-use rb_config::{DnsOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
-use rb_dialer::NetworkDefaults;
-use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
+use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use rb_adapter::{apply_strategy, DnsResolver, LookupOptions, OutboundRegistry, Socksaddr};
+use rb_config::{DnsOptions, DnsRouteActionOptions, DnsRule, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
+use rb_dialer::{DialerEnv, NetworkDefaults};
+use rb_rule::{
+    compile, compile_dns_match, Compiled, Context as RuleContext, DnsResponseMetadata, Metadata, RuleSetMetadata,
+    RuleSets,
+};
 
-pub use transport::{Answer, Transport, QTYPE_A, QTYPE_AAAA};
+pub use transport::{
+    Answer, DohTransport, DoqTransport, DotTransport, FakeIpTransport, H3Transport, HostsTransport, Transport, QTYPE_A,
+    QTYPE_AAAA,
+};
 
 /// sing-box `C.DNSTimeout`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -83,8 +89,239 @@ impl Cache {
 
 /// Where the DNS rules send one query.
 enum Selection {
-    Server { server: String, strategy: DomainStrategy, disable_cache: bool },
+    Server { server: String, options: LookupOptions },
     Reject(RejectMethod),
+    Respond(Option<EvaluatedDnsResponse>),
+    Error(io::Error),
+}
+
+/// One evaluated response, kept local to one lookup or exchange.
+#[derive(Clone)]
+struct EvaluatedDnsResponse {
+    raw: Vec<u8>,
+    message: Message,
+    addresses: Vec<IpAddr>,
+}
+
+impl EvaluatedDnsResponse {
+    fn metadata(&self) -> DnsResponseMetadata<'_> {
+        DnsResponseMetadata {
+            rcode: i32::from(u16::from(self.message.response_code())),
+            addresses: &self.addresses,
+            answers: self.message.answers(),
+            ns: self.message.name_servers(),
+            extra: self.message.additionals(),
+        }
+    }
+}
+
+struct DnsEvaluationState {
+    anonymous: Option<usize>,
+    named: HashMap<String, usize>,
+    futures: Vec<DnsEvaluationFuture>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    sender: tokio::sync::mpsc::UnboundedSender<(usize, io::Result<EvaluatedDnsResponse>)>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<(usize, io::Result<EvaluatedDnsResponse>)>,
+    armed: Vec<DnsArmedRule>,
+}
+
+struct DnsEvaluationFuture {
+    server: String,
+    terminal: bool,
+    resolved: bool,
+    response: Option<EvaluatedDnsResponse>,
+    error: Option<(io::ErrorKind, String)>,
+}
+
+struct DnsArmedRule {
+    index: usize,
+    futures: Vec<usize>,
+    anonymous_future: Option<usize>,
+    binds_anonymous: bool,
+    options: LookupOptions,
+}
+
+impl DnsEvaluationState {
+    fn new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            anonymous: None,
+            named: HashMap::new(),
+            futures: Vec::new(),
+            tasks: Vec::new(),
+            sender,
+            receiver,
+            armed: Vec::new(),
+        }
+    }
+
+    fn launch(
+        &mut self,
+        tag: Option<&str>,
+        server: &str,
+        transport: Arc<Transport>,
+        request: Vec<u8>,
+        options: LookupOptions,
+        default_timeout: Duration,
+    ) -> usize {
+        let index = self.futures.len();
+        self.futures.push(DnsEvaluationFuture {
+            server: server.to_string(),
+            terminal: tag.is_none(),
+            resolved: false,
+            response: None,
+            error: None,
+        });
+        if let Some(tag) = tag {
+            if tag.is_empty() {
+                self.anonymous = Some(index);
+            } else {
+                self.named.insert(tag.to_string(), index);
+            }
+        }
+        let sender = self.sender.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let result = DnsRouter::evaluate_transport(transport, request, options, default_timeout).await;
+            let _ = sender.send((index, result));
+        }));
+        index
+    }
+
+    fn settle_one(&mut self, index: usize, result: io::Result<EvaluatedDnsResponse>) {
+        let Some(future) = self.futures.get_mut(index) else { return };
+        if future.resolved {
+            return;
+        }
+        future.resolved = true;
+        match result {
+            Ok(response) => future.response = Some(response),
+            Err(error) if future.terminal => future.error = Some((error.kind(), error.to_string())),
+            Err(error) => tracing::error!(%error, server = %future.server, "dns: evaluate exchange failed"),
+        }
+    }
+
+    fn terminal_result(&self, index: usize) -> Option<io::Result<EvaluatedDnsResponse>> {
+        let future = self.futures.get(index)?;
+        if !future.resolved {
+            return None;
+        }
+        match (&future.response, &future.error) {
+            (Some(response), _) => Some(Ok(response.clone())),
+            (_, Some((kind, message))) => Some(Err(io::Error::new(*kind, message.clone()))),
+            _ => Some(Err(io::Error::other("DNS terminal exchange returned no response"))),
+        }
+    }
+
+    fn settle_completed(&mut self) {
+        while let Ok((index, result)) = self.receiver.try_recv() {
+            self.settle_one(index, result);
+        }
+    }
+
+    async fn wait_for(&mut self, index: usize) {
+        while self.futures.get(index).is_some_and(|future| !future.resolved) {
+            let Some((completed_index, result)) = self.receiver.recv().await else { return };
+            self.settle_one(completed_index, result);
+        }
+    }
+
+    async fn wait_for_completion(&mut self) {
+        if let Some((index, result)) = self.receiver.recv().await {
+            self.settle_one(index, result);
+        }
+    }
+
+    fn resolved(&self, index: usize) -> bool {
+        self.futures.get(index).is_none_or(|future| future.resolved)
+    }
+
+    fn future_response(&self, index: usize) -> Option<&EvaluatedDnsResponse> {
+        self.futures.get(index).filter(|future| future.resolved).and_then(|future| future.response.as_ref())
+    }
+
+    fn anonymous_response(&self) -> Option<&EvaluatedDnsResponse> {
+        self.anonymous.and_then(|index| self.future_response(index))
+    }
+
+    fn named_metadata(&self) -> Vec<(&str, DnsResponseMetadata<'_>)> {
+        self.named
+            .iter()
+            .filter_map(|(tag, index)| self.future_response(*index).map(|response| (tag.as_str(), response.metadata())))
+            .collect()
+    }
+
+    fn response(&self, tag: &str) -> Option<&EvaluatedDnsResponse> {
+        if tag.is_empty() {
+            self.anonymous_response()
+        } else {
+            self.named.get(tag).and_then(|index| self.future_response(*index))
+        }
+    }
+}
+
+impl Drop for DnsEvaluationState {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn apply_dns_route_options(options: &mut LookupOptions, route: &DnsRouteActionOptions) {
+    if route.strategy != DomainStrategy::AsIs {
+        options.strategy = route.strategy;
+    }
+    options.disable_cache |= route.disable_cache;
+    if !route.timeout.0.is_zero() {
+        options.timeout = Some(route.timeout.0);
+    }
+    if route.rewrite_ttl.is_some() {
+        options.rewrite_ttl = route.rewrite_ttl;
+    }
+    // There is no optimistic DNS cache to disable.
+}
+
+fn respond_tag(rule: &DnsRule) -> Option<&str> {
+    match rule {
+        DnsRule::Default { matcher, .. } if matcher.match_response.enabled => Some(&matcher.match_response.tag),
+        _ => None,
+    }
+}
+
+fn response_bindings(rule: &DnsRule) -> (Vec<String>, bool) {
+    fn collect(rule: &DnsRule, tags: &mut Vec<String>, anonymous: &mut bool) {
+        match rule {
+            DnsRule::Default { matcher, .. } => {
+                if matcher.match_response.enabled {
+                    if matcher.match_response.tag.is_empty() {
+                        *anonymous = true;
+                    } else if !tags.contains(&matcher.match_response.tag) {
+                        tags.push(matcher.match_response.tag.clone());
+                    }
+                }
+            }
+            DnsRule::Logical { rules, .. } => {
+                for rule in rules {
+                    collect(rule, tags, anonymous);
+                }
+            }
+        }
+    }
+
+    let mut tags = Vec::new();
+    let mut anonymous = false;
+    collect(rule, &mut tags, &mut anonymous);
+    (tags, anonymous)
+}
+
+fn dns_query_message(domain: &str, query_type: u16) -> io::Result<Message> {
+    let name =
+        Name::from_ascii(domain).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut query = Query::new();
+    query.set_name(name).set_query_type(RecordType::from(query_type));
+    let mut message = Message::new();
+    message.set_id(0).set_message_type(MessageType::Query).set_recursion_desired(true).add_query(query);
+    Ok(message)
 }
 
 /// The compiled rules and the mode they run in.
@@ -110,6 +347,37 @@ pub struct DnsRouter {
     strategy: DomainStrategy,
     timeout: Duration,
     cache: Option<Mutex<Cache>>,
+}
+
+#[derive(Default)]
+struct DnsResolverHandle {
+    router: RwLock<Option<Weak<DnsRouter>>>,
+}
+
+impl DnsResolverHandle {
+    fn router(&self) -> io::Result<Arc<DnsRouter>> {
+        self.router
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "DNS router is not initialized"))
+    }
+}
+
+#[async_trait]
+impl DnsResolver for DnsResolverHandle {
+    async fn lookup(&self, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>> {
+        self.router()?.lookup(domain, options).await
+    }
+
+    async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
+        self.router()?.exchange(query, options).await
+    }
+
+    fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        self.router()?.reverse_lookup(address)
+    }
 }
 
 #[derive(Debug)]
@@ -149,6 +417,33 @@ fn strategy_allows(strategy: DomainStrategy, query_type: u16) -> bool {
 }
 
 impl DnsRouter {
+    fn validate_evaluate_servers(options: &DnsOptions) -> Result<(), DnsError> {
+        let server_tags: Vec<(String, bool)> = options
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| {
+                let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
+                (tag, matches!(server, DnsServer::FakeIp(_)))
+            })
+            .collect();
+        for (index, rule) in options.rules.iter().enumerate() {
+            let Some(DnsRuleAction::Evaluate { server, .. }) = rule.action() else { continue };
+            if server.is_empty() {
+                return Err(DnsError(format!("dns.rules[{index}]: missing server field")));
+            }
+            if !server_tags.iter().any(|(tag, _)| tag == server) {
+                return Err(DnsError(format!("dns.rules[{index}]: DNS server not found: {server}")));
+            }
+            if server_tags.iter().any(|(tag, fakeip)| tag == server && *fakeip) {
+                return Err(DnsError(format!(
+                    "dns.rules[{index}]: evaluate action cannot use fakeip server: {server}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `defaults` are the route-level dial defaults and `outbounds` the
     /// handle a server's `detour` dials through (filled once the outbounds
     /// are built). The rules are checked against the rule-sets as they are
@@ -159,9 +454,14 @@ impl DnsRouter {
         defaults: &NetworkDefaults,
         outbounds: &Arc<OutboundRegistry>,
         rule_sets: &RuleSets,
-    ) -> Result<Self, DnsError> {
+        certificates: &Arc<rb_certificate::Store>,
+    ) -> Result<Arc<Self>, DnsError> {
+        Self::validate_evaluate_servers(options)?;
         let mut servers = HashMap::new();
         let mut first = None;
+        let mut fakeip_count = 0;
+        let dns_resolver = Arc::new(DnsResolverHandle::default());
+        let dns_resolver_trait: Arc<dyn DnsResolver> = dns_resolver.clone();
         for (index, server) in options.servers.iter().enumerate() {
             let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
             let dialer = |remote: &rb_config::RemoteDnsServer| {
@@ -176,6 +476,151 @@ impl DnsRouter {
                 DnsServer::Tcp(remote) => {
                     Transport::Tcp((remote.server, port_or_default(remote.server_port)).into(), dialer(remote)?)
                 }
+                DnsServer::Tls(remote) | DnsServer::Quic(remote) => {
+                    let address = Socksaddr::from_host_port(&remote.server, port_or_default_dot(remote.server_port));
+                    if remote.server.is_empty() {
+                        return Err(DnsError(format!("dns.servers[{index}]: invalid server address: {address}")));
+                    }
+                    let dial_options = remote.dialer_options();
+                    let has_resolver =
+                        dial_options.domain_resolver.as_ref().is_some_and(|resolver| !resolver.server.is_empty());
+                    if address.domain().is_some() && dial_options.detour.is_empty() && !has_resolver {
+                        return Err(DnsError(format!(
+                            "dns.servers[{index}]: missing domain resolver for domain server address"
+                        )));
+                    }
+                    let environment = DialerEnv {
+                        defaults: defaults.clone(),
+                        outbounds: outbounds.clone(),
+                        dns: dns_resolver_trait.clone(),
+                        // sing-box DNS remote dialers use DirectResolver;
+                        // route.default_domain_resolver is deliberately not inherited.
+                        default_resolver: None,
+                    };
+                    let remote_dialer = rb_dialer::new_outbound_dialer(
+                        &dial_options,
+                        address.domain().is_some(),
+                        &environment,
+                        &format!(
+                            "dns/transport/{}[{tag}]",
+                            if matches!(server, DnsServer::Quic(_)) { "quic" } else { "tls" }
+                        ),
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let mut tls = remote.tls.clone().unwrap_or_default();
+                    // sing-box forces TLS on and leaves ALPN empty by default.
+                    tls.enabled = true;
+                    if matches!(server, DnsServer::Quic(_)) && tls.alpn.is_empty() {
+                        tls.alpn.0 = vec!["doq".into()];
+                    }
+                    let client = rb_tls::TlsClient::new(&tls, &remote.server, certificates)
+                        .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    if matches!(server, DnsServer::Quic(_)) {
+                        Transport::Doq(Arc::new(DoqTransport::new(address, remote_dialer, client)))
+                    } else {
+                        let tls_dialer = Arc::new(rb_tls::TlsDialer::new(remote_dialer, client));
+                        Transport::Dot(Arc::new(DotTransport::new(address, tls_dialer)))
+                    }
+                }
+                DnsServer::Https(remote) => {
+                    let address = Socksaddr::from_host_port(&remote.server, port_or_default_https(remote.server_port));
+                    if remote.server.is_empty() {
+                        return Err(DnsError(format!("dns.servers[{index}]: invalid server address: {address}")));
+                    }
+                    let dial_options = remote.dialer_options();
+                    let has_resolver =
+                        dial_options.domain_resolver.as_ref().is_some_and(|resolver| !resolver.server.is_empty());
+                    if address.domain().is_some() && dial_options.detour.is_empty() && !has_resolver {
+                        return Err(DnsError(format!(
+                            "dns.servers[{index}]: missing domain resolver for domain server address"
+                        )));
+                    }
+                    let environment = DialerEnv {
+                        defaults: defaults.clone(),
+                        outbounds: outbounds.clone(),
+                        dns: dns_resolver_trait.clone(),
+                        default_resolver: None,
+                    };
+                    let remote_dialer = rb_dialer::new_outbound_dialer(
+                        &dial_options,
+                        address.domain().is_some(),
+                        &environment,
+                        &format!("dns/transport/https[{tag}]"),
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let mut tls = remote.tls.clone().unwrap_or_default();
+                    tls.enabled = true;
+                    if tls.alpn.is_empty() {
+                        tls.alpn.0 = vec!["h2".into(), "http/1.1".into()];
+                    }
+                    let client = rb_tls::TlsClient::new(&tls, &remote.server, certificates)
+                        .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let doh = DohTransport::new(
+                        address,
+                        remote_dialer,
+                        client,
+                        remote.server_port,
+                        &remote.path,
+                        &remote.headers,
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    Transport::Doh(Arc::new(doh))
+                }
+                DnsServer::Http3(remote) => {
+                    let address = Socksaddr::from_host_port(&remote.server, port_or_default_https(remote.server_port));
+                    if remote.server.is_empty() {
+                        return Err(DnsError(format!("dns.servers[{index}]: invalid server address: {address}")));
+                    }
+                    let dial_options = remote.dialer_options();
+                    let has_resolver =
+                        dial_options.domain_resolver.as_ref().is_some_and(|resolver| !resolver.server.is_empty());
+                    if address.domain().is_some() && dial_options.detour.is_empty() && !has_resolver {
+                        return Err(DnsError(format!(
+                            "dns.servers[{index}]: missing domain resolver for domain server address"
+                        )));
+                    }
+                    let environment = DialerEnv {
+                        defaults: defaults.clone(),
+                        outbounds: outbounds.clone(),
+                        dns: dns_resolver_trait.clone(),
+                        default_resolver: None,
+                    };
+                    let remote_dialer = rb_dialer::new_outbound_dialer(
+                        &dial_options,
+                        address.domain().is_some(),
+                        &environment,
+                        &format!("dns/transport/http3[{tag}]"),
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let mut tls = remote.tls.clone().unwrap_or_default();
+                    tls.enabled = true;
+                    tls.alpn.0 = vec!["h3".into()];
+                    let client = rb_tls::TlsClient::new(&tls, &remote.server, certificates)
+                        .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    let h3 = H3Transport::new(
+                        address,
+                        remote_dialer,
+                        client,
+                        remote.server_port,
+                        &remote.path,
+                        &remote.headers,
+                    )
+                    .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?;
+                    Transport::H3(Arc::new(h3))
+                }
+                DnsServer::Hosts(hosts) => {
+                    Transport::hosts(hosts).map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?
+                }
+                DnsServer::FakeIp(fakeip) => {
+                    fakeip_count += 1;
+                    if fakeip_count > 1 {
+                        return Err(DnsError("multiple fakeip server are not supported".into()));
+                    }
+                    Transport::FakeIp(Arc::new(
+                        FakeIpTransport::new(fakeip)
+                            .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?,
+                    ))
+                }
             };
             first.get_or_insert_with(|| tag.clone());
             servers.insert(tag, Arc::new(transport));
@@ -189,6 +634,9 @@ impl DnsRouter {
             servers.insert("local".into(), Arc::new(Transport::Local));
             "local".into()
         };
+        if servers.get(&final_server).is_some_and(|server| matches!(server.as_ref(), Transport::FakeIp(_))) {
+            return Err(DnsError("default server cannot be fakeip".into()));
+        }
         let timeout = if options.timeout.0.is_zero() { DEFAULT_TIMEOUT } else { options.timeout.0 };
         let cache = (!options.disable_cache).then(|| {
             Mutex::new(Cache {
@@ -201,7 +649,7 @@ impl DnsRouter {
                 disable_expire: options.disable_expire,
             })
         });
-        let router = DnsRouter {
+        let router = Arc::new(DnsRouter {
             servers,
             raw_rules: options.rules.clone(),
             rules: RwLock::new(Arc::new(DnsRules { rules: Vec::new(), legacy: false })),
@@ -210,7 +658,8 @@ impl DnsRouter {
             strategy: options.strategy,
             timeout,
             cache,
-        };
+        });
+        *dns_resolver.router.write().unwrap() = Some(Arc::downgrade(&router));
         let (rules, _) = router.build_rules(rule_sets)?;
         *router.rules.write().unwrap() = Arc::new(rules);
         Ok(router)
@@ -218,6 +667,7 @@ impl DnsRouter {
 
     /// `Router.buildRules`.
     fn build_rules(&self, rule_sets: &RuleSets) -> Result<(DnsRules, mode::ModeFlags), DnsError> {
+        mode::validate_nested_actions(&self.raw_rules).map_err(DnsError)?;
         let lookup = mode::MetadataLookup { rule_sets, overrides: HashMap::new() };
         let (legacy, flags) = mode::resolve_legacy_mode(&self.raw_rules, &lookup).map_err(DnsError)?;
         if !legacy {
@@ -258,6 +708,22 @@ impl DnsRouter {
         self.state.lock().unwrap().closing = true;
     }
 
+    /// `DNSRouter.LookupReverseMapping`, including FakeIP store lookups.
+    /// An address inside the configured FakeIP range without a record is an
+    /// error rather than an ordinary unmapped address.
+    pub fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        for server in self.servers.values() {
+            if let Transport::FakeIp(fakeip) = server.as_ref() {
+                if fakeip.contains(address) {
+                    return fakeip.lookup(address).map(Some).ok_or_else(|| {
+                        io::Error::other("missing fakeip record, try enable `experimental.cache_file`")
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether the rules run in sing-box's legacy DNS mode.
     pub fn legacy_mode(&self) -> bool {
         self.rules.read().unwrap().legacy
@@ -282,75 +748,386 @@ impl DnsRouter {
         mode::validate_update(&self.raw_rules, &lookup, started, legacy)
     }
 
-    /// `Router.matchDNS`: the first rule that routes or rejects, from
-    /// `start`, and its index.
-    fn match_rules(
+    /// Walks rules in order, keeping evaluated responses on this request only.
+    #[allow(clippy::too_many_arguments)]
+    async fn match_rules(
         &self,
         rules: &DnsRules,
-        metadata: &mut Metadata,
+        domain: &str,
+        query_type: u16,
         start: usize,
         address_query: bool,
-        options: &LookupOptions,
+        base_options: &LookupOptions,
+        options: &mut LookupOptions,
+        request: &Message,
+        evaluation: &mut DnsEvaluationState,
     ) -> (Selection, Option<usize>) {
         if let Some(server) = &options.server {
-            return (
-                Selection::Server {
-                    server: server.clone(),
-                    strategy: options.strategy,
-                    disable_cache: options.disable_cache,
-                },
-                None,
-            );
+            return (Selection::Server { server: server.clone(), options: options.clone() }, None);
         }
-        for (index, rule) in rules.rules.iter().enumerate().skip(start) {
-            let matched = if rules.legacy {
-                if rule.matcher.with_address_limit() && !address_query {
-                    continue;
+        let mut index = start;
+        while index < rules.rules.len() {
+            evaluation.settle_completed();
+            if let Some((selection, index)) =
+                self.sweep_ready_armed(rules, domain, query_type, base_options, evaluation)
+            {
+                return (selection, Some(index));
+            }
+            let rule = &rules.rules[index];
+            if rules.legacy && rule.matcher.with_address_limit() && !address_query {
+                index += 1;
+                continue;
+            }
+            let (response_tags, binds_anonymous) = self.raw_rules.get(index).map(response_bindings).unwrap_or_default();
+            let anonymous_future = binds_anonymous.then_some(evaluation.anonymous).flatten();
+            let mut bound_futures: Vec<usize> =
+                response_tags.iter().filter_map(|tag| evaluation.named.get(tag).copied()).collect();
+            if let Some(future) = anonymous_future {
+                if !bound_futures.contains(&future) {
+                    bound_futures.push(future);
                 }
-                metadata.reset_rule_cache();
-                metadata.destination_address_match_from_response = false;
-                rule.matcher.legacy_pre_match(metadata)
-            } else {
-                metadata.reset_rule_cache();
-                rule.matches(metadata)
+            }
+            let race = matches!(
+                rule.action(),
+                Some(
+                    DnsRuleAction::Route { race: true, .. }
+                        | DnsRuleAction::Respond { race: true }
+                        | DnsRuleAction::Reject { race: true, .. }
+                )
+            );
+            if race {
+                evaluation.armed.push(DnsArmedRule {
+                    index,
+                    futures: bound_futures.clone(),
+                    anonymous_future,
+                    binds_anonymous,
+                    options: options.clone(),
+                });
+                if let Some((selection, matched_index)) =
+                    self.sweep_ready_armed(rules, domain, query_type, base_options, evaluation)
+                {
+                    return (selection, Some(matched_index));
+                }
+                index += 1;
+                continue;
+            }
+            for future in bound_futures {
+                while !evaluation.resolved(future) {
+                    evaluation.wait_for(future).await;
+                    evaluation.settle_completed();
+                    if let Some((selection, matched_index)) =
+                        self.sweep_ready_armed(rules, domain, query_type, base_options, evaluation)
+                    {
+                        return (selection, Some(matched_index));
+                    }
+                }
+            }
+            let matched = {
+                let named_responses = evaluation.named_metadata();
+                let mut metadata = Metadata {
+                    inbound: base_options.inbound.as_deref().unwrap_or(""),
+                    network: base_options.network.map(|network| network.as_str()),
+                    user: base_options.user.as_deref(),
+                    source: base_options.source,
+                    domain: Some(domain),
+                    query_type: Some(query_type),
+                    ip_version: ip_version_of(query_type),
+                    dns_response: evaluation.anonymous_response().map(EvaluatedDnsResponse::metadata),
+                    named_dns_responses: &named_responses,
+                    ..Default::default()
+                };
+                if rules.legacy {
+                    rule.matcher.legacy_pre_match(&mut metadata)
+                } else {
+                    rule.matches(&mut metadata)
+                }
+            };
+            if !matched {
+                index += 1;
+                continue;
+            }
+            match rule.action() {
+                Some(DnsRuleAction::Route { server, options: route_options, speculative, .. }) => {
+                    let Some(transport) = self.servers.get(server).cloned() else {
+                        tracing::error!(server, "dns: route transport not found");
+                        index += 1;
+                        continue;
+                    };
+                    if *speculative && !evaluation.armed.is_empty() {
+                        let mut route_options_snapshot = options.clone();
+                        apply_dns_route_options(&mut route_options_snapshot, route_options);
+                        let request = match request.to_vec() {
+                            Ok(request) => request,
+                            Err(error) => {
+                                return (Selection::Error(io::Error::other(error.to_string())), Some(index));
+                            }
+                        };
+                        let terminal_future =
+                            evaluation.launch(None, server, transport, request, route_options_snapshot, self.timeout);
+                        if let Some((selection, matched_index)) =
+                            self.drain_armed(rules, domain, query_type, base_options, evaluation).await
+                        {
+                            return (selection, Some(matched_index));
+                        }
+                        evaluation.wait_for(terminal_future).await;
+                        evaluation.settle_completed();
+                        return match evaluation.terminal_result(terminal_future) {
+                            Some(Ok(response)) => (Selection::Respond(Some(response)), Some(index)),
+                            Some(Err(error)) => (Selection::Error(error), Some(index)),
+                            None => (
+                                Selection::Error(io::Error::other("DNS terminal exchange did not complete")),
+                                Some(index),
+                            ),
+                        };
+                    }
+                    if !evaluation.armed.is_empty() {
+                        if let Some((selection, matched_index)) =
+                            self.drain_armed(rules, domain, query_type, base_options, evaluation).await
+                        {
+                            return (selection, Some(matched_index));
+                        }
+                    }
+                    tracing::debug!(domain, rule = index, server, "dns: match");
+                    apply_dns_route_options(options, route_options);
+                    return (Selection::Server { server: server.clone(), options: options.clone() }, Some(index));
+                }
+                Some(DnsRuleAction::Reject { options: reject, .. }) => {
+                    if !evaluation.armed.is_empty() {
+                        if let Some((selection, matched_index)) =
+                            self.drain_armed(rules, domain, query_type, base_options, evaluation).await
+                        {
+                            return (selection, Some(matched_index));
+                        }
+                    }
+                    tracing::debug!(domain, rule = index, "dns: reject");
+                    return (Selection::Reject(reject.method), Some(index));
+                }
+                Some(DnsRuleAction::Evaluate { server, tag, options: route_options, speculative, .. }) => {
+                    if !speculative && !evaluation.armed.is_empty() {
+                        if let Some((selection, matched_index)) =
+                            self.drain_armed(rules, domain, query_type, base_options, evaluation).await
+                        {
+                            return (selection, Some(matched_index));
+                        }
+                    }
+                    let transport = match self.servers.get(server) {
+                        Some(transport) => transport.clone(),
+                        None => {
+                            tracing::error!(server, "dns: evaluate transport not found");
+                            if tag.is_empty() {
+                                evaluation.anonymous = None;
+                            } else {
+                                evaluation.named.remove(tag);
+                            }
+                            index += 1;
+                            continue;
+                        }
+                    };
+                    let mut evaluate_options = options.clone();
+                    apply_dns_route_options(&mut evaluate_options, route_options);
+                    let request = match request.to_vec() {
+                        Ok(request) => request,
+                        Err(error) => return (Selection::Error(io::Error::other(error.to_string())), Some(index)),
+                    };
+                    evaluation.launch(Some(tag), server, transport, request, evaluate_options, self.timeout);
+                }
+                Some(DnsRuleAction::Respond { .. }) => {
+                    if !evaluation.armed.is_empty() {
+                        if let Some((selection, matched_index)) =
+                            self.drain_armed(rules, domain, query_type, base_options, evaluation).await
+                        {
+                            return (selection, Some(matched_index));
+                        }
+                    }
+                    if response_tags.is_empty() && !binds_anonymous {
+                        if let Some(future) = evaluation.anonymous {
+                            if !evaluation.resolved(future) {
+                                evaluation.wait_for(future).await;
+                                evaluation.settle_completed();
+                            }
+                        }
+                    }
+                    let tag = self.raw_rules.get(index).and_then(respond_tag).unwrap_or("");
+                    return (Selection::Respond(evaluation.response(tag).cloned()), Some(index));
+                }
+                None => {}
+            }
+            index += 1;
+        }
+        if !evaluation.armed.is_empty() {
+            if let Some((selection, matched_index)) =
+                self.drain_armed(rules, domain, query_type, base_options, evaluation).await
+            {
+                return (selection, Some(matched_index));
+            }
+        }
+        (Selection::Server { server: self.final_server.clone(), options: options.clone() }, None)
+    }
+
+    fn sweep_ready_armed(
+        &self,
+        rules: &DnsRules,
+        domain: &str,
+        query_type: u16,
+        base_options: &LookupOptions,
+        evaluation: &mut DnsEvaluationState,
+    ) -> Option<(Selection, usize)> {
+        let armed_rules = std::mem::take(&mut evaluation.armed);
+        let mut pending = Vec::new();
+        for armed in armed_rules {
+            if armed.futures.iter().any(|future| !evaluation.resolved(*future)) {
+                pending.push(armed);
+                continue;
+            }
+            let Some(rule) = rules.rules.get(armed.index) else { continue };
+            let matched = {
+                let named_responses = evaluation.named_metadata();
+                let anonymous = if armed.binds_anonymous {
+                    armed.anonymous_future.and_then(|future| evaluation.future_response(future))
+                } else {
+                    evaluation.anonymous_response()
+                };
+                let mut metadata = Metadata {
+                    inbound: base_options.inbound.as_deref().unwrap_or(""),
+                    network: base_options.network.map(|network| network.as_str()),
+                    user: base_options.user.as_deref(),
+                    source: base_options.source,
+                    domain: Some(domain),
+                    query_type: Some(query_type),
+                    ip_version: ip_version_of(query_type),
+                    dns_response: anonymous.map(EvaluatedDnsResponse::metadata),
+                    named_dns_responses: &named_responses,
+                    ..Default::default()
+                };
+                if rules.legacy {
+                    rule.matcher.legacy_pre_match(&mut metadata)
+                } else {
+                    rule.matches(&mut metadata)
+                }
             };
             if !matched {
                 continue;
             }
             match rule.action() {
-                Some(DnsRuleAction::Route { server, strategy, disable_cache }) => {
-                    tracing::debug!(domain = metadata.domain, rule = index, server, "dns: match");
-                    let strategy = if *strategy != DomainStrategy::AsIs { *strategy } else { options.strategy };
-                    return (
-                        Selection::Server {
-                            server: server.clone(),
-                            strategy,
-                            disable_cache: *disable_cache || options.disable_cache,
-                        },
-                        Some(index),
-                    );
+                Some(DnsRuleAction::Route { server, options, .. }) => {
+                    if !self.servers.contains_key(server) {
+                        tracing::error!(server, "dns: race route transport not found");
+                        continue;
+                    }
+                    let mut effective_options = armed.options;
+                    apply_dns_route_options(&mut effective_options, options);
+                    evaluation.armed = pending;
+                    return Some((
+                        Selection::Server { server: server.clone(), options: effective_options },
+                        armed.index,
+                    ));
                 }
-                Some(DnsRuleAction::Reject(reject)) => {
-                    tracing::debug!(domain = metadata.domain, rule = index, "dns: reject");
-                    return (Selection::Reject(reject.method), Some(index));
+                Some(DnsRuleAction::Reject { options, .. }) => {
+                    evaluation.armed = pending;
+                    return Some((Selection::Reject(options.method), armed.index));
                 }
-                None => {}
+                Some(DnsRuleAction::Respond { .. }) => {
+                    let tag = self.raw_rules.get(armed.index).and_then(respond_tag).unwrap_or("");
+                    let response = if !tag.is_empty() {
+                        evaluation.response(tag)
+                    } else if let Some(future) = armed.anonymous_future {
+                        evaluation.future_response(future)
+                    } else {
+                        evaluation.anonymous_response()
+                    }
+                    .cloned();
+                    evaluation.armed = pending;
+                    return Some((Selection::Respond(response), armed.index));
+                }
+                Some(DnsRuleAction::Evaluate { .. }) | None => {}
             }
         }
-        (
-            Selection::Server {
-                server: self.final_server.clone(),
-                strategy: options.strategy,
-                disable_cache: options.disable_cache,
-            },
-            None,
-        )
+        evaluation.armed = pending;
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_armed(
+        &self,
+        rules: &DnsRules,
+        domain: &str,
+        query_type: u16,
+        base_options: &LookupOptions,
+        evaluation: &mut DnsEvaluationState,
+    ) -> Option<(Selection, usize)> {
+        loop {
+            evaluation.settle_completed();
+            if let Some(selection) = self.sweep_ready_armed(rules, domain, query_type, base_options, evaluation) {
+                return Some(selection);
+            }
+            let next = evaluation
+                .armed
+                .iter()
+                .flat_map(|rule| rule.futures.iter().copied())
+                .find(|future| !evaluation.resolved(*future));
+            next?;
+            evaluation.wait_for_completion().await;
+        }
     }
 
     fn transport(&self, server: &str) -> io::Result<&Arc<Transport>> {
         self.servers
             .get(server)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("DNS server not found: {server}")))
+    }
+
+    async fn evaluate_transport(
+        transport: Arc<Transport>,
+        raw_request: Vec<u8>,
+        options: LookupOptions,
+        default_timeout: Duration,
+    ) -> io::Result<EvaluatedDnsResponse> {
+        let request = Message::from_vec(&raw_request)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let timeout = options.timeout.unwrap_or(default_timeout);
+        let exchange = tokio::time::timeout(timeout, transport.exchange(&raw_request, timeout))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS evaluate exchange timed out"))??;
+        let raw = match exchange {
+            Some(response) => response,
+            None => {
+                let Some(question) = request.queries().first() else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "DNS query has no question"));
+                };
+                let query_type = u16::from(question.query_type());
+                if query_type != QTYPE_A && query_type != QTYPE_AAAA {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "DNS transport does not support this query type",
+                    ));
+                }
+                let domain = question.name().to_ascii().trim_end_matches('.').to_ascii_lowercase();
+                let mut answer =
+                    tokio::time::timeout(timeout, transport.query(&domain, query_type, timeout)).await.map_err(
+                        |_| io::Error::new(io::ErrorKind::TimedOut, format!("{domain}: DNS query timed out")),
+                    )??;
+                if let Some(ttl) = options.rewrite_ttl {
+                    if !answer.addresses.is_empty() {
+                        answer.ttl = ttl;
+                    }
+                }
+                let records = answer
+                    .addresses
+                    .iter()
+                    .filter_map(|address| match address {
+                        IpAddr::V4(ip) if query_type == QTYPE_A => Some(RData::A((*ip).into())),
+                        IpAddr::V6(ip) if query_type == QTYPE_AAAA => Some(RData::AAAA((*ip).into())),
+                        _ => None,
+                    })
+                    .map(|data| Record::from_rdata(question.name().clone(), answer.ttl, data))
+                    .collect();
+                response(&request, ResponseCode::NoError, records)?
+            }
+        };
+        let message =
+            Message::from_vec(&raw).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let addresses = response_addresses(&raw);
+        Ok(EvaluatedDnsResponse { raw, message, addresses })
     }
 
     /// Asks `server` for the A or AAAA records of `domain`, through the cache.
@@ -407,19 +1184,28 @@ impl DnsRouter {
         query_type: u16,
         options: &LookupOptions,
     ) -> io::Result<Vec<IpAddr>> {
-        let selection = {
-            let mut metadata = Self::base_metadata(domain, options);
-            metadata.query_type = Some(query_type);
-            metadata.ip_version = ip_version_of(query_type);
-            self.match_rules(rules, &mut metadata, 0, true, options).0
-        };
+        let request = dns_query_message(domain, query_type)?;
+        let mut evaluation = DnsEvaluationState::new();
+        let mut effective_options = options.clone();
+        if effective_options.strategy == DomainStrategy::AsIs {
+            effective_options.strategy = self.strategy;
+        }
+        let selection = self
+            .match_rules(rules, domain, query_type, 0, true, options, &mut effective_options, &request, &mut evaluation)
+            .await
+            .0;
         match selection {
             Selection::Reject(method) => Err(reject_error(domain, method)),
-            Selection::Server { server, strategy, disable_cache } => {
-                if !strategy_allows(strategy, query_type) {
+            Selection::Error(error) => Err(error),
+            Selection::Respond(Some(response)) => Ok(filter_query_addresses(response.addresses, query_type)),
+            Selection::Respond(None) => {
+                Err(io::Error::other("respond action requires an evaluated response from a preceding evaluate action"))
+            }
+            Selection::Server { server, options } => {
+                if !strategy_allows(options.strategy, query_type) {
                     return Ok(Vec::new());
                 }
-                let answer = self.query_server(&server, disable_cache, domain, query_type, options).await?;
+                let answer = self.query_server(&server, options.disable_cache, domain, query_type, &options).await?;
                 Ok(answer.addresses)
             }
         }
@@ -461,16 +1247,45 @@ impl DnsRouter {
 
     async fn lookup_legacy(&self, rules: &DnsRules, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>> {
         let mut start = 0;
+        let request = dns_query_message(domain, QTYPE_A)?;
+        let mut evaluation = DnsEvaluationState::new();
+        let mut effective_options = options.clone();
+        if effective_options.strategy == DomainStrategy::AsIs {
+            effective_options.strategy = self.strategy;
+        }
         loop {
-            let mut metadata = Self::base_metadata(domain, options);
-            let (selection, index) = self.match_rules(rules, &mut metadata, start, true, options);
-            let (server, strategy, disable_cache) = match selection {
+            let (selection, index) = self
+                .match_rules(
+                    rules,
+                    domain,
+                    QTYPE_A,
+                    start,
+                    true,
+                    options,
+                    &mut effective_options,
+                    &request,
+                    &mut evaluation,
+                )
+                .await;
+            let (server, effective_options) = match selection {
                 Selection::Reject(method) => return Err(reject_error(domain, method)),
-                Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+                Selection::Error(error) => return Err(error),
+                Selection::Respond(Some(response)) => return Ok(filter_query_addresses(response.addresses, QTYPE_A)),
+                Selection::Respond(None) => {
+                    return Err(io::Error::other(
+                        "respond action requires an evaluated response from a preceding evaluate action",
+                    ))
+                }
+                Selection::Server { server, options } => (server, options),
             };
-            let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
+            let strategy = if effective_options.strategy != DomainStrategy::AsIs {
+                effective_options.strategy
+            } else {
+                self.strategy
+            };
+            let disable_cache = effective_options.disable_cache;
             let check = index.filter(|index| rules.rules[*index].matcher.with_address_limit());
-            let metadata = Self::base_metadata(domain, options);
+            let metadata = Self::base_metadata(domain, &effective_options);
             let result = self
                 .lookup_server(
                     rules,
@@ -479,7 +1294,7 @@ impl DnsRouter {
                     disable_cache,
                     domain,
                     strategy,
-                    options,
+                    &effective_options,
                 )
                 .await;
             match (check, result) {
@@ -510,17 +1325,36 @@ impl DnsRouter {
         }
         let rules = self.rules.read().unwrap().clone();
         let mut start = 0;
+        let mut effective_options = options.clone();
+        let mut evaluation = DnsEvaluationState::new();
         loop {
-            let mut metadata = Self::base_metadata(&domain, options);
-            metadata.query_type = Some(query_type);
-            metadata.ip_version = ip_version_of(query_type);
-            let (selection, index) =
-                self.match_rules(&rules, &mut metadata, start, is_address_query(query_type), options);
-            let (server, strategy, disable_cache) = match selection {
-                Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+            let (selection, index) = self
+                .match_rules(
+                    &rules,
+                    &domain,
+                    query_type,
+                    start,
+                    is_address_query(query_type),
+                    options,
+                    &mut effective_options,
+                    request,
+                    &mut evaluation,
+                )
+                .await;
+            let (server, effective_options) = match selection {
+                Selection::Server { server, options } => (server, options),
+                Selection::Error(error) => return Err(error),
+                Selection::Respond(Some(response)) => return Ok(Some(response.raw)),
+                Selection::Respond(None) => {
+                    return Err(io::Error::other(
+                        "respond action requires an evaluated response from a preceding evaluate action",
+                    ))
+                }
                 Selection::Reject(RejectMethod::Drop) => return Ok(None),
                 Selection::Reject(_) => return response(request, ResponseCode::Refused, Vec::new()).map(Some),
             };
+            let strategy = effective_options.strategy;
+            let disable_cache = effective_options.disable_cache;
             let check = index.filter(|index| rules.legacy && rules.rules[*index].matcher.with_address_limit());
             let (result, addresses) = self
                 .exchange_with_server(
@@ -531,10 +1365,13 @@ impl DnsRouter {
                     &server,
                     strategy,
                     disable_cache,
-                    options,
+                    &effective_options,
                 )
                 .await?;
             if let Some(index) = check {
+                let mut metadata = Self::base_metadata(&domain, options);
+                metadata.query_type = Some(query_type);
+                metadata.ip_version = ip_version_of(query_type);
                 if !rules.rules[index].matcher.match_address_limit(&metadata, &addresses) {
                     tracing::debug!(domain, "dns: response rejected, trying the next rule");
                     start = index + 1;
@@ -605,6 +1442,16 @@ impl DnsRouter {
             Err(_) => Ok((Some(response(request, ResponseCode::ServFail, Vec::new())?), Vec::new())),
         }
     }
+}
+
+fn filter_query_addresses(addresses: Vec<IpAddr>, query_type: u16) -> Vec<IpAddr> {
+    addresses
+        .into_iter()
+        .filter(|address| match address {
+            IpAddr::V4(_) => query_type == QTYPE_A,
+            IpAddr::V6(_) => query_type == QTYPE_AAAA,
+        })
+        .collect()
 }
 
 /// `DNSResponseAddresses`: the A and AAAA answers of a successful response.
@@ -681,6 +1528,22 @@ fn port_or_default(port: u16) -> u16 {
     }
 }
 
+fn port_or_default_dot(port: u16) -> u16 {
+    if port == 0 {
+        853
+    } else {
+        port
+    }
+}
+
+fn port_or_default_https(port: u16) -> u16 {
+    if port == 0 {
+        443
+    } else {
+        port
+    }
+}
+
 #[async_trait]
 impl DnsResolver for DnsRouter {
     async fn lookup(&self, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>> {
@@ -717,6 +1580,10 @@ impl DnsResolver for DnsRouter {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not a DNS query"));
         }
         self.exchange_message(&request, options).await
+    }
+
+    fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        DnsRouter::reverse_lookup(self, address)
     }
 }
 

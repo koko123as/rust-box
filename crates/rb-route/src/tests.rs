@@ -20,18 +20,24 @@ impl Outbound for FakeOutbound {
 }
 
 #[derive(Default)]
-struct FakeDns(Mutex<Vec<String>>);
+struct FakeDns {
+    lookups: Mutex<Vec<String>>,
+    reverse: Mutex<std::collections::HashMap<IpAddr, String>>,
+}
 
 #[async_trait]
 impl DnsResolver for FakeDns {
     async fn lookup(&self, domain: &str, options: &LookupOptions) -> io::Result<Vec<IpAddr>> {
-        self.0.lock().unwrap().push(format!("{domain}@{}", options.server.clone().unwrap_or_default()));
+        self.lookups.lock().unwrap().push(format!("{domain}@{}", options.server.clone().unwrap_or_default()));
         Ok(vec!["10.0.0.7".parse().unwrap()])
     }
     async fn exchange(&self, query: &[u8], _options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
         let mut answer = b"answer:".to_vec();
         answer.extend_from_slice(&query[..2]);
         Ok(Some(answer))
+    }
+    fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        Ok(self.reverse.lock().unwrap().get(&address).cloned())
     }
 }
 
@@ -123,6 +129,26 @@ fn udp_context(destination: &str) -> InboundContext {
         InboundContext::new("socks-in", "socks", Network::Udp, "127.0.0.1:40000".parse().unwrap(), destination.into());
     context.inbound_udp_timeout = Some(Duration::from_millis(200));
     context
+}
+
+#[tokio::test]
+async fn fakeip_destination_is_restored_before_route_matching() {
+    let fake_address: IpAddr = "198.18.0.2".parse().unwrap();
+    let dns = Arc::new(FakeDns::default());
+    dns.reverse.lock().unwrap().insert(fake_address, "fake.example".into());
+    let router = router(r#"[{"domain":"fake.example","outbound":"direct"}]"#, dns);
+    let mut context = InboundContext::new(
+        "socks-in",
+        "socks",
+        Network::Tcp,
+        "127.0.0.1:40000".parse().unwrap(),
+        Socksaddr::new(Host::Ip(fake_address), 443),
+    );
+    let mut client = None;
+
+    assert_eq!(router.decide(&mut context, &mut client).await.unwrap(), Decision::Route("direct".into()));
+    assert_eq!(context.destination.domain(), Some("fake.example"));
+    assert_eq!(context.fake_ip_original_destination.unwrap().ip(), Some(fake_address));
 }
 
 #[tokio::test]
@@ -265,7 +291,7 @@ async fn resolve_then_match_ip() {
     let mut stream: Option<BoxStream> = None;
     let mut ctx = context("intranet.example", 80);
     assert_eq!(router.decide(&mut ctx, &mut stream).await.unwrap(), Decision::Route("direct".into()));
-    assert_eq!(dns.0.lock().unwrap().as_slice(), ["intranet.example@google"]);
+    assert_eq!(dns.lookups.lock().unwrap().as_slice(), ["intranet.example@google"]);
     // An IP destination is not resolved, and falls to the reject rule.
     let mut ctx = context("8.8.8.8", 80);
     assert!(matches!(ctx.destination.host, Host::Ip(_)));

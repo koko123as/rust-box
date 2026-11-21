@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{
-    BoxStream, CachedPacketConn, ConnectionRouter, DnsResolver, InboundContext, InboundRegistry, LookupOptions,
+    BoxStream, CachedPacketConn, ConnectionRouter, DnsResolver, Host, InboundContext, InboundRegistry, LookupOptions,
     Network, Outbound, PacketConn, PrefixedStream, RouteError, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE,
 };
 use rb_config::{RejectMethod, RouteActionOptions, RouteOptions, RuleAction};
@@ -205,6 +205,7 @@ impl Router {
         context: &mut InboundContext,
         mut input: Input<'_>,
     ) -> Result<Decision, RouteError> {
+        self.reverse_fakeip(context)?;
         let mut last_sniffers: Option<&[String]> = None;
         for (index, rule) in self.rules.iter().enumerate() {
             let matched = {
@@ -331,6 +332,16 @@ impl Router {
             )));
         }
         Ok(outbound)
+    }
+
+    /// Restores a FakeIP destination to its DNS name before route matching.
+    fn reverse_fakeip(&self, context: &mut InboundContext) -> Result<(), RouteError> {
+        let Some(address) = context.destination.ip() else { return Ok(()) };
+        let Some(domain) = self.dns.reverse_lookup(address).map_err(RouteError::Resolve)? else { return Ok(()) };
+        let port = context.destination.port;
+        context.destination = Socksaddr::new(Host::Domain(domain), port);
+        context.fake_ip_original_destination.get_or_insert_with(|| Socksaddr::new(Host::Ip(address), port));
+        Ok(())
     }
 
     /// Answers DNS over TCP on a hijacked connection (sing-box

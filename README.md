@@ -11,8 +11,8 @@ licensed GPL-3.0-or-later, like sing-box (see `LICENSE` and `COPYING`).
 ## Status
 
 Milestones 1 (the core path), 2 (UDP), 3 (dial options and outbound
-plumbing), 4 (rule-sets) and 5 (TLS and the first encrypted protocols)
-are in place:
+plumbing), 4 (rule-sets), 5 (TLS and the first encrypted protocols) and
+6 (DNS) are in place:
 
 | Area | Implemented | sing-box reference |
 |---|---|---|
@@ -29,13 +29,12 @@ are in place:
 | Certificates | top-level `certificate`: `store` `system` (default), `mozilla`, `chrome`, `none`; `certificate`, `certificate_path`, `certificate_directory_path` (watched) | `common/certificate` |
 | Rule actions | `route`, `route-options`, `bypass`, `reject`, `hijack-dns`, `sniff` (tls, http, quic, dns, stun, bittorrent, dtls, ssh, rdp, ntp), `resolve` | `route/route.go`, `common/sniff` |
 | Route options | `override_address`, `override_port` (TCP and UDP, replies mapped back), `fallback_delay`, `udp_connect`, `udp_timeout`, `udp_disable_domain_unmapping`, `tls_fragment`, `tls_fragment_fallback_delay`, `tls_record_fragment` | `route/route.go`, `common/tlsfragment` |
-| DNS | `local`, `udp`, `tcp` servers; rules (`domain*`, `query_type`, `inbound`, `rule_set`, ...) with `route` and `reject`; `final`, `strategy`, cache | `dns/` |
+| DNS | `local`, `udp`, `tcp`, `tls` (DoT), `https` (DoH), `quic` (DoQ), `h3` servers; `hosts` with predefined mappings, in-memory `fakeip`; rules with `evaluate`/`respond` and `match_response`; `final`, `strategy`, cache | `dns/` |
 | CLI | `run`, `check`, `version`; `rule-set compile`, `decompile`, `format`, `upgrade`, `merge`, `match`, `convert` (AdGuard) | `cmd/sing-box` |
 
-Not yet: TUN, other encrypted protocols (Hysteria2, TUIC, ...), TCP
-Brutal (`multiplex.brutal`), V2Ray transports (`transport`), uTLS /
-REALITY, ECH, DNS over TLS/HTTPS/QUIC, FakeIP, Clash API and
-`tls_spoof`. The `network_strategy` family of fields (dial fields,
+Not yet: TUN, Hysteria2, TUIC, TCP Brutal (`multiplex.brutal`), V2Ray
+transports (`transport`), uTLS / REALITY, ECH, Clash API and `tls_spoof`.
+The `network_strategy` family of fields (dial fields,
 route option, `route.default_network_*`) only works with a platform
 interface in sing-box's graphical clients; rust-box handles them as
 sing-box's command line does: accepted without effect, with the same
@@ -51,6 +50,14 @@ differences of each milestone) and the architecture analysis in
 TLS 1.2/1.3 only (rustls); no ALPN-mismatch fallback; proxy requests are sent
 at dial time; zero Vision padding; `multiplex.brutal` rejected; no mux error
 status; minor log wording. The full list is in `docs/roadmap.md`.
+
+### Known differences in milestone 6
+
+FakeIP mappings are in memory only (cache-file persistence is deferred to
+M9). Windows' default hosts path is built from `%SystemRoot%\System32`, unlike
+sing-box's `GetSystemDirectory` lookup. The full workspace suite passed, but
+DNS transports were not directly interoperability-tested against sing-box;
+their transport tests use local fixtures. See `docs/roadmap.md` for details.
 
 ## Build and run
 

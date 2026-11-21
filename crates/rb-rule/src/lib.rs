@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use hickory_proto::rr::Record;
 use rb_config::{DefaultHeadlessRule, DnsRuleMatch, HeadlessRule, LogicalMode, Rule, RuleMatch};
 
 use items::Item;
@@ -50,6 +51,9 @@ pub struct Metadata<'a> {
     /// The A/AAAA answers of a successful DNS response, when
     /// `destination_address_match_from_response` is set.
     pub response_addresses: &'a [IpAddr],
+    /// Anonymous and tagged DNS evaluate responses available to this rule walk.
+    pub dns_response: Option<DnsResponseMetadata<'a>>,
+    pub named_dns_responses: &'a [(&'a str, DnsResponseMetadata<'a>)],
 
     pub ip_cidr_match_source: bool,
     pub ip_cidr_accept_empty: bool,
@@ -78,6 +82,16 @@ impl Metadata<'_> {
     fn restore(&mut self, snapshot: (bool, bool, u8)) {
         (self.ip_cidr_match_source, self.ip_cidr_accept_empty, self.deferred_ip_cidr_match_groups) = snapshot;
     }
+}
+
+/// DNS response view selected by `match_response`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DnsResponseMetadata<'a> {
+    pub rcode: i32,
+    pub addresses: &'a [IpAddr],
+    pub answers: &'a [Record],
+    pub ns: &'a [Record],
+    pub extra: &'a [Record],
 }
 
 #[derive(Debug)]
@@ -130,6 +144,9 @@ pub struct DefaultMatcher {
     rule_set: Option<RuleSetItem>,
     item_count: usize,
     invert: bool,
+    /// `None` means ordinary matching; `Some("")` selects the anonymous
+    /// evaluate response and a nonempty string selects its named slot.
+    response_tag: Option<String>,
     /// The items' descriptions in the order they were added (`String()`).
     descriptions: Vec<String>,
 }
@@ -147,6 +164,31 @@ impl DefaultMatcher {
 
     /// `abstractDefaultRule.Match`.
     pub fn matches(&self, metadata: &mut Metadata) -> bool {
+        if let Some(tag) = &self.response_tag {
+            let response = if tag.is_empty() {
+                metadata.dns_response
+            } else {
+                metadata
+                    .named_dns_responses
+                    .iter()
+                    .find_map(|(response_tag, response)| (*response_tag == tag).then_some(*response))
+            };
+            let Some(response) = response else {
+                metadata.deferred_ip_cidr_match_groups = 0;
+                return self.invert;
+            };
+            let mut response_metadata = metadata.clone();
+            response_metadata.response_addresses = response.addresses;
+            response_metadata.destination_address_match_from_response = true;
+            response_metadata.dns_response = Some(response);
+            let matched = self.matches_with_metadata(&mut response_metadata);
+            metadata.deferred_ip_cidr_match_groups = response_metadata.deferred_ip_cidr_match_groups;
+            return matched;
+        }
+        self.matches_with_metadata(metadata)
+    }
+
+    fn matches_with_metadata(&self, metadata: &mut Metadata) -> bool {
         if self.item_count == 0 && self.rule_set.is_none() {
             return true;
         }
@@ -531,6 +573,32 @@ fn add_query_types(matcher: &mut DefaultMatcher, query_types: &[rb_config::types
     }
 }
 
+fn dns_response_code_name(rcode: i32) -> &'static str {
+    match rcode {
+        0 => "NOERROR",
+        1 => "FORMERR",
+        2 => "SERVFAIL",
+        3 => "NXDOMAIN",
+        4 => "NOTIMP",
+        5 => "REFUSED",
+        6 => "YXDOMAIN",
+        7 => "YXRRSET",
+        8 => "NXRRSET",
+        9 => "NOTAUTH",
+        10 => "NOTZONE",
+        11 => "DSOTYPENI",
+        16 => "BADVERS",
+        17 => "BADKEY",
+        18 => "BADTIME",
+        19 => "BADMODE",
+        20 => "BADNAME",
+        21 => "BADALG",
+        22 => "BADTRUNC",
+        23 => "BADCOOKIE",
+        _ => "",
+    }
+}
+
 /// Compiles a route rule's match fields (sing-box `NewDefaultRule`).
 pub fn compile_route_match(options: &RuleMatch, context: &Context) -> Result<DefaultMatcher, RuleError> {
     let mut matcher = DefaultMatcher { invert: options.invert, ..Default::default() };
@@ -584,7 +652,8 @@ pub fn compile_route_match(options: &RuleMatch, context: &Context) -> Result<Def
 
 /// Compiles a DNS rule's match fields (sing-box `NewDefaultDNSRule`).
 pub fn compile_dns_match(options: &DnsRuleMatch, context: &Context) -> Result<DefaultMatcher, RuleError> {
-    let mut matcher = DefaultMatcher { invert: options.invert, ..Default::default() };
+    let response_tag = options.match_response.enabled.then(|| options.match_response.tag.clone());
+    let mut matcher = DefaultMatcher { invert: options.invert, response_tag, ..Default::default() };
     add_sets(&mut matcher, "inbound", &options.inbound.0, Item::Inbound);
     add_ip_version(&mut matcher, options.ip_version)?;
     add_query_types(&mut matcher, &options.query_type.0);
@@ -612,6 +681,28 @@ pub fn compile_dns_match(options: &DnsRuleMatch, context: &Context) -> Result<De
     }
     if options.ip_accept_any {
         matcher.push(|m| &mut m.destination_ip_cidr, Item::IpAcceptAny, "ip_accept_any=true".into());
+    }
+    if let Some(rcode) = options.response_rcode {
+        matcher.push(
+            |m| &mut m.items,
+            Item::ResponseRcode(rcode.0),
+            format!("response_rcode={}", dns_response_code_name(rcode.0)),
+        );
+    }
+    for (field, records, section) in [
+        ("response_answer", &options.response_answer.0, items::ResponseSection::Answer),
+        ("response_ns", &options.response_ns.0, items::ResponseSection::Ns),
+        ("response_extra", &options.response_extra.0, items::ResponseSection::Extra),
+    ] {
+        if !records.is_empty() {
+            let parsed_records =
+                records.iter().map(|record| items::parse_dns_record(record, field)).collect::<Result<Vec<_>, _>>()?;
+            let description = format!(
+                "{field}=[{}]",
+                parsed_records.iter().map(items::describe_dns_record).collect::<Vec<_>>().join(" ")
+            );
+            matcher.push(|m| &mut m.items, Item::ResponseRecord { section, records: parsed_records }, description);
+        }
     }
     add_ports(
         &mut matcher,

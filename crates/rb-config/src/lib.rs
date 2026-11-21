@@ -24,15 +24,15 @@ use serde_json::Value;
 
 pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrategy};
 pub use rule::{
-    DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule,
-    Rule, RuleAction, RuleMatch, SNIFFERS,
+    DnsMatchResponse, DnsRecordOptions, DnsResponseCode, DnsRouteActionOptions, DnsRule, DnsRuleAction, DnsRuleMatch,
+    LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule, Rule, RuleAction, RuleMatch, SNIFFERS,
 };
 pub use rule_set::{
     DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,
     RuleSetKind, RuleSetOptions,
 };
 pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions};
-pub use types::{DomainResolveOptions, DomainStrategy, Duration, Listable, QueryType, UdpTimeout, User};
+pub use types::{DomainResolveOptions, DomainStrategy, Duration, IpPrefix, Listable, QueryType, UdpTimeout, User};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -199,6 +199,18 @@ pub enum DnsServer {
     Udp(RemoteDnsServer),
     #[serde(rename = "tcp")]
     Tcp(RemoteDnsServer),
+    #[serde(rename = "tls")]
+    Tls(Box<RemoteTlsDnsServer>),
+    #[serde(rename = "quic")]
+    Quic(Box<RemoteTlsDnsServer>),
+    #[serde(rename = "https")]
+    Https(Box<RemoteHttpsDnsServer>),
+    #[serde(rename = "h3")]
+    Http3(Box<RemoteHttpsDnsServer>),
+    #[serde(rename = "hosts")]
+    Hosts(HostsDnsServer),
+    #[serde(rename = "fakeip")]
+    FakeIp(FakeIpDnsServer),
 }
 
 impl DnsServer {
@@ -206,13 +218,17 @@ impl DnsServer {
         match self {
             DnsServer::Local { tag } => tag,
             DnsServer::Udp(server) | DnsServer::Tcp(server) => &server.tag,
+            DnsServer::Tls(server) | DnsServer::Quic(server) => &server.tag,
+            DnsServer::Https(server) | DnsServer::Http3(server) => &server.tag,
+            DnsServer::Hosts(server) => &server.tag,
+            DnsServer::FakeIp(server) => &server.tag,
         }
     }
 }
 
 with_dial_fields! {
     /// sing-box `RemoteDNSServerOptions` with its dial fields (the server
-    /// must be an IP address in rust-box).
+    /// for `udp` and `tcp` must be an IP address in rust-box).
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct RemoteDnsServer {
@@ -222,6 +238,66 @@ with_dial_fields! {
         #[serde(default)]
         pub server_port: u16,
     }
+}
+
+with_dial_fields! {
+    /// sing-box `RemoteTLSDNSServerOptions` (DNS over TLS).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RemoteTlsDnsServer {
+        #[serde(default)]
+        pub tag: String,
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `RemoteHTTPSDNSServerOptions` (DNS over HTTPS).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RemoteHttpsDnsServer {
+        #[serde(default)]
+        pub tag: String,
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub path: String,
+        #[serde(default)]
+        pub method: String,
+        #[serde(default)]
+        pub headers: std::collections::BTreeMap<String, Listable<String>>,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+    }
+}
+
+/// sing-box `HostsDNSServerOptions`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostsDnsServer {
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub path: Listable<String>,
+    #[serde(default)]
+    pub predefined: Option<std::collections::BTreeMap<String, Listable<IpAddr>>>,
+}
+
+/// sing-box `FakeIPDNSServerOptions`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeIpDnsServer {
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub inet4_range: Option<IpPrefix>,
+    #[serde(default)]
+    pub inet6_range: Option<IpPrefix>,
 }
 
 /// Inbounds (sing-box `option.Inbound`).
@@ -943,6 +1019,57 @@ pub struct RouteOptions {
     pub default_fallback_delay: Duration,
 }
 
+fn validate_hosts_predefined(value: &Value) -> Result<(), ConfigError> {
+    let Some(servers) = value.get("dns").and_then(|dns| dns.get("servers")).and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, server) in servers.iter().enumerate() {
+        if server.get("type").and_then(Value::as_str) != Some("hosts") {
+            continue;
+        }
+        let Some(predefined) = server.get("predefined").and_then(Value::as_object) else { continue };
+        for (domain, addresses) in predefined {
+            let invalid = match addresses {
+                Value::String(address) => address.parse::<IpAddr>().is_err(),
+                Value::Array(values) => {
+                    values.iter().filter_map(Value::as_str).any(|address| address.parse::<IpAddr>().is_err())
+                }
+                _ => false,
+            };
+            if invalid {
+                return Err(ConfigError::Field {
+                    path: format!("dns.servers[{index}].predefined.{domain}"),
+                    message: "invalid IP address syntax".into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fakeip_ranges(value: &Value) -> Result<(), ConfigError> {
+    let Some(servers) = value.get("dns").and_then(|dns| dns.get("servers")).and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, server) in servers.iter().enumerate() {
+        if server.get("type").and_then(Value::as_str) != Some("fakeip") {
+            continue;
+        }
+        for field in ["inet4_range", "inet6_range"] {
+            let Some(range) = server.get(field) else { continue };
+            let result = match range {
+                Value::Null => continue,
+                Value::String(prefix) => prefix.parse::<IpPrefix>().map(|_| ()).map_err(|error| error.to_string()),
+                other => serde_json::from_value::<String>(other.clone()).map(|_| ()).map_err(|error| error.to_string()),
+            };
+            if let Err(message) = result {
+                return Err(ConfigError::Field { path: format!("dns.servers[{index}].{field}"), message });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses a configuration, naming the path of a field that fails.
 pub fn parse(content: &str) -> Result<Options, ConfigError> {
     let clean = strip_json_comments(content.as_bytes()).map_err(ConfigError::Unsupported)?;
@@ -954,6 +1081,8 @@ pub fn parse(content: &str) -> Result<Options, ConfigError> {
             }
         }
     }
+    validate_hosts_predefined(&value)?;
+    validate_fakeip_ranges(&value)?;
     let options: Options = serde_path_to_error::deserialize(value)
         .map_err(|error| ConfigError::Field { path: error.path().to_string(), message: error.inner().to_string() })?;
     options.validate()?;
@@ -1170,18 +1299,80 @@ impl Options {
             self.check_dialer(&path, &direct.dialer_options(), &server_known)?;
         }
         for (index, server) in self.dns.servers.iter().enumerate() {
-            if let DnsServer::Udp(remote) | DnsServer::Tcp(remote) = server {
-                self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+            match server {
+                DnsServer::Udp(remote) | DnsServer::Tcp(remote) => {
+                    self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+                }
+                DnsServer::Tls(remote) | DnsServer::Quic(remote) => {
+                    self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+                    if let Some(tls) = &remote.tls {
+                        // sing-box forces TLS on for `type: tls` and `type: quic`,
+                        // even when `enabled` is absent or false.
+                        let mut tls = tls.clone();
+                        tls.enabled = true;
+                        tls.validate(&format!("dns.servers[{index}].tls"))?;
+                    }
+                }
+                DnsServer::Https(remote) | DnsServer::Http3(remote) => {
+                    self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
+                    if let Some(tls) = &remote.tls {
+                        // sing-box forces TLS on for `type: https` and `type: h3` DNS servers.
+                        let mut tls = tls.clone();
+                        tls.enabled = true;
+                        tls.validate(&format!("dns.servers[{index}].tls"))?;
+                    }
+                }
+                _ => {}
             }
         }
         if !self.dns.r#final.is_empty() && !server_known(&self.dns.r#final) {
             return Err(field("dns.final".into(), format!("DNS server not found: {}", self.dns.r#final)));
         }
+        let check_dns_route_options = |path: &str, options: &rule::DnsRouteActionOptions| {
+            if options.client_subnet.is_some() {
+                return Err(field(
+                    format!("{path}.client_subnet"),
+                    "`client_subnet` is not supported by rust-box yet".into(),
+                ));
+            }
+            if options.remove_client_subnet {
+                return Err(field(
+                    format!("{path}.remove_client_subnet"),
+                    "`remove_client_subnet` is not supported by rust-box yet".into(),
+                ));
+            }
+            Ok(())
+        };
         for (index, rule) in self.dns.rules.iter().enumerate() {
-            if let Some(DnsRuleAction::Route { server, .. }) = rule.action() {
-                if !server_known(server) {
-                    return Err(field(format!("dns.rules[{index}]"), format!("DNS server not found: {server}")));
+            let path = format!("dns.rules[{index}]");
+            match rule.action() {
+                Some(DnsRuleAction::Route { server, options, .. }) => {
+                    if !server_known(server) {
+                        return Err(field(path, format!("DNS server not found: {server}")));
+                    }
+                    check_dns_route_options(&path, options)?;
                 }
+                Some(DnsRuleAction::Evaluate { server, options, .. }) => {
+                    if server.is_empty() {
+                        return Err(field(path, "missing server field".into()));
+                    }
+                    if !server_known(server) {
+                        return Err(field(path, format!("DNS server not found: {server}")));
+                    }
+                    let fakeip = self.dns.servers.iter().enumerate().any(|(server_index, candidate)| {
+                        let tag = if candidate.tag().is_empty() {
+                            server_index.to_string()
+                        } else {
+                            candidate.tag().to_string()
+                        };
+                        tag == *server && matches!(candidate, DnsServer::FakeIp(_))
+                    });
+                    if fakeip {
+                        return Err(field(path, format!("evaluate action cannot use fakeip server: {server}")));
+                    }
+                    check_dns_route_options(&path, options)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1294,6 +1485,85 @@ mod tests {
         assert_eq!(options.dns.servers[1].tag(), "google");
         assert_eq!(options.route.rules.len(), 3);
         assert_eq!(options.dns.strategy, DomainStrategy::PreferIpv4);
+    }
+
+    #[test]
+    fn hosts_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"hosts","tag":"hosts","path":["/etc/hosts","$HOME/.hosts"],
+                "predefined":{"localhost":"127.0.0.1","dual":["127.0.0.1","::1"]}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[0].tag(), "hosts");
+        let DnsServer::Hosts(hosts) = &options.dns.servers[0] else { panic!() };
+        assert_eq!(hosts.path.0, vec!["/etc/hosts", "$HOME/.hosts"]);
+        let predefined = hosts.predefined.as_ref().unwrap();
+        assert_eq!(predefined["localhost"].0, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(predefined["dual"].0, vec!["127.0.0.1".parse::<IpAddr>().unwrap(), "::1".parse().unwrap()]);
+
+        let error = parse(r#"{"dns":{"servers":[{"type":"hosts","unknown":true}]}}"#).unwrap_err().to_string();
+        assert!(error.contains("dns.servers[0]") && error.contains("unknown field"), "{error}");
+        let error = parse(r#"{"dns":{"servers":[{"type":"hosts","predefined":{"bad":"not-an-ip"}}]}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dns.servers[0].predefined.bad"), "{error}");
+    }
+
+    #[test]
+    fn fakeip_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15",
+                "inet6_range":"2001:2::/48"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[0].tag(), "fake");
+        let DnsServer::FakeIp(fakeip) = &options.dns.servers[0] else { panic!() };
+        assert_eq!(fakeip.inet4_range.unwrap().prefix_len, 15);
+        assert_eq!(fakeip.inet6_range.unwrap().prefix_len, 48);
+
+        for (config, field) in [
+            (r#"{"dns":{"servers":[{"type":"fakeip","inet4_range":"not-a-cidr"}]}}"#, "inet4_range"),
+            (r#"{"dns":{"servers":[{"type":"fakeip","inet4_range":"198.18.0.0/33"}]}}"#, "inet4_range"),
+            (r#"{"dns":{"servers":[{"type":"fakeip","unknown":true}]}}"#, "unknown"),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains("dns.servers[0]") && error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn dns_evaluate_validates_server_and_unsupported_route_options() {
+        parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"}],
+                "rules":[{"domain":"example.com","action":"evaluate","server":"local"} ]}}"#,
+        )
+        .unwrap();
+
+        for (config, expected) in [
+            (r#"{"dns":{"rules":[{"action":"evaluate"}]}}"#, "dns.rules[0]: missing server field"),
+            (
+                r#"{"dns":{"rules":[{"action":"evaluate","server":"missing"}]}}"#,
+                "dns.rules[0]: DNS server not found: missing",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15"}],
+                    "rules":[{"action":"evaluate","server":"fake"}]}}"#,
+                "evaluate action cannot use fakeip server: fake",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"}],
+                    "rules":[{"action":"evaluate","server":"local","client_subnet":"192.0.2.0/24"}]}}"#,
+                "dns.rules[0].client_subnet: `client_subnet` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"}],
+                    "rules":[{"action":"route","server":"local","remove_client_subnet":true}]}}"#,
+                "dns.rules[0].remove_client_subnet: `remove_client_subnet` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
     }
 
     #[test]
@@ -1429,6 +1699,136 @@ mod tests {
         assert_eq!(options.route.default_mark, FwMark(7));
         let DnsServer::Udp(remote) = &options.dns.servers[1] else { panic!() };
         assert_eq!(remote.dialer_options().detour, "d2");
+    }
+
+    #[test]
+    fn tls_dns_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"tls","tag":"dot","server":"dns.example","domain_resolver":"local",
+                 "tls":{"server_name":"dns.example","alpn":[]}}]}}"#,
+        )
+        .unwrap();
+        let DnsServer::Tls(server) = &options.dns.servers[1] else { panic!() };
+        assert_eq!(server.server, "dns.example");
+        assert_eq!(server.server_port, 0);
+        assert_eq!(server.dialer_options().domain_resolver.unwrap().server, "local");
+        assert_eq!(server.tls.as_ref().unwrap().server_name, "dns.example");
+        assert!(server.tls.as_ref().unwrap().alpn.is_empty());
+
+        let error = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"tls","server":"dns.example","domain_resolver":"local",
+                 "tls":{"utls":{"enabled":true}}}]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dns.servers[1].tls.utls: `utls` is not supported by rust-box yet"), "{error}");
+
+        let error =
+            parse(r#"{"dns":{"servers":[{"type":"tls","server":"1.1.1.1","unknown":true}]}}"#).unwrap_err().to_string();
+        assert!(error.contains("unknown field `unknown`"), "{error}");
+    }
+
+    #[test]
+    fn quic_dns_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"quic","tag":"doq","server":"dns.example","domain_resolver":"local",
+                 "tls":{"server_name":"dns.example","alpn":[]}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[1].tag(), "doq");
+        let DnsServer::Quic(server) = &options.dns.servers[1] else { panic!() };
+        assert_eq!(server.server, "dns.example");
+        assert_eq!(server.server_port, 0);
+        assert_eq!(server.dialer_options().domain_resolver.unwrap().server, "local");
+        assert!(server.tls.as_ref().unwrap().alpn.is_empty());
+
+        for (config, needle) in [
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                    {"type":"quic","server":"dns.example","domain_resolver":"local",
+                     "tls":{"utls":{"enabled":true}}}]}}"#,
+                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+            ),
+            (r#"{"dns":{"servers":[{"type":"quic","server":"1.1.1.1","unknown":true}]}}"#, "unknown field `unknown`"),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn https_dns_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"https","tag":"doh","server":"dns.example","domain_resolver":"local",
+                 "server_port":8443,"path":"/custom-query","method":"GET",
+                 "headers":{"Host":"resolver.example","X-Mode":["one","two"]},
+                 "tls":{"server_name":"tls.example","alpn":[]}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[1].tag(), "doh");
+        let DnsServer::Https(server) = &options.dns.servers[1] else { panic!() };
+        assert_eq!((server.server.as_str(), server.server_port), ("dns.example", 8443));
+        assert_eq!(server.path, "/custom-query");
+        assert_eq!(server.method, "GET");
+        assert_eq!(server.headers["Host"].0, vec!["resolver.example"]);
+        assert_eq!(server.headers["X-Mode"].0, vec!["one", "two"]);
+        assert_eq!(server.dialer_options().domain_resolver.unwrap().server, "local");
+        assert_eq!(server.tls.as_ref().unwrap().server_name, "tls.example");
+        assert!(server.tls.as_ref().unwrap().alpn.is_empty());
+
+        for (config, needle) in [
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                    {"type":"https","server":"dns.example","domain_resolver":"local",
+                     "tls":{"utls":{"enabled":true}}}]}}"#,
+                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"https","server":"dns.example","unknown":true}]}}"#,
+                "unknown field `unknown`",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn http3_dns_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"h3","tag":"h3","server":"dns.example","domain_resolver":"local",
+                 "path":"/custom","method":"GET","headers":{"Host":"resolver.example"},
+                 "tls":{"server_name":"tls.example","alpn":["h2"]}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[1].tag(), "h3");
+        let DnsServer::Http3(server) = &options.dns.servers[1] else { panic!() };
+        assert_eq!(
+            (server.server.as_str(), server.path.as_str(), server.method.as_str()),
+            ("dns.example", "/custom", "GET")
+        );
+        assert_eq!(server.headers["Host"].0, vec!["resolver.example"]);
+        assert_eq!(server.dialer_options().domain_resolver.unwrap().server, "local");
+        assert_eq!(server.tls.as_ref().unwrap().server_name, "tls.example");
+        assert_eq!(server.tls.as_ref().unwrap().alpn.0, vec!["h2"]);
+
+        for (config, needle) in [
+            (
+                r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                    {"type":"h3","server":"dns.example","domain_resolver":"local",
+                     "tls":{"utls":{"enabled":true}}}]}}"#,
+                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+            ),
+            (r#"{"dns":{"servers":[{"type":"h3","server":"1.1.1.1","unknown":true}]}}"#, "unknown field `unknown`"),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
     }
 
     #[test]

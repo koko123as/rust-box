@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{Name, RData, Record};
 use rb_config::{DnsRule, DnsRuleAction, HeadlessRule, RouteRule, RuleAction};
 
 use super::*;
@@ -287,4 +289,73 @@ fn rule_set_metadata_flags() {
     );
     let pure = rule_set_metadata(&rules[..1]);
     assert!(pure.contains_ip_cidr_rule && !pure.contains_non_ip_cidr_rule);
+}
+
+fn test_a_record(name: &str, ttl: u32) -> Record {
+    Record::from_rdata(Name::from_ascii(name).unwrap(), ttl, RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 1))))
+}
+
+#[test]
+fn dns_match_response_selects_anonymous_or_tagged_record_and_rcode() {
+    let rule = dns_with(
+        &RuleSets::new(),
+        r#"{"match_response":"lookup","response_rcode":"NOERROR",
+            "response_answer":["example.com. IN A 192.0.2.1"],"action":"reject"}"#,
+        false,
+    );
+    let answers = [test_a_record("EXAMPLE.COM.", 7)];
+    let tagged = DnsResponseMetadata { rcode: 0, answers: &answers, ..Default::default() };
+    let named_responses = [("lookup", tagged)];
+    let mut metadata = Metadata { named_dns_responses: &named_responses, ..Default::default() };
+    assert!(rule.matches(&mut metadata), "record comparison must ignore TTL and DNS-name case");
+
+    let other_tag = [("other", tagged)];
+    let mut metadata = Metadata { named_dns_responses: &other_tag, ..Default::default() };
+    assert!(!rule.matches(&mut metadata));
+
+    let mismatch = DnsResponseMetadata { rcode: 3, answers: &answers, ..Default::default() };
+    let named_responses = [("lookup", mismatch)];
+    let mut metadata = Metadata { named_dns_responses: &named_responses, ..Default::default() };
+    assert!(!rule.matches(&mut metadata));
+
+    let anonymous_rule = dns_with(
+        &RuleSets::new(),
+        r#"{"match_response":true,"response_answer":["example.com. 60 IN A 192.0.2.1"],"action":"reject"}"#,
+        false,
+    );
+    let mut metadata = Metadata { dns_response: Some(tagged), ..Default::default() };
+    assert!(anonymous_rule.matches(&mut metadata));
+}
+
+#[test]
+fn dns_match_response_handles_wire_records_missing_responses_and_invalid_records() {
+    let binary_rule = dns_with(
+        &RuleSets::new(),
+        r#"{"match_response":true,"response_answer":["B2V4YW1wbGUDY29tAAABAAEAAAA8AATAAAIB"],"action":"reject"}"#,
+        false,
+    );
+    let answers = [test_a_record("example.com.", 300)];
+    let response = DnsResponseMetadata { answers: &answers, ..Default::default() };
+    let mut metadata = Metadata { dns_response: Some(response), ..Default::default() };
+    assert!(binary_rule.matches(&mut metadata));
+
+    let normal =
+        dns_with(&RuleSets::new(), r#"{"match_response":true,"response_rcode":"NOERROR","action":"reject"}"#, false);
+    assert!(!normal.matches(&mut Metadata::default()));
+    let inverted = dns_with(
+        &RuleSets::new(),
+        r#"{"match_response":true,"response_rcode":"NOERROR","invert":true,"action":"reject"}"#,
+        false,
+    );
+    assert!(inverted.matches(&mut Metadata::default()));
+
+    let sets = RuleSets::new();
+    let context = Context::new(&sets);
+    for (record, expected) in [("not an RR", "bad DNS record"), ("AAAA", "parse binary DNS record")] {
+        let rule: DnsRule =
+            json(&format!(r#"{{"match_response":true,"response_answer":["{record}"],"action":"reject"}}"#));
+        let Rule::Default { matcher, .. } = rule else { panic!("expected default rule") };
+        let error = compile_dns_match(&matcher, &context).unwrap_err();
+        assert!(error.0.contains(expected), "{record}: {error}");
+    }
 }

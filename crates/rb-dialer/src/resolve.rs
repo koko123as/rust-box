@@ -203,6 +203,14 @@ impl PacketConn for NatPacketConn {
     async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
         self.inner.write_packet(data, self.to_resolved.get(address).unwrap_or(address)).await
     }
+
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
 }
 
 #[cfg(test)]

@@ -263,3 +263,17 @@ sing-box v1.14.4 binary in both directions (`SING_BOX_BIN`).
   (such as shadowsocks) entirely.
 - vmess tests inject a clock into the AEAD timestamp check; the runtime uses
   real time, as sing-vmess does.
+
+## Known differences in milestone 6
+
+- FakeIP address/domain mappings and allocation cursors live only in process
+  memory. They are not saved to or restored from `experimental.cache_file`;
+  that persistence work is deferred to milestone 9.
+- On Windows, the default hosts path is built from `%SystemRoot%\\System32\\Drivers\\etc\\hosts`;
+  sing-box uses `GetSystemDirectory`. WOW64 path behavior may therefore differ
+  and has not been verified on Windows.
+- The full workspace suite passed, including its existing sing-box CLI/proxy
+  interoperability cases, but there is no dedicated DNS transport-to-transport
+  interoperability test against sing-box v1.14.4. DoT/DoH/DoQ/DoH3 transport
+  tests use local fixtures; live public resolvers and non-Linux platforms have
+  not been verified.

@@ -2,10 +2,42 @@
 //! `sing/common/json/badoption`.
 
 use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
 use std::time::Duration as StdDuration;
 
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
+
+/// An IP network prefix accepted by sing-box's `badoption.Prefix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpPrefix {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl FromStr for IpPrefix {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix_len) =
+            value.split_once('/').ok_or_else(|| format!("invalid IP prefix {value:?}: missing prefix length"))?;
+        let address = address.parse::<IpAddr>().map_err(|error| format!("invalid IP prefix {value:?}: {error}"))?;
+        let prefix_len = prefix_len.parse::<u8>().map_err(|error| format!("invalid IP prefix {value:?}: {error}"))?;
+        let max_prefix_len = if address.is_ipv4() { 32 } else { 128 };
+        if prefix_len > max_prefix_len {
+            return Err(format!("invalid IP prefix {value:?}: prefix length exceeds {max_prefix_len}"));
+        }
+        Ok(IpPrefix { address, prefix_len })
+    }
+}
+
+impl<'de> Deserialize<'de> for IpPrefix {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
+    }
+}
 
 /// A value that may be written as a single item or as an array
 /// (sing-box `badoption.Listable`).

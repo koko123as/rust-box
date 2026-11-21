@@ -11,10 +11,20 @@ rb-config.workspace = true
 rb-adapter.workspace = true
 rb-rule.workspace = true
 rb-dialer.workspace = true
+rb-certificate.workspace = true
+rb-tls.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 hickory-proto.workspace = true
+h2.workspace = true
+http.workspace = true
+bytes.workspace = true
+httparse.workspace = true
+flate2.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

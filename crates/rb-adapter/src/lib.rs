@@ -135,6 +135,8 @@ pub struct InboundContext {
     /// The destination before `override_address`/`override_port` (sing-box
     /// `metadata.RouteOriginalDestination`).
     pub route_original_destination: Option<Socksaddr>,
+    /// The synthetic FakeIP endpoint before it is restored to a domain.
+    pub fake_ip_original_destination: Option<Socksaddr>,
     /// `fallback_delay` from a matched route action.
     pub fallback_delay: Option<Duration>,
     /// `tls_fragment` from a matched route action.
@@ -171,6 +173,7 @@ impl InboundContext {
             inbound_detour: None,
             last_inbound: None,
             route_original_destination: None,
+            fake_ip_original_destination: None,
             fallback_delay: None,
             tls_fragment: false,
             tls_fragment_fallback_delay: None,
@@ -271,6 +274,17 @@ pub trait PacketConn: Send + Sync {
     /// the packet's length and address.
     async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)>;
     async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()>;
+
+    /// The local UDP socket address, when the underlying packet connection
+    /// exposes one.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// The connected UDP peer, when the packet connection has one.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 pub type SharedPacketConn = Arc<dyn PacketConn>;
@@ -302,6 +316,14 @@ impl PacketConn for CachedPacketConn {
 
     async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
         self.inner.write_packet(data, address).await
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
     }
 }
 
@@ -393,6 +415,13 @@ pub trait DnsResolver: Send + Sync {
     async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
         let _ = (query, options);
         Err(io::Error::new(io::ErrorKind::Unsupported, "DNS exchange is not supported"))
+    }
+
+    /// Resolves an address previously allocated by a synthetic DNS server.
+    /// Implementations without reverse mappings return `Ok(None)`.
+    fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        let _ = address;
+        Ok(None)
     }
 }
 
