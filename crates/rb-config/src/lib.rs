@@ -2193,7 +2193,7 @@ mod tests {
 
         for (config, needle) in [
             (
-                r#"{"inbounds":[{"type":"trojan","transport":{"type":"ws","path":"/"}}]}"#,
+                r#"{"inbounds":[{"type":"trojan","transport":{"type":"http","path":"/"}}]}"#,
                 "inbounds[0].transport: `transport` is not supported by rust-box yet",
             ),
             (r#"{"inbounds":[{"type":"trojan","transport":{}}]}"#, "unknown transport type: "),
