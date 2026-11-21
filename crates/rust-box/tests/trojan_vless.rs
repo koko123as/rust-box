@@ -526,14 +526,13 @@ fn build_errors() {
             json!({"inbounds": [{"type": "trojan", "fallback_for_alpn": {"h2": {"server": "127.0.0.1"}}}]}),
             "fallback for ALPN is not supported without TLS",
         ),
-        (
-            json!({"inbounds": [{"type": "vless", "transport": {"type": "http"}}]}),
-            "`transport` is not supported by rust-box yet",
-        ),
     ] {
         let error = build(config.clone());
         assert!(error.contains(needle), "{config}: {error}");
     }
+    let http_config = json!({"inbounds": [{"type": "vless", "transport": {"type": "http"}}]});
+    let error = build(http_config.clone());
+    assert!(error.is_empty(), "{http_config}: {error}");
 }
 
 // ---- interop with the real sing-box ----
