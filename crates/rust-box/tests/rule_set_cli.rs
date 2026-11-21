@@ -155,3 +155,45 @@ fn convert_matches_sing_box() {
     let output = rust_box(&["rule-set", "convert", "-t", "x", data("adguard.txt").to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported source type: x"));
 }
+
+/// Empty lists as sing-box's decoder sees them (outputs taken from the real
+/// binary): `[]` is unset, and a rule list of only empty rules is no list.
+#[test]
+fn empty_lists_match_sing_box() {
+    let cases = [
+        (r#"{"version":3,"rules":[{}]}"#, r#"{"version":3}"#, ""),
+        (r#"{"version":3,"rules":[{"domain":[]}]}"#, r#"{"version":3}"#, ""),
+        (r#"{"version":3,"rules":[{},{}]}"#, r#"{"version":3}"#, ""),
+        (r#"{"version":3,"rules":[{"type":"default"}]}"#, r#"{"version":3}"#, ""),
+        (
+            r#"{"version":3,"rules":[{"domain":[]},{"domain":"a"}]}"#,
+            r#"{"version":3,"rules":[{},{"domain":"a"}]}"#,
+            "parse rule_set.rules.[0]: missing conditions",
+        ),
+        (
+            r#"{"version":3,"rules":[{"domain":[],"invert":true}]}"#,
+            r#"{"version":3,"rules":[{"invert":true}]}"#,
+            "parse rule_set.rules.[0]: missing conditions",
+        ),
+        (
+            r#"{"version":3,"rules":[{"type":"logical","mode":"and","rules":[{}]}]}"#,
+            r#"{"version":3,"rules":[{"type":"logical","mode":"and"}]}"#,
+            "parse rule_set.rules.[0]: missing conditions",
+        ),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("e.json");
+    for (source, formatted, error) in cases {
+        std::fs::write(&path, source).unwrap();
+        let output = ok(&["rule-set", "format", path.to_str().unwrap()]);
+        let compact: String = String::from_utf8(output.stdout).unwrap().split_whitespace().collect();
+        assert_eq!(compact, formatted, "{source}");
+        let output = rust_box(&["rule-set", "match", path.to_str().unwrap(), "a.com"]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if error.is_empty() {
+            assert!(output.status.success() && stderr.is_empty(), "{source}: {stderr}");
+        } else {
+            assert!(!output.status.success() && stderr.contains(error), "{source}: {stderr}");
+        }
+    }
+}

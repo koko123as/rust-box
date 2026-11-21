@@ -56,7 +56,11 @@ jobs:
       - name: Android linker from the runner's NDK
         if: matrix.target == 'aarch64-linux-android'
         run: |
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          # ring (rustls) compiles C and assembly for the target.
+          echo "CC_aarch64_linux_android=$bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target ${{ matrix.target }} -p rust-box
       - uses: actions/upload-artifact@v4
         with:

@@ -318,9 +318,7 @@ impl HeadlessRule {
                 let mode = take_string(&mut object, "mode", "option.LogicalHeadlessRule.mode")?;
                 let rules = match object.remove("rules") {
                     None | Some(Value::Null) => Vec::new(),
-                    Some(Value::Array(items)) => {
-                        items.into_iter().map(HeadlessRule::from_value).collect::<Result<_, _>>()?
-                    }
+                    Some(Value::Array(items)) => parse_rules(items)?,
                     Some(other) => {
                         return Err(format!(
                             "json: cannot unmarshal {} into Go struct field LogicalHeadlessRule.rules of type []option.HeadlessRule",
@@ -394,6 +392,19 @@ fn take_string(object: &mut Map<String, Value>, key: &str, field: &str) -> Resul
     }
 }
 
+/// A `[]option.HeadlessRule` list. sing-box's decoder leaves the list
+/// empty when every item decodes to an empty default rule (`[{}]`,
+/// `[{"domain":[]}]`, `[{"type":"default"}]`), while one real rule keeps
+/// the empty ones beside it (which then fail with "missing conditions").
+fn parse_rules(items: Vec<Value>) -> Result<Vec<HeadlessRule>, String> {
+    let rules: Vec<HeadlessRule> = items.into_iter().map(HeadlessRule::from_value).collect::<Result<_, _>>()?;
+    let empty = HeadlessRule::Default(DefaultHeadlessRule::default());
+    if rules.iter().all(|rule| *rule == empty) {
+        return Ok(Vec::new());
+    }
+    Ok(rules)
+}
+
 /// `option.PlainRuleSet`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlainRuleSet {
@@ -404,7 +415,7 @@ impl PlainRuleSet {
     fn from_object(mut object: Map<String, Value>) -> Result<Self, String> {
         let rules = match object.remove("rules") {
             None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => items.into_iter().map(HeadlessRule::from_value).collect::<Result<_, _>>()?,
+            Some(Value::Array(items)) => parse_rules(items)?,
             Some(other) => {
                 return Err(format!(
                     "json: cannot unmarshal {} into Go struct field PlainRuleSet.rules of type []option.HeadlessRule",
@@ -711,6 +722,14 @@ mod tests {
         assert!(PlainRuleSetCompat::parse(br#"{"version":1,"rules":[{"outbound":"x"}]}"#).is_err());
         assert!(PlainRuleSetCompat::parse(br#"{"version":1,"extra":1}"#).is_err());
         let rule = HeadlessRule::from_value(serde_json::json!({"invert": true})).unwrap();
+        // All-empty rule lists decode as no rules, as in sing-box.
+        for source in [r#"{"version":3,"rules":[{}]}"#, r#"{"version":3,"rules":[{"domain":[]},{"type":"default"}]}"#] {
+            assert!(PlainRuleSetCompat::parse(source.as_bytes()).unwrap().options.rules.is_empty(), "{source}");
+        }
+        let kept = PlainRuleSetCompat::parse(br#"{"version":3,"rules":[{},{"domain":"a"}]}"#).unwrap();
+        assert_eq!(kept.options.rules.len(), 2);
+        let logical = PlainRuleSetCompat::parse(br#"{"version":3,"rules":[{"type":"logical","mode":"and","rules":[{}]}]}"#).unwrap();
+        assert!(matches!(&logical.options.rules[0], HeadlessRule::Logical(rule) if rule.rules.is_empty()));
         assert!(!rule.is_valid());
     }
 }
