@@ -10,6 +10,7 @@ use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::dial::NetworkStrategy;
 use crate::types::{DomainStrategy, Duration, Listable, QueryType};
 
 /// Match fields shared by route rules (sing-box `RawDefaultRule`, the subset
@@ -142,30 +143,50 @@ pub enum RejectMethod {
     Drop,
 }
 
-/// The `route-options` fields of the `route` and `route-options` actions
-/// (sing-box `RouteActionOptions`, the UDP subset rust-box implements).
+/// The `route-options` fields of the `route`, `route-options` and `bypass`
+/// actions (sing-box `RawRouteOptionsActionOptions`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteActionOptions {
+    /// Replaces the destination host (an IP or a domain), keeping its port.
+    #[serde(default)]
+    pub override_address: String,
+    #[serde(default)]
+    pub override_port: u16,
+    /// Rejected by [`take_route_options`]: graphical clients only.
+    #[serde(default)]
+    pub network_strategy: Option<NetworkStrategy>,
+    /// A plain number, used as nanoseconds: sing-box v1.14.4 declares this
+    /// field `uint32` and converts it with `time.Duration(...)`.
+    #[serde(default)]
+    pub fallback_delay: u32,
     #[serde(default)]
     pub udp_disable_domain_unmapping: bool,
     #[serde(default)]
     pub udp_connect: bool,
     #[serde(default)]
     pub udp_timeout: Duration,
+    #[serde(default)]
+    pub tls_fragment: bool,
+    #[serde(default)]
+    pub tls_fragment_fallback_delay: Duration,
+    #[serde(default)]
+    pub tls_record_fragment: bool,
+    /// Rejected by [`take_route_options`]: not implemented yet.
+    #[serde(default)]
+    pub tls_spoof: String,
+    #[serde(default)]
+    pub tls_spoof_method: String,
 }
 
-const ROUTE_OPTION_FIELDS: &[&str] = &["udp_disable_domain_unmapping", "udp_connect", "udp_timeout"];
-
-/// `route-options` fields sing-box v1.14.4 has and rust-box does not
-/// implement yet: rejected by name instead of reported as unknown.
-const UNSUPPORTED_ROUTE_OPTION_FIELDS: &[&str] = &[
+const ROUTE_OPTION_FIELDS: &[&str] = &[
     "override_address",
     "override_port",
     "network_strategy",
-    "network_type",
-    "fallback_network_type",
     "fallback_delay",
+    "udp_disable_domain_unmapping",
+    "udp_connect",
+    "udp_timeout",
     "tls_fragment",
     "tls_fragment_fallback_delay",
     "tls_record_fragment",
@@ -173,25 +194,71 @@ const UNSUPPORTED_ROUTE_OPTION_FIELDS: &[&str] = &[
     "tls_spoof_method",
 ];
 
+/// `tls_spoof_method` values (sing-box `common/tlsspoof`).
+const TLS_SPOOF_METHODS: &[&str] =
+    &["", "wrong-sequence", "wrong-checksum", "wrong-ack", "wrong-md5", "wrong-timestamp"];
+
 /// Sniffer names of the `sniff` action (sing-box `route/rule/rule_action.go`).
 pub const SNIFFERS: &[&str] = &["tls", "http", "quic", "dns", "stun", "bittorrent", "dtls", "ssh", "rdp", "ntp"];
 
 /// Route rule actions (sing-box `RuleAction`, the subset rust-box implements).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleAction {
-    Route { outbound: String, options: RouteActionOptions },
+    Route {
+        outbound: String,
+        options: RouteActionOptions,
+    },
     RouteOptions(RouteActionOptions),
+    /// `bypass`: in connection routing it routes like `route` when it names
+    /// an outbound and is skipped otherwise; the kernel-level bypass of
+    /// `auto_redirect` pre-matching needs a TUN.
+    Bypass {
+        outbound: String,
+        options: RouteActionOptions,
+    },
     Reject(RejectOptions),
     HijackDns,
-    Sniff { sniffer: Vec<String>, timeout: Duration },
-    Resolve { server: String, strategy: DomainStrategy, disable_cache: bool },
+    Sniff {
+        sniffer: Vec<String>,
+        timeout: Duration,
+    },
+    Resolve {
+        server: String,
+        strategy: DomainStrategy,
+        disable_cache: bool,
+    },
 }
 
-fn take_route_options(object: &mut Map<String, Value>) -> Result<RouteActionOptions, String> {
-    if let Some(field) = UNSUPPORTED_ROUTE_OPTION_FIELDS.iter().find(|field| object.contains_key(**field)) {
-        return Err(format!("route option `{field}` is not supported by rust-box yet"));
+/// Takes the route option fields out of a rule object. `exclusive` is set
+/// for the `route-options` action, which sing-box checks for emptiness and
+/// for `tls_fragment` with `tls_record_fragment`
+/// (`RouteOptionsActionOptions.UnmarshalJSON`).
+fn take_route_options(object: &mut Map<String, Value>, exclusive: bool) -> Result<RouteActionOptions, String> {
+    let options: RouteActionOptions = take_as(object, ROUTE_OPTION_FIELDS)?;
+    if exclusive {
+        if options == RouteActionOptions::default() {
+            return Err("empty route option action".into());
+        }
+        if options.tls_fragment && options.tls_record_fragment {
+            return Err("`tls_fragment` and `tls_record_fragment` are mutually exclusive".into());
+        }
     }
-    take_as(object, ROUTE_OPTION_FIELDS)
+    // tlsspoof.ParseOptions
+    if options.tls_spoof.is_empty() && !options.tls_spoof_method.is_empty() {
+        return Err("spoof_method requires spoof".into());
+    }
+    if !TLS_SPOOF_METHODS.contains(&options.tls_spoof_method.as_str()) {
+        return Err(format!("tls_spoof: unknown method: {}", options.tls_spoof_method));
+    }
+    if !options.tls_spoof.is_empty() {
+        return Err("route option `tls_spoof` is not supported by rust-box yet".into());
+    }
+    if options.network_strategy.is_some() {
+        return Err("route option `network_strategy` is only supported in graphical clients with a platform \
+                    interface (Android, Apple), which rust-box does not have yet"
+            .into());
+    }
+    Ok(options)
 }
 
 /// DNS rule actions (sing-box `DNSRuleAction`, the subset rust-box implements).
@@ -240,10 +307,20 @@ impl ActionParser for RuleAction {
                 if route.outbound.is_empty() {
                     return Err("missing outbound for route action".into());
                 }
-                let options = take_route_options(object)?;
+                let options = take_route_options(object, false)?;
                 Ok(RuleAction::Route { outbound: route.outbound, options })
             }
-            "route-options" => Ok(RuleAction::RouteOptions(take_route_options(object)?)),
+            "route-options" => Ok(RuleAction::RouteOptions(take_route_options(object, true)?)),
+            "bypass" => {
+                #[derive(Deserialize)]
+                struct Bypass {
+                    #[serde(default)]
+                    outbound: String,
+                }
+                let bypass: Bypass = take_as(object, &["outbound"])?;
+                let options = take_route_options(object, false)?;
+                Ok(RuleAction::Bypass { outbound: bypass.outbound, options })
+            }
             "reject" => Ok(RuleAction::Reject(take_as(object, &["method", "no_drop"])?)),
             "hijack-dns" => Ok(RuleAction::HijackDns),
             "sniff" => {
@@ -277,7 +354,6 @@ impl ActionParser for RuleAction {
                     disable_cache: resolve.disable_cache,
                 })
             }
-            "bypass" => Err(format!("rule action {name:?} is not supported by rust-box yet")),
             _ => Err(format!("unknown rule action: {name}")),
         }
     }
@@ -396,7 +472,10 @@ mod tests {
         // `method` only belongs to reject; on a route rule it is an unknown field.
         assert!(serde_json::from_str::<RouteRule>(r#"{"outbound":"a","method":"drop"}"#).is_err());
         assert!(serde_json::from_str::<RouteRule>(r#"{"geoip":"cn","outbound":"a"}"#).is_err());
-        assert!(serde_json::from_str::<RouteRule>(r#"{"action":"bypass","outbound":"a"}"#).is_err());
+        assert!(matches!(
+            serde_json::from_str::<RouteRule>(r#"{"action":"bypass","outbound":"a"}"#).unwrap().action(),
+            Some(RuleAction::Bypass { outbound, .. }) if outbound == "a"
+        ));
         assert!(serde_json::from_str::<RouteRule>(r#"{"action":"sniff","sniffer":["quic","nope"]}"#).is_err());
     }
 
@@ -409,8 +488,35 @@ mod tests {
         let Some(RuleAction::RouteOptions(options)) = rule.action() else { panic!() };
         assert!(options.udp_disable_domain_unmapping);
         assert_eq!(options.udp_timeout.0, std::time::Duration::from_secs(60));
-        let error = serde_json::from_str::<RouteRule>(r#"{"outbound":"a","tls_fragment":true}"#).unwrap_err();
-        assert!(error.to_string().contains("tls_fragment"), "{error}");
+        let rule: RouteRule = serde_json::from_str(
+            r#"{"outbound":"a","tls_fragment":true,"tls_record_fragment":true,"override_address":"1.2.3.4",
+                "override_port":8443,"fallback_delay":300,"tls_fragment_fallback_delay":"20ms"}"#,
+        )
+        .unwrap();
+        let Some(RuleAction::Route { options, .. }) = rule.action() else { panic!() };
+        assert!(options.tls_fragment && options.tls_record_fragment);
+        assert_eq!((options.override_address.as_str(), options.override_port), ("1.2.3.4", 8443));
+        assert_eq!(options.fallback_delay, 300);
+        assert_eq!(options.tls_fragment_fallback_delay.0, std::time::Duration::from_millis(20));
+        // route-options checks what route does not.
+        let error = serde_json::from_str::<RouteRule>(r#"{"action":"route-options"}"#).unwrap_err();
+        assert!(error.to_string().contains("empty route option action"), "{error}");
+        let error = serde_json::from_str::<RouteRule>(
+            r#"{"action":"route-options","tls_fragment":true,"tls_record_fragment":true}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+        // A string fallback_delay does not fit sing-box's uint32.
+        assert!(serde_json::from_str::<RouteRule>(r#"{"outbound":"a","fallback_delay":"300ms"}"#).is_err());
+        for (field, needle) in [
+            (r#""tls_spoof":"example.com""#, "tls_spoof"),
+            (r#""tls_spoof_method":"wrong-ack""#, "spoof_method requires spoof"),
+            (r#""network_strategy":"hybrid""#, "network_strategy"),
+            (r#""network_type":"wifi""#, "network_type"),
+        ] {
+            let error = serde_json::from_str::<RouteRule>(&format!(r#"{{"outbound":"a",{field}}}"#)).unwrap_err();
+            assert!(error.to_string().contains(needle), "{field}: {error}");
+        }
         assert_eq!(
             serde_json::from_str::<RouteRule>(r#"{"action":"hijack-dns"}"#).unwrap().action(),
             Some(&RuleAction::HijackDns)

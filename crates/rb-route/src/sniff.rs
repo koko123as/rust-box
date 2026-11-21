@@ -68,7 +68,7 @@ pub fn sniff_packet(name: &str, packet: &[u8]) -> Verdict {
 /// sing-box `sniff.Skip`: server-first protocols, where waiting for the
 /// client to speak only adds the sniff timeout.
 pub fn skip_port(port: u16) -> bool {
-    matches!(port, 25 | 465 | 587 | 143 | 993 | 110 | 995)
+    rb_adapter::server_first_port(port)
 }
 
 fn dns_query(message: &[u8]) -> bool {

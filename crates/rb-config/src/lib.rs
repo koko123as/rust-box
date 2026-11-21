@@ -6,6 +6,8 @@
 //! feature rust-box does not have yet fails to load instead of silently
 //! behaving differently.
 
+#[macro_use]
+pub mod dial;
 pub mod rule;
 pub mod types;
 
@@ -14,6 +16,7 @@ use std::net::IpAddr;
 use serde::Deserialize;
 use serde_json::Value;
 
+pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrategy};
 pub use rule::{
     DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule,
     Rule, RuleAction, RuleMatch, SNIFFERS,
@@ -31,8 +34,16 @@ pub enum ConfigError {
 }
 
 /// Top-level sections sing-box has and rust-box does not implement yet.
-const UNSUPPORTED_SECTIONS: &[&str] =
-    &["ntp", "certificate", "certificate_providers", "endpoints", "services", "experimental", "http_clients"];
+const UNSUPPORTED_SECTIONS: &[&str] = &[
+    "ntp",
+    "certificate",
+    "certificate_providers",
+    "endpoints",
+    "services",
+    "experimental",
+    "http_clients",
+    "network_namespaces",
+];
 
 /// sing-box `option.Options`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -112,16 +123,18 @@ impl DnsServer {
     }
 }
 
-/// sing-box `RemoteDNSServerOptions` (the subset rust-box implements: the
-/// server must be an IP address).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteDnsServer {
-    #[serde(default)]
-    pub tag: String,
-    pub server: IpAddr,
-    #[serde(default)]
-    pub server_port: u16,
+with_dial_fields! {
+    /// sing-box `RemoteDNSServerOptions` with its dial fields (the server
+    /// must be an IP address in rust-box).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RemoteDnsServer {
+        #[serde(default)]
+        pub tag: String,
+        pub server: IpAddr,
+        #[serde(default)]
+        pub server_port: u16,
+    }
 }
 
 /// Inbounds (sing-box `option.Inbound`).
@@ -151,26 +164,23 @@ impl Inbound {
     }
 }
 
-/// Options of the socks, http and mixed inbounds (sing-box
-/// `SocksInboundOptions`, `HTTPMixedInboundOptions` with `ListenOptions`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProxyInbound {
-    #[serde(default)]
-    pub tag: String,
-    #[serde(default)]
-    pub listen: Option<IpAddr>,
-    #[serde(default)]
-    pub listen_port: u16,
-    #[serde(default)]
-    pub users: Vec<User>,
-    /// UDP NAT expiration (`ListenOptions.udp_timeout`, 5m by default). The
-    /// `http` inbound accepts it like sing-box and has no UDP to apply it to.
-    #[serde(default)]
-    pub udp_timeout: UdpTimeout,
+with_listen_fields! {
+    /// Options of the socks, http and mixed inbounds (sing-box
+    /// `SocksInboundOptions`, `HTTPMixedInboundOptions` with `ListenOptions`).
+    /// The `http` inbound accepts `udp_timeout` and `udp_fragment` like
+    /// sing-box and has no UDP to apply them to.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProxyInbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub users: Vec<User>,
+    }
 }
 
 /// Outbounds (sing-box `option.Outbound`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Outbound {
@@ -189,16 +199,21 @@ impl Outbound {
     }
 }
 
-/// sing-box `DirectOutboundOptions` (dial fields: the subset rust-box implements).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DirectOutbound {
-    #[serde(default)]
-    pub tag: String,
-    #[serde(default)]
-    pub domain_resolver: Option<DomainResolveOptions>,
-    #[serde(default)]
-    pub connect_timeout: Duration,
+with_dial_fields! {
+    /// sing-box `DirectOutboundOptions`: the dial fields and the removed
+    /// destination override fields (rejected when set).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DirectOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub override_address: String,
+        #[serde(default)]
+        pub override_port: u16,
+        #[serde(default)]
+        pub proxy_protocol: u8,
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -222,6 +237,12 @@ pub struct RouteOptions {
     /// nothing needs to bind to the default interface.
     #[serde(default)]
     pub auto_detect_interface: bool,
+    /// Interface outbound connections bind to by default (Linux).
+    #[serde(default)]
+    pub default_interface: String,
+    /// Routing mark outbound connections get by default (Linux).
+    #[serde(default)]
+    pub default_mark: FwMark,
 }
 
 /// Parses a configuration, naming the path of a field that fails.
@@ -246,6 +267,14 @@ impl Options {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let field = |path: String, message: String| ConfigError::Field { path, message };
         let mut tags = std::collections::HashSet::new();
+        let inbound_tags: Vec<String> = self
+            .inbounds
+            .iter()
+            .enumerate()
+            .map(
+                |(index, inbound)| if inbound.tag().is_empty() { index.to_string() } else { inbound.tag().to_string() },
+            )
+            .collect();
         for (index, inbound) in self.inbounds.iter().enumerate() {
             if !inbound.tag().is_empty() && !tags.insert(("inbound", inbound.tag().to_string())) {
                 return Err(field(format!("inbounds[{index}]"), format!("duplicate inbound tag: {}", inbound.tag())));
@@ -283,22 +312,53 @@ impl Options {
                 _ => {}
             }
         }
-        if let Some(resolver) = &self.route.default_domain_resolver {
+        let check_resolver = |path: &str, resolver: &DomainResolveOptions| -> Result<(), ConfigError> {
             if !server_known(&resolver.server) {
+                return Err(field(path.into(), format!("DNS server not found: {}", resolver.server)));
+            }
+            if resolver.client_subnet.is_some() {
                 return Err(field(
-                    "route.default_domain_resolver".into(),
-                    format!("DNS server not found: {}", resolver.server),
+                    format!("{path}.client_subnet"),
+                    "`client_subnet` is not supported by rust-box yet".into(),
                 ));
+            }
+            Ok(())
+        };
+        if let Some(resolver) = &self.route.default_domain_resolver {
+            check_resolver("route.default_domain_resolver", resolver)?;
+        }
+        for (index, inbound) in self.inbounds.iter().enumerate() {
+            let options = inbound.options();
+            if let Some(message) = options.removed_field_error() {
+                return Err(field(format!("inbounds[{index}]"), message.to_string()));
+            }
+            let detour = &options.detour;
+            if !detour.is_empty() && !inbound_tags.contains(detour) {
+                return Err(field(format!("inbounds[{index}].detour"), format!("inbound detour not found: {detour}")));
             }
         }
         for (index, outbound) in self.outbounds.iter().enumerate() {
-            if let Outbound::Direct(DirectOutbound { domain_resolver: Some(resolver), .. }) = outbound {
-                if !server_known(&resolver.server) {
-                    return Err(field(
-                        format!("outbounds[{index}].domain_resolver"),
-                        format!("DNS server not found: {}", resolver.server),
-                    ));
-                }
+            let Outbound::Direct(direct) = outbound else { continue };
+            let path = format!("outbounds[{index}]");
+            if !direct.override_address.is_empty() || direct.override_port != 0 {
+                return Err(field(
+                    path,
+                    "destination override fields in direct outbound are deprecated in sing-box 1.11.0 and removed \
+                     in sing-box 1.13.0, use route options instead"
+                        .into(),
+                ));
+            }
+            if direct.proxy_protocol != 0 {
+                return Err(field(path, dial::PROXY_PROTOCOL_ERROR.into()));
+            }
+            if !direct.detour.is_empty() {
+                return Err(field(format!("{path}.detour"), "`detour` is not supported in direct context".into()));
+            }
+            self.check_dialer(&path, &direct.dialer_options(), &server_known)?;
+        }
+        for (index, server) in self.dns.servers.iter().enumerate() {
+            if let DnsServer::Udp(remote) | DnsServer::Tcp(remote) = server {
+                self.check_dialer(&format!("dns.servers[{index}]"), &remote.dialer_options(), &server_known)?;
             }
         }
         if !self.dns.r#final.is_empty() && !server_known(&self.dns.r#final) {
@@ -312,6 +372,84 @@ impl Options {
             }
         }
         Ok(())
+    }
+
+    /// Checks one object's dial fields: references, and the fields rust-box
+    /// cannot honor.
+    fn check_dialer(
+        &self,
+        path: &str,
+        options: &DialerOptions,
+        server_known: &dyn Fn(&str) -> bool,
+    ) -> Result<(), ConfigError> {
+        let field = |path: String, message: String| ConfigError::Field { path, message };
+        if let Some(name) = options.platform_only_field() {
+            return Err(field(
+                format!("{path}.{name}"),
+                format!(
+                    "`{name}` is only supported in graphical clients with a platform interface (Android, Apple) \
+                     and `auto_detect_interface`, which rust-box does not have yet"
+                ),
+            ));
+        }
+        if let Some(resolver) = &options.domain_resolver {
+            if !server_known(&resolver.server) {
+                return Err(field(
+                    format!("{path}.domain_resolver"),
+                    format!("DNS server not found: {}", resolver.server),
+                ));
+            }
+            if resolver.client_subnet.is_some() {
+                return Err(field(
+                    format!("{path}.domain_resolver.client_subnet"),
+                    "`client_subnet` is not supported by rust-box yet".into(),
+                ));
+            }
+        }
+        for (name, address, ipv4) in [
+            ("inet4_bind_address", options.inet4_bind_address, true),
+            ("inet6_bind_address", options.inet6_bind_address, false),
+        ] {
+            if let Some(address) = address {
+                if address.is_ipv4() != ipv4 {
+                    return Err(field(
+                        format!("{path}.{name}"),
+                        format!("not an IPv{} address: {address}", if ipv4 { 4 } else { 6 }),
+                    ));
+                }
+            }
+        }
+        if !options.detour.is_empty() {
+            let target = self.outbounds.iter().enumerate().find(|(index, outbound)| {
+                let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
+                tag == options.detour
+            });
+            match target {
+                None => {
+                    return Err(field(
+                        format!("{path}.detour"),
+                        format!("outbound detour not found: {}", options.detour),
+                    ))
+                }
+                Some((_, Outbound::Direct(direct))) if direct.dialer_options().is_empty() => {
+                    return Err(field(
+                        format!("{path}.detour"),
+                        "detour to an empty direct outbound makes no sense".into(),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Inbound {
+    /// The listen fields of any inbound.
+    pub fn options(&self) -> &ProxyInbound {
+        match self {
+            Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options,
+        }
     }
 }
 
@@ -360,14 +498,113 @@ mod tests {
     fn rejects_what_is_not_implemented() {
         let error = parse(r#"{"experimental": {}}"#).unwrap_err().to_string();
         assert!(error.contains("experimental"), "{error}");
+        let error = parse(r#"{"network_namespaces": []}"#).unwrap_err().to_string();
+        assert!(error.contains("network_namespaces"), "{error}");
         let error = parse(r#"{"inbounds":[{"type":"tun"}]}"#).unwrap_err().to_string();
         assert!(error.contains("inbounds[0]"), "{error}");
         let error =
-            parse(r#"{"inbounds":[{"type":"mixed","listen_port":1,"tcp_fast_open":true}]}"#).unwrap_err().to_string();
-        assert!(error.contains("tcp_fast_open"), "{error}");
+            parse(r#"{"inbounds":[{"type":"mixed","listen_port":1,"tcp_brutal":true}]}"#).unwrap_err().to_string();
+        assert!(error.contains("inbounds[0]") && error.contains("tcp_brutal"), "{error}");
         let error =
-            parse(r#"{"route":{"rules":[{"action":"route-options","override_port":53}]}}"#).unwrap_err().to_string();
-        assert!(error.contains("route.rules[0]") && error.contains("override_port"), "{error}");
+            parse(r#"{"route":{"rules":[{"action":"route-options","tls_spoof":"a.com"}]}}"#).unwrap_err().to_string();
+        assert!(error.contains("route.rules[0]") && error.contains("tls_spoof"), "{error}");
+        let error = parse(r#"{"outbounds":[{"type":"direct","network_strategy":"hybrid"}]}"#).unwrap_err().to_string();
+        assert!(error.contains("outbounds[0].network_strategy"), "{error}");
+        let error =
+            parse(r#"{"outbounds":[{"type":"direct","fallback_network_type":["wifi"]}]}"#).unwrap_err().to_string();
+        assert!(error.contains("outbounds[0].fallback_network_type"), "{error}");
+        let error = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"l"}]},
+                "outbounds":[{"type":"direct","domain_resolver":{"server":"l","client_subnet":"1.2.3.0/24"}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outbounds[0].domain_resolver.client_subnet"), "{error}");
+        let error = parse(r#"{"route":{"default_network_strategy":"hybrid"}}"#).unwrap_err().to_string();
+        assert!(error.contains("default_network_strategy"), "{error}");
+    }
+
+    #[test]
+    fn dial_fields() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                                  {"type":"udp","tag":"remote","server":"1.1.1.1","detour":"d2","connect_timeout":"3s"}]},
+                "outbounds":[
+                  {"type":"direct","tag":"d1","bind_interface":"eth0","inet4_bind_address":"192.0.2.1",
+                   "inet6_bind_address":"2001:db8::1","bind_address_no_port":true,"protect_path":"/tmp/p",
+                   "routing_mark":"0x20","reuse_addr":true,"netns":"ns1","connect_timeout":"2s",
+                   "tcp_fast_open":true,"tcp_multi_path":true,"disable_tcp_keep_alive":true,
+                   "tcp_keep_alive":"1m","tcp_keep_alive_interval":"10s","udp_fragment":false,
+                   "domain_resolver":{"server":"local","strategy":"ipv4_only","rewrite_ttl":60,
+                                      "disable_optimistic_cache":true},
+                   "fallback_delay":"100ms","domain_strategy":"prefer_ipv6"},
+                  {"type":"direct","tag":"d2","inet4_bind_address":"127.0.0.1"}],
+                "route":{"default_interface":"eth1","default_mark":7}}"#,
+        )
+        .unwrap();
+        let Outbound::Direct(direct) = &options.outbounds[0] else { panic!() };
+        let dial = direct.dialer_options();
+        assert_eq!(dial.bind_interface, "eth0");
+        assert_eq!(dial.routing_mark, FwMark(0x20));
+        assert_eq!(dial.udp_fragment, Some(false));
+        assert!(dial.tcp_fast_open && dial.tcp_multi_path && dial.disable_tcp_keep_alive && dial.reuse_addr);
+        assert_eq!(dial.fallback_delay.0, std::time::Duration::from_millis(100));
+        assert_eq!(dial.domain_strategy, DomainStrategy::PreferIpv6);
+        let resolver = dial.domain_resolver.clone().unwrap();
+        assert_eq!((resolver.strategy, resolver.rewrite_ttl), (DomainStrategy::Ipv4Only, Some(60)));
+        assert!(!dial.is_empty());
+        assert_eq!(options.route.default_mark, FwMark(7));
+        let DnsServer::Udp(remote) = &options.dns.servers[1] else { panic!() };
+        assert_eq!(remote.dialer_options().detour, "d2");
+    }
+
+    #[test]
+    fn dial_references_and_removed_fields() {
+        for (config, needle) in [
+            (
+                r#"{"outbounds":[{"type":"direct","detour":"x"}]}"#,
+                "outbounds[0].detour: `detour` is not supported in direct context",
+            ),
+            (r#"{"outbounds":[{"type":"direct","override_port":53}]}"#, "destination override fields"),
+            (r#"{"outbounds":[{"type":"direct","proxy_protocol":1}]}"#, "Proxy Protocol"),
+            (r#"{"outbounds":[{"type":"direct","inet4_bind_address":"::1"}]}"#, "not an IPv4 address"),
+            (
+                r#"{"dns":{"servers":[{"type":"udp","server":"1.1.1.1","detour":"nope"}]}}"#,
+                "dns.servers[0].detour: outbound detour not found: nope",
+            ),
+            (
+                r#"{"dns":{"servers":[{"type":"udp","server":"1.1.1.1","detour":"d"}]},"outbounds":[{"type":"direct","tag":"d"}]}"#,
+                "detour to an empty direct outbound makes no sense",
+            ),
+            (r#"{"inbounds":[{"type":"socks","sniff":true}]}"#, "legacy inbound fields"),
+            (r#"{"inbounds":[{"type":"socks","domain_strategy":"ipv4_only"}]}"#, "legacy inbound fields"),
+            (r#"{"inbounds":[{"type":"http","proxy_protocol":true}]}"#, "Proxy Protocol"),
+            (r#"{"inbounds":[{"type":"http","detour":"nope"}]}"#, "inbounds[0].detour: inbound detour not found: nope"),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+        // Legacy fields at their zero values are accepted, as sing-box does.
+        parse(r#"{"inbounds":[{"type":"socks","sniff":false,"sniff_timeout":"0s","proxy_protocol":false}]}"#).unwrap();
+    }
+
+    #[test]
+    fn listen_fields() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"mixed","tag":"a","listen":"::","listen_port":1080,"bind_interface":"eth0",
+                   "routing_mark":16,"reuse_addr":true,"netns":"/run/netns/x","disable_tcp_keep_alive":false,
+                   "tcp_keep_alive":"30s","tcp_keep_alive_interval":"5s","tcp_fast_open":true,
+                   "tcp_multi_path":true,"udp_fragment":true,"udp_timeout":"1m","detour":"b"},
+                  {"type":"socks","tag":"b"}]}"#,
+        )
+        .unwrap();
+        let listen = options.inbounds[0].options().listen_options();
+        assert_eq!(listen.listen, Some("::".parse().unwrap()));
+        assert_eq!(listen.routing_mark, FwMark(16));
+        assert_eq!(listen.detour, "b");
+        assert_eq!(listen.udp_fragment, Some(true));
+        assert_eq!(listen.udp_timeout.0 .0, std::time::Duration::from_secs(60));
     }
 
     #[test]

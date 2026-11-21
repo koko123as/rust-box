@@ -17,11 +17,21 @@ silently ignored.
    `udp_disable_domain_unmapping`, packet sniffers (dns, quic, stun,
    bittorrent, dtls, ntp) and stream sniffers dns and rdp, `hijack-dns` over
    UDP and TCP.
-3. **Dial options and outbound plumbing**: `detour`, `bind_interface`,
-   `routing_mark`, `tcp_fast_open`, happy-eyeballs (`fallback_delay`), the
-   remaining `route-options` fields (`override_address`, `override_port`,
-   `network_strategy`, `fallback_delay`, `tls_fragment`, `tls_spoof`, ...),
-   `bypass`.
+3. **Dial options and outbound plumbing** (done): every dial field
+   (`shared/dial`) in a new crate `rb-dialer` — `detour` (DNS servers),
+   `bind_interface`, `inet4_bind_address`, `inet6_bind_address`,
+   `bind_address_no_port`, `protect_path`, `routing_mark`, `reuse_addr`,
+   `netns`, `connect_timeout`, `tcp_fast_open`, `tcp_multi_path`,
+   `disable_tcp_keep_alive`, `tcp_keep_alive`, `tcp_keep_alive_interval`,
+   `udp_fragment`, `domain_resolver` (string and object, with
+   `rewrite_ttl`), `fallback_delay` and the deprecated `domain_strategy`;
+   `route.default_interface` and `route.default_mark`; happy-eyeballs in
+   `direct`; the route options `override_address`, `override_port`,
+   `fallback_delay`, `tls_fragment`, `tls_fragment_fallback_delay`,
+   `tls_record_fragment` on `route`, `route-options` and `bypass`; the
+   listen fields (`shared/listen`) including the inbound `detour`; HTTP
+   proxy keep-alive. Dial fields are also accepted on `udp` and `tcp` DNS
+   servers.
 4. **Rule-sets**: inline, local and remote `source`/`binary` (SRS) rule-sets,
    `rule_set` rule items.
 5. **TLS and first encrypted protocols**: rustls client/server, `shadowsocks`
@@ -39,11 +49,10 @@ silently ignored.
 
 ## Known differences in milestone 1
 
-- `direct` tries resolved addresses one after another; sing-box races them
-  with `fallback_delay` (happy-eyeballs).
-- A plain HTTP proxy request is forwarded with `Connection: close`, so each
-  request uses its own upstream connection; sing-box keeps the client
-  connection alive across requests.
+- ~~`direct` tries resolved addresses one after another~~: fixed in
+  milestone 3 (happy-eyeballs).
+- ~~A plain HTTP proxy request is forwarded with `Connection: close`~~:
+  fixed in milestone 3 (keep-alive client connections).
 - The `local` DNS server uses the system resolver (getaddrinfo), which
   reports no TTL; answers are cached for 10 seconds.
 - `reject` with `method: drop` closes the connection like `default`.
@@ -73,4 +82,80 @@ silently ignored.
 - The UDP NAT table (`rb_route::nat`) has no user yet: the SOCKS5 inbound
   gives each UDP ASSOCIATE its own socket and session, as sing-box does; the
   table is for the inbounds that share a socket (`direct`, `shadowsocks`,
-  `tun`). `udp_fragment` is not supported.
+  `tun`). `udp_fragment` was not supported (added in milestone 3).
+
+## Milestone 3: platform support of the dial and listen fields
+
+| Field | Linux | Android | other platforms |
+|---|---|---|---|
+| `bind_interface` (dial and listen), `route.default_interface` | `SO_BINDTOIFINDEX`, else `SO_BINDTODEVICE` | same | refused (sing-box also supports macOS and Windows) |
+| `routing_mark` (dial and listen), `route.default_mark` | `SO_MARK`, needs `CAP_NET_ADMIN` | same | refused (sing-box: Linux only) |
+| `bind_address_no_port` | `IP_BIND_ADDRESS_NO_PORT` | same | refused (sing-box: Linux only) |
+| `netns` (dial and listen) | `setns` on a helper thread, needs `CAP_SYS_ADMIN` | same | refused (sing-box: Linux only) |
+| `tcp_fast_open` (dial) | lazy connect, data in the SYN (`MSG_FASTOPEN`) | same | refused (sing-box also macOS, Windows, FreeBSD) |
+| `tcp_fast_open` (listen) | `TCP_FASTOPEN` queue 4096 | same | refused |
+| `tcp_multi_path` | `IPPROTO_MPTCP`, plain TCP when the kernel has none | same | plain TCP (as Go) |
+| `udp_fragment` | `IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER` | same | system default |
+| `protect_path` | `SCM_RIGHTS` over a Unix socket | same | refused off Unix |
+| `reuse_addr` | `SO_REUSEADDR` + `SO_REUSEPORT` | same | `SO_REUSEADDR` |
+| `tcp_keep_alive*`, `disable_tcp_keep_alive` | `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, count 9 (Go's default) | same | idle time only |
+
+`network_strategy`, `network_type` and `fallback_network_type` (dial fields
+and the `network_strategy` route option) only take effect in sing-box's
+graphical clients, through their platform interface with
+`auto_detect_interface`. rust-box has no platform interface yet
+(milestone 8), so these fields are rejected with their path.
+
+## Known differences in milestone 3
+
+- Rejected with their path rather than implemented: `network_strategy`,
+  `network_type`, `fallback_network_type` (sing-box's command line parses
+  them and leaves them unused), the route options `network_strategy`,
+  `tls_spoof` and `tls_spoof_method` (raw-socket injection),
+  `route.default_network_strategy` and the other `default_network_*`
+  fields, `domain_resolver.client_subnet`, and the `network_namespaces`
+  section (so `netns` takes a name under `/var/run/netns` or a path, not a
+  namespace tag).
+- `domain_resolver.disable_optimistic_cache` is accepted; rust-box has no
+  optimistic cache, so it is always in effect.
+- References are checked when the configuration loads: an inbound
+  `detour`, a DNS server `detour` (including sing-box's "detour to an empty
+  direct outbound makes no sense") and an `inet4_bind_address` /
+  `inet6_bind_address` of the wrong family. sing-box reports these on the
+  first connection that uses them.
+- `listen` now defaults to `127.0.0.1`, as in sing-box's listener code
+  (`Listen.Build(127.0.0.1)`); milestones 1 and 2 used `0.0.0.0`.
+- Behaviors kept from v1.14.4 on purpose: `tcp_multi_path` only applies to
+  the IPv4 dialer (sing-box enables MPTCP on `dialer4` only; listeners use
+  it for both families); the route option `fallback_delay` is a plain number
+  of nanoseconds (`uint32` cast to `time.Duration`), so `"300ms"` is a type
+  error; `tls_fragment` cuts the ClientHello once inside the first label of
+  the server name (the label list is cut down by the number of dots) and
+  turns `TCP_NODELAY` off afterwards; `udp_fragment` has no effect on the
+  `socks`, `http` and `mixed` inbounds, whose UDP sockets sing-box opens
+  without it; inbound `detour` hands TCP connections over but a SOCKS5 UDP
+  association fails with "inbound detour is not UDP injectable", as these
+  inbounds are not UDP-injectable in sing-box either.
+- `tcp_fast_open`: a destination port of a server-first protocol (SMTP,
+  IMAP, POP3) is connected at once instead of on the first write (sing-box
+  achieves the same by writing an empty first packet); when the kernel
+  refuses Fast Open the connection falls back to a plain connect.
+- `bypass` routes like `route` when it names an outbound and is skipped
+  otherwise; its kernel-level meaning for `auto_redirect` pre-matching
+  needs a TUN (milestone 8).
+- HTTP proxy, plain requests: each request is a routed connection of its
+  own and the client connection stays open with `HTTP/1.1` and
+  `Proxy-Connection: keep-alive`, as in sing-box. Differences from Go's
+  HTTP client underneath sing-box: no `User-Agent` is added when the client
+  sent none; header names and order are passed as received instead of
+  canonicalized and sorted; an absolute `https://` target is answered with
+  502 (sing-box would make the TLS connection itself); a request body the
+  upstream did not read to its end closes the client connection (sing-box
+  discards up to 256 KiB to keep it open); the `407` realm is `rust-box`.
+  As in sing-box, `X-Forwarded-For` replaces the source address (port 0)
+  for routing, so `source_*` rules can be steered by the client.
+- `protect_path` talks to the protector synchronously on the dialing
+  thread, as sing-box's control function does.
+- Not ported: sing-box's connection tracking and power reports in the
+  default dialer, and the `direct` outbound's check against connecting back
+  into a TUN range.

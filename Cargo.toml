@@ -15,6 +15,7 @@ rb-rule = { path = "crates/rb-rule" }
 rb-dns = { path = "crates/rb-dns" }
 rb-route = { path = "crates/rb-route" }
 rb-protocol = { path = "crates/rb-protocol" }
+rb-dialer = { path = "crates/rb-dialer" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +33,10 @@ aes = "0.8"
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+httparse = "1"
+rand = "0.9"
 
 [profile.release]
 lto = true
