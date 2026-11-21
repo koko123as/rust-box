@@ -527,7 +527,7 @@ fn build_errors() {
             "fallback for ALPN is not supported without TLS",
         ),
         (
-            json!({"inbounds": [{"type": "vless", "transport": {"type": "ws"}}]}),
+            json!({"inbounds": [{"type": "vless", "transport": {"type": "http"}}]}),
             "`transport` is not supported by rust-box yet",
         ),
     ] {
