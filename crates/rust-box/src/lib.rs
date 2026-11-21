@@ -19,6 +19,7 @@ use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_protocol::{
     Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
+    TrojanInbound, TrojanOutbound,
 };
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
@@ -134,7 +135,11 @@ impl RustBox {
                     ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
-                OutboundOptions::Trojan(_) | OutboundOptions::Vless(_) => {
+                OutboundOptions::Trojan(trojan) => Arc::new(
+                    TrojanOutbound::new(trojan, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
+                OutboundOptions::Vless(_) => {
                     return Err(anyhow!("outbounds[{index}]: not supported by rust-box yet"));
                 }
             });
@@ -172,7 +177,11 @@ impl RustBox {
                     ShadowsocksInbound::new(shadowsocks, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
-                InboundOptions::Trojan(_) | InboundOptions::Vless(_) => {
+                InboundOptions::Trojan(trojan) => Arc::new(
+                    TrojanInbound::new(trojan, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Vless(_) => {
                     return Err(anyhow!("inbounds[{index}]: not supported by rust-box yet"));
                 }
             };
