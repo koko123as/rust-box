@@ -122,7 +122,7 @@ impl HostsFile {
     fn lookup(&self, domain: &str) -> Vec<IpAddr> {
         let mut cache = self.cache.lock().unwrap();
         self.update(&mut cache);
-        cache.by_name.get(domain).cloned().unwrap_or_default()
+        cache.by_name.get(&canonical_name(domain)).cloned().unwrap_or_default()
     }
 
     fn update(&self, cache: &mut HostsFileCache) {
@@ -236,7 +236,7 @@ mod tests {
         fs::write(&path, "192.0.2.1 refresh.test\n").unwrap();
         let file = HostsFile { path: path.clone(), cache: Mutex::new(HostsFileCache::default()) };
         assert_eq!(file.lookup("refresh.test"), vec!["192.0.2.1".parse::<IpAddr>().unwrap()]);
-        fs::write(&path, "198.51.100.2 refresh.test\n").unwrap();
+        fs::write(&path, "198.51.100.2 refresh.test # updated\n").unwrap();
         file.cache.lock().unwrap().expires = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(file.lookup("refresh.test"), vec!["198.51.100.2".parse::<IpAddr>().unwrap()]);
         fs::remove_file(path).unwrap();

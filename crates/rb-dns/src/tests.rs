@@ -157,6 +157,7 @@ async fn hosts_predefined_path_order_and_dns_responses() {
     std::fs::write(&first, "1.1.1.1 file.test first-only.test pre.test\n").unwrap();
     std::fs::write(&second, "3.3.3.3 file.test second-only.test pre.test\n").unwrap();
     let config = serde_json::json!({
+        "disable_cache": true,
         "servers": [{
             "type": "hosts",
             "tag": "hosts",
