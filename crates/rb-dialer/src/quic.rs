@@ -56,6 +56,15 @@ pub async fn connect_with_options(
     Ok((endpoint, connection))
 }
 
+/// Builds a Quinn server configuration from the shared TLS and QUIC options.
+pub fn server_config(tls: Arc<rustls::ServerConfig>, options: &QuicOptions) -> io::Result<quinn::ServerConfig> {
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|error| io::Error::other(format!("QUIC TLS configuration: {error}")))?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(Arc::new(transport_config(options)?));
+    Ok(config)
+}
+
 /// Builds the Quinn transport parameters corresponding to sing-box's shared
 /// QUIC options. Zero/omitted values retain Quinn's protocol defaults, just as
 /// `sing-quic.ApplyQUICOptions` leaves its underlying QUIC config untouched.
@@ -331,6 +340,7 @@ fn copy_error(error: &io::Error) -> io::Error {
 mod tests {
     use std::io;
     use std::io::IoSliceMut;
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use quinn::udp::Transmit;
@@ -338,8 +348,17 @@ mod tests {
     use rb_adapter::{PacketConn, SharedPacketConn, Socksaddr};
     use tokio::sync::mpsc;
 
-    use super::{transport_config, QuicPacketSocket};
+    use super::{server_config, transport_config, QuicPacketSocket};
     use rb_config::{MemoryBytes, QuicOptions};
+
+    fn server_tls_config() -> Arc<rustls::ServerConfig> {
+        let generated = rcgen::generate_simple_self_signed(vec!["quic.example".into()]).unwrap();
+        let certificate = generated.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(generated.key_pair.serialize_der().into());
+        Arc::new(
+            rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![certificate], key).unwrap(),
+        )
+    }
 
     #[test]
     fn shared_quic_options_map_and_reject_unrepresentable_windows() {
@@ -358,6 +377,23 @@ mod tests {
             Err(error) => assert!(error.to_string().contains("stream_receive_window")),
             Ok(_) => panic!("window larger than QUIC's varint range must be rejected"),
         }
+    }
+
+    #[test]
+    fn server_quic_config_uses_shared_transport_options() {
+        let options = QuicOptions {
+            stream_receive_window: Some(MemoryBytes(256 * 1024)),
+            connection_receive_window: Some(MemoryBytes(4 * 1024 * 1024)),
+            max_concurrent_streams: 128,
+            initial_packet_size: 1400,
+            disable_path_mtu_discovery: true,
+            ..Default::default()
+        };
+        assert!(server_config(server_tls_config(), &options).is_ok());
+
+        let invalid = QuicOptions { stream_receive_window: Some(MemoryBytes(u64::MAX)), ..Default::default() };
+        let error = server_config(server_tls_config(), &invalid).unwrap_err();
+        assert!(error.to_string().contains("stream_receive_window"));
     }
 
     struct MockPacketConn {
