@@ -736,6 +736,67 @@ fn check_v2ray_transport(
     }
 }
 
+fn check_hysteria2_obfs(path: &str, obfs: Option<&Hysteria2Obfs>) -> Result<(), ConfigError> {
+    let Some(obfs) = obfs else { return Ok(()) };
+    let field_path = format!("{path}.type");
+    let message = match obfs.r#type.as_str() {
+        "salamander" | "gecko" => "`obfs.type` is not supported by rust-box yet".to_string(),
+        other => format!("unknown Hysteria2 obfs type: {other}"),
+    };
+    Err(ConfigError::Field { path: field_path, message })
+}
+
+fn check_hysteria2_inbound(path: &str, options: &Hysteria2Inbound) -> Result<(), ConfigError> {
+    let field = |name: &str| ConfigError::Field {
+        path: format!("{path}.{name}"),
+        message: format!("`{name}` is not supported by rust-box yet"),
+    };
+    if options.masquerade.is_some() {
+        return Err(field("masquerade"));
+    }
+    if options.realm.is_some() {
+        return Err(field("realm"));
+    }
+    check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
+    for (name, enabled) in [
+        ("up_mbps", options.up_mbps != 0),
+        ("down_mbps", options.down_mbps != 0),
+        ("ignore_client_bandwidth", options.ignore_client_bandwidth),
+        ("bbr_profile", !options.bbr_profile.is_empty()),
+        ("brutal_debug", options.brutal_debug),
+    ] {
+        if enabled {
+            return Err(field(name));
+        }
+    }
+    Ok(())
+}
+
+fn check_hysteria2_outbound(path: &str, options: &Hysteria2Outbound) -> Result<(), ConfigError> {
+    let field = |name: &str| ConfigError::Field {
+        path: format!("{path}.{name}"),
+        message: format!("`{name}` is not supported by rust-box yet"),
+    };
+    if options.realm.is_some() {
+        return Err(field("realm"));
+    }
+    check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
+    for (name, enabled) in [
+        ("server_ports", !options.server_ports.is_empty()),
+        ("hop_interval", !options.hop_interval.0.is_zero()),
+        ("hop_interval_max", !options.hop_interval_max.0.is_zero()),
+        ("up_mbps", options.up_mbps != 0),
+        ("down_mbps", options.down_mbps != 0),
+        ("bbr_profile", !options.bbr_profile.is_empty()),
+        ("brutal_debug", options.brutal_debug),
+    ] {
+        if enabled {
+            return Err(field(name));
+        }
+    }
+    Ok(())
+}
+
 /// A V2Ray transport configuration. Unsupported transport features are
 /// rejected with their configuration path.
 #[derive(Debug, Clone, PartialEq)]
@@ -1339,6 +1400,9 @@ impl Options {
                 _ => None,
             };
             check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
+            if let Inbound::Hysteria2(options) = inbound {
+                check_hysteria2_inbound(&format!("inbounds[{index}]"), options)?;
+            }
             if let Inbound::Vless(options) = inbound {
                 if options.users.iter().any(|user| user.flow == "xtls-rprx-vision")
                     && options.transport.as_ref().is_some_and(|t| matches!(&t.config, V2RayTransportConfig::Grpc(_)))
@@ -1433,6 +1497,7 @@ impl Options {
                     check_proxy_outbound(&path, vmess.tls.as_ref(), vmess.multiplex.as_ref(), &vmess.transport)?;
                     self.check_dialer(&path, &vmess.dialer_options(), &server_known)?;
                 }
+                Outbound::Hysteria2(hysteria2) => check_hysteria2_outbound(&path, hysteria2)?,
                 _ => {}
             }
             let Outbound::Direct(direct) = outbound else { continue };
@@ -2227,14 +2292,13 @@ mod tests {
                    "users":[{"name":"alice","uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p"}],
                    "congestion_control":"new_reno","tls":{"enabled":true}},
                   {"type":"hysteria2","tag":"hy2-in","listen_port":8443,
-                   "users":[{"name":"bob","password":"q"}],"tls":{"enabled":true},
-                   "obfs":{"type":"salamander","password":"secret"}}],
+                   "users":[{"name":"bob","password":"q"}],"tls":{"enabled":true}}],
                 "outbounds":[
                   {"type":"tuic","tag":"tuic-out","server":"example.com","server_port":443,
                    "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p",
                    "udp_relay_mode":"native","tls":{"enabled":true}},
                   {"type":"hysteria2","tag":"hy2-out","server":"example.com","server_port":8443,
-                   "password":"q","up_mbps":40,"tls":{"enabled":true}}]}"#,
+                   "password":"q","tls":{"enabled":true}}]}"#,
         )
         .unwrap();
         assert_eq!(options.inbounds[0].kind(), "tuic");
@@ -2243,13 +2307,12 @@ mod tests {
         assert_eq!(tuic.users[0].name, "alice");
         assert_eq!(tuic.congestion_control, "new_reno");
         let Inbound::Hysteria2(hysteria2) = &options.inbounds[1] else { panic!() };
-        assert_eq!(hysteria2.obfs.as_ref().unwrap().r#type, "salamander");
         assert_eq!(hysteria2.users[0].password, "q");
         let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
         assert_eq!(tuic.udp_relay_mode, "native");
         assert_eq!(tuic.dialer_options().detour, "");
         let Outbound::Hysteria2(hysteria2) = &options.outbounds[1] else { panic!() };
-        assert_eq!(hysteria2.up_mbps, 40);
+        assert_eq!(hysteria2.up_mbps, 0);
 
         let unknown_top_level = parse(r#"{"inbounds":[{"type":"tuic","unknown":true}]}"#).unwrap_err().to_string();
         assert!(
@@ -2261,6 +2324,51 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(unknown_nested.contains("unknown field `unknown`"), "{unknown_nested}");
+    }
+
+    #[test]
+    fn hysteria2_unimplemented_options_fail_with_their_config_paths() {
+        for (config, expected) in [
+            (
+                r#"{"inbounds":[{"type":"hysteria2","masquerade":{"type":"string","content":"hello"}}]}"#,
+                "inbounds[0].masquerade: `masquerade` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","realm":{"server_url":"https://realm.test","realm_id":"x"}}]}"#,
+                "inbounds[0].realm: `realm` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","obfs":{"type":"salamander","password":"secret"}}]}"#,
+                "inbounds[0].obfs.type: `obfs.type` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","obfs":{"type":"gecko","password":"secret"}}]}"#,
+                "inbounds[0].obfs.type: `obfs.type` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","up_mbps":10}]}"#,
+                "inbounds[0].up_mbps: `up_mbps` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","bbr_profile":"aggressive"}]}"#,
+                "inbounds[0].bbr_profile: `bbr_profile` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","server_ports":["443-444"]}]}"#,
+                "outbounds[0].server_ports: `server_ports` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","hop_interval":"30s"}]}"#,
+                "outbounds[0].hop_interval: `hop_interval` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","realm":{"server_url":"https://realm.test","realm_id":"x"}}]}"#,
+                "outbounds[0].realm: `realm` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
     }
 
     #[test]
