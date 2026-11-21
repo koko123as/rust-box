@@ -185,14 +185,22 @@ fn collect_matchers<'a>(rule: &'a DnsRule, matchers: &mut Vec<&'a DnsRuleMatch>)
     }
 }
 
-fn validate_nested_actions(rule: &DnsRule) -> Result<(), String> {
+fn validate_nested_action_tree(rule: &DnsRule) -> Result<(), String> {
     if let Rule::Logical { rules, .. } = rule {
         for (index, rule) in rules.iter().enumerate() {
             if rule.action().is_some() {
                 return Err(format!("sub rule[{index}]: DNS rule action is not supported in nested rules"));
             }
-            validate_nested_actions(rule).map_err(|error| format!("sub rule[{index}]: {error}"))?;
+            validate_nested_action_tree(rule).map_err(|error| format!("sub rule[{index}]: {error}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Nested DNS rule actions are rejected by sing-box in either DNS rule mode.
+pub(crate) fn validate_nested_actions(rules: &[DnsRule]) -> Result<(), String> {
+    for (index, rule) in rules.iter().enumerate() {
+        validate_nested_action_tree(rule).map_err(|error| format!("dns rule[{index}]: {error}"))?;
     }
     Ok(())
 }
@@ -206,7 +214,6 @@ pub(crate) fn validate_evaluate_rules(rules: &[DnsRule]) -> Result<(), String> {
 
     for (index, rule) in rules.iter().enumerate() {
         let rule_error = |message: String| format!("dns rule[{index}]: {message}");
-        validate_nested_actions(rule).map_err(rule_error)?;
 
         let is_logical = matches!(rule, Rule::Logical { .. });
         let mut matchers = Vec::new();
