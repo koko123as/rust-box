@@ -2161,10 +2161,6 @@ mod tests {
 
         for (config, needle) in [
             (
-                r#"{"inbounds":[{"type":"vmess","transport":{"type":"http","path":"/"}}]}"#,
-                "inbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
-            (
                 r#"{"inbounds":[{"type":"vmess","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
                 "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
@@ -2229,10 +2225,6 @@ mod tests {
         assert_eq!(outbound.packet_encoding.as_deref(), Some(""));
 
         for (config, needle) in [
-            (
-                r#"{"inbounds":[{"type":"trojan","transport":{"type":"http","path":"/"}}]}"#,
-                "inbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
             (r#"{"inbounds":[{"type":"trojan","transport":{}}]}"#, "unknown transport type: "),
             (r#"{"outbounds":[{"type":"vless","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
             (
