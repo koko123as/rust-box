@@ -21,7 +21,8 @@ fn read(name: &str) -> Vec<u8> {
 }
 
 fn rust_box(args: &[&str]) -> Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_rust-box")).args(args).output().unwrap();
+    let binary = std::env::var_os("CARGO_BIN_EXE_rust-box").expect("Cargo supplies the rust-box binary path");
+    let output = Command::new(binary).args(args).output().unwrap();
     output
 }
 

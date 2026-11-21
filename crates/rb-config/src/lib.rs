@@ -1047,6 +1047,29 @@ fn validate_hosts_predefined(value: &Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_fakeip_ranges(value: &Value) -> Result<(), ConfigError> {
+    let Some(servers) = value.get("dns").and_then(|dns| dns.get("servers")).and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, server) in servers.iter().enumerate() {
+        if server.get("type").and_then(Value::as_str) != Some("fakeip") {
+            continue;
+        }
+        for field in ["inet4_range", "inet6_range"] {
+            let Some(range) = server.get(field) else { continue };
+            let result = match range {
+                Value::Null => continue,
+                Value::String(prefix) => prefix.parse::<IpPrefix>().map(|_| ()).map_err(|error| error.to_string()),
+                other => serde_json::from_value::<String>(other.clone()).map(|_| ()).map_err(|error| error.to_string()),
+            };
+            if let Err(message) = result {
+                return Err(ConfigError::Field { path: format!("dns.servers[{index}].{field}"), message });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses a configuration, naming the path of a field that fails.
 pub fn parse(content: &str) -> Result<Options, ConfigError> {
     let clean = strip_json_comments(content.as_bytes()).map_err(ConfigError::Unsupported)?;
@@ -1059,6 +1082,7 @@ pub fn parse(content: &str) -> Result<Options, ConfigError> {
         }
     }
     validate_hosts_predefined(&value)?;
+    validate_fakeip_ranges(&value)?;
     let options: Options = serde_path_to_error::deserialize(value)
         .map_err(|error| ConfigError::Field { path: error.path().to_string(), message: error.inner().to_string() })?;
     options.validate()?;
