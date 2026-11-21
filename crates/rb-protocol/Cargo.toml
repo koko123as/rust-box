@@ -1,0 +1,18 @@
+[package]
+name = "rb-protocol"
+description = "rust-box protocols (sing-box protocol/): socks, http, mixed, direct, block"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-config.workspace = true
+rb-adapter.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

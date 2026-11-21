@@ -1,0 +1,18 @@
+[package]
+name = "rb-route"
+description = "rust-box router (sing-box route/)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-config.workspace = true
+rb-adapter.workspace = true
+rb-rule.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

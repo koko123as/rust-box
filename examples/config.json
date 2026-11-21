@@ -1,0 +1,29 @@
+{
+  "log": {"level": "info", "timestamp": true},
+  "dns": {
+    "servers": [
+      {"type": "local", "tag": "local"},
+      {"type": "udp", "tag": "cloudflare", "server": "1.1.1.1"}
+    ],
+    "rules": [{"domain_suffix": ["lan", "local"], "server": "local"}],
+    "final": "cloudflare",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"}
+  ],
+  "route": {
+    "rules": [
+      {"action": "sniff"},
+      {"protocol": "bittorrent", "action": "reject"},
+      {"domain_suffix": ["ads.example"], "action": "reject"},
+      {"ip_is_private": true, "outbound": "direct"}
+    ],
+    "final": "direct",
+    "default_domain_resolver": "local"
+  }
+}

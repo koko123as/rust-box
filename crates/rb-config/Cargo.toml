@@ -1,0 +1,13 @@
+[package]
+name = "rb-config"
+description = "rust-box configuration model (sing-box compatible JSON subset)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+serde_path_to_error = "0.1"
