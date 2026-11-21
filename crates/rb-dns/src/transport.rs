@@ -3,12 +3,14 @@
 mod doh;
 mod doq;
 mod dot;
+mod fakeip;
 mod hosts;
 mod http3;
 mod quic_socket;
 pub use doh::DohTransport;
 pub use doq::DoqTransport;
 pub use dot::DotTransport;
+pub use fakeip::FakeIpTransport;
 pub use hosts::HostsTransport;
 pub use http3::H3Transport;
 
@@ -42,6 +44,7 @@ pub enum Transport {
     Doh(Arc<DohTransport>),
     H3(Arc<H3Transport>),
     Hosts(Arc<HostsTransport>),
+    FakeIp(Arc<FakeIpTransport>),
 }
 
 impl std::fmt::Debug for Transport {
@@ -55,6 +58,7 @@ impl std::fmt::Debug for Transport {
             Transport::Doh(_) => f.write_str("Doh"),
             Transport::H3(_) => f.write_str("H3"),
             Transport::Hosts(_) => f.write_str("Hosts"),
+            Transport::FakeIp(fakeip) => write!(f, "{fakeip:?}"),
         }
     }
 }
@@ -127,6 +131,7 @@ impl Transport {
         match self {
             Transport::Local => query_local(domain, query_type).await,
             Transport::Hosts(hosts) => hosts.query(domain, query_type),
+            Transport::FakeIp(fakeip) => fakeip.query(domain, query_type),
             Transport::Dot(dot) => {
                 let id = next_id();
                 let query = build_query(domain, query_type, id)?;
@@ -197,6 +202,7 @@ impl Transport {
         let mut response = match self {
             Transport::Local => return Ok(None),
             Transport::Hosts(hosts) => return hosts.exchange(query).map(Some),
+            Transport::FakeIp(fakeip) => fakeip.exchange(query)?,
             Transport::Udp(server, dialer) => {
                 let socket = dialer.dial_udp(&Socksaddr::from(*server)).await?;
                 socket.write_packet(&message, &Socksaddr::from(*server)).await?;

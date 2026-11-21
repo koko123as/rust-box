@@ -361,3 +361,54 @@ async fn hosts_predefined_path_order_and_dns_responses() {
     std::fs::remove_file(first).unwrap();
     std::fs::remove_file(second).unwrap();
 }
+
+#[tokio::test]
+async fn fakeip_allocates_per_domain_and_supports_reverse_lookup() {
+    let dns = router(
+        r#"{"servers":[
+            {"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15","inet6_range":"2001:2::/48"},
+            {"type":"local","tag":"local"}],"final":"local"}"#
+            .into(),
+    );
+    let options =
+        LookupOptions { server: Some("fake".into()), strategy: DomainStrategy::Ipv4Only, ..Default::default() };
+    let first = dns.lookup("one.test", &options).await.unwrap();
+    assert_eq!(first, vec!["198.18.0.2".parse::<IpAddr>().unwrap()]);
+    assert_eq!(dns.lookup("ONE.TEST.", &options).await.unwrap(), first);
+    assert_eq!(dns.reverse_lookup(first[0]).unwrap().as_deref(), Some("one.test"));
+    assert_eq!(dns.reverse_lookup("203.0.113.1".parse().unwrap()).unwrap(), None);
+    assert!(dns
+        .reverse_lookup("198.18.0.4".parse().unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("missing fakeip record"));
+
+    let v6 = LookupOptions { strategy: DomainStrategy::Ipv6Only, ..options };
+    assert_eq!(dns.lookup("one.test", &v6).await.unwrap(), vec!["2001:2::2".parse::<IpAddr>().unwrap()]);
+}
+
+#[test]
+fn fakeip_server_must_be_unique_and_not_the_default() {
+    for config in [
+        r#"{"servers":[{"type":"fakeip","inet4_range":"198.18.0.0/15"}]}"#,
+        r#"{"servers":[{"type":"fakeip","tag":"a","inet4_range":"198.18.0.0/15"},
+            {"type":"fakeip","tag":"b","inet6_range":"2001:2::/48"}],"final":"local"}"#,
+    ] {
+        let options: rb_config::DnsOptions = serde_json::from_str(config).unwrap();
+        let certificates = rb_certificate::Store::new(None).unwrap();
+        let error = match DnsRouter::new(
+            &options,
+            &Default::default(),
+            &rb_adapter::OutboundRegistry::new(),
+            &rb_rule::RuleSets::new(),
+            &certificates,
+        ) {
+            Ok(_) => panic!("invalid FakeIP server registration must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("default server cannot be fakeip") || error.contains("multiple fakeip server"),
+            "{error}"
+        );
+    }
+}

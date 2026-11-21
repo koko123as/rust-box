@@ -24,7 +24,8 @@ use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_rule::{compile, compile_dns_match, Compiled, Context as RuleContext, Metadata, RuleSetMetadata, RuleSets};
 
 pub use transport::{
-    Answer, DohTransport, DoqTransport, DotTransport, H3Transport, HostsTransport, Transport, QTYPE_A, QTYPE_AAAA,
+    Answer, DohTransport, DoqTransport, DotTransport, FakeIpTransport, H3Transport, HostsTransport, Transport, QTYPE_A,
+    QTYPE_AAAA,
 };
 
 /// sing-box `C.DNSTimeout`.
@@ -139,6 +140,10 @@ impl DnsResolver for DnsResolverHandle {
     async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
         self.router()?.exchange(query, options).await
     }
+
+    fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        self.router()?.reverse_lookup(address)
+    }
 }
 
 #[derive(Debug)]
@@ -192,6 +197,7 @@ impl DnsRouter {
     ) -> Result<Arc<Self>, DnsError> {
         let mut servers = HashMap::new();
         let mut first = None;
+        let mut fakeip_count = 0;
         let dns_resolver = Arc::new(DnsResolverHandle::default());
         let dns_resolver_trait: Arc<dyn DnsResolver> = dns_resolver.clone();
         for (index, server) in options.servers.iter().enumerate() {
@@ -343,6 +349,16 @@ impl DnsRouter {
                 DnsServer::Hosts(hosts) => {
                     Transport::hosts(hosts).map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?
                 }
+                DnsServer::FakeIp(fakeip) => {
+                    fakeip_count += 1;
+                    if fakeip_count > 1 {
+                        return Err(DnsError("multiple fakeip server are not supported".into()));
+                    }
+                    Transport::FakeIp(Arc::new(
+                        FakeIpTransport::new(fakeip)
+                            .map_err(|error| DnsError(format!("dns.servers[{index}]: {error}")))?,
+                    ))
+                }
             };
             first.get_or_insert_with(|| tag.clone());
             servers.insert(tag, Arc::new(transport));
@@ -356,6 +372,9 @@ impl DnsRouter {
             servers.insert("local".into(), Arc::new(Transport::Local));
             "local".into()
         };
+        if servers.get(&final_server).is_some_and(|server| matches!(server.as_ref(), Transport::FakeIp(_))) {
+            return Err(DnsError("default server cannot be fakeip".into()));
+        }
         let timeout = if options.timeout.0.is_zero() { DEFAULT_TIMEOUT } else { options.timeout.0 };
         let cache = (!options.disable_cache).then(|| {
             Mutex::new(Cache {
@@ -424,6 +443,22 @@ impl DnsRouter {
     /// Stops accepting rule-set updates (sing-box marks the router closing).
     pub fn close(&self) {
         self.state.lock().unwrap().closing = true;
+    }
+
+    /// `DNSRouter.LookupReverseMapping`, including FakeIP store lookups.
+    /// An address inside the configured FakeIP range without a record is an
+    /// error rather than an ordinary unmapped address.
+    pub fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        for server in self.servers.values() {
+            if let Transport::FakeIp(fakeip) = server.as_ref() {
+                if fakeip.contains(address) {
+                    return fakeip.lookup(address).map(Some).ok_or_else(|| {
+                        io::Error::other("missing fakeip record, try enable `experimental.cache_file`")
+                    });
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Whether the rules run in sing-box's legacy DNS mode.
@@ -901,6 +936,10 @@ impl DnsResolver for DnsRouter {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not a DNS query"));
         }
         self.exchange_message(&request, options).await
+    }
+
+    fn reverse_lookup(&self, address: IpAddr) -> io::Result<Option<String>> {
+        DnsRouter::reverse_lookup(self, address)
     }
 }
 

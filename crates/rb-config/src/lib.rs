@@ -32,7 +32,7 @@ pub use rule_set::{
     RuleSetKind, RuleSetOptions,
 };
 pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions};
-pub use types::{DomainResolveOptions, DomainStrategy, Duration, Listable, QueryType, UdpTimeout, User};
+pub use types::{DomainResolveOptions, DomainStrategy, Duration, IpPrefix, Listable, QueryType, UdpTimeout, User};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -209,6 +209,8 @@ pub enum DnsServer {
     Http3(Box<RemoteHttpsDnsServer>),
     #[serde(rename = "hosts")]
     Hosts(HostsDnsServer),
+    #[serde(rename = "fakeip")]
+    FakeIp(FakeIpDnsServer),
 }
 
 impl DnsServer {
@@ -219,6 +221,7 @@ impl DnsServer {
             DnsServer::Tls(server) | DnsServer::Quic(server) => &server.tag,
             DnsServer::Https(server) | DnsServer::Http3(server) => &server.tag,
             DnsServer::Hosts(server) => &server.tag,
+            DnsServer::FakeIp(server) => &server.tag,
         }
     }
 }
@@ -283,6 +286,18 @@ pub struct HostsDnsServer {
     pub path: Listable<String>,
     #[serde(default)]
     pub predefined: Option<std::collections::BTreeMap<String, Listable<IpAddr>>>,
+}
+
+/// sing-box `FakeIPDNSServerOptions`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeIpDnsServer {
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub inet4_range: Option<IpPrefix>,
+    #[serde(default)]
+    pub inet6_range: Option<IpPrefix>,
 }
 
 /// Inbounds (sing-box `option.Inbound`).
@@ -1428,6 +1443,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("dns.servers[0].predefined.bad"), "{error}");
+    }
+
+    #[test]
+    fn fakeip_server_options() {
+        let options = parse(
+            r#"{"dns":{"servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15",
+                "inet6_range":"2001:2::/48"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.dns.servers[0].tag(), "fake");
+        let DnsServer::FakeIp(fakeip) = &options.dns.servers[0] else { panic!() };
+        assert_eq!(fakeip.inet4_range.unwrap().prefix_len, 15);
+        assert_eq!(fakeip.inet6_range.unwrap().prefix_len, 48);
+
+        for (config, field) in [
+            (r#"{"dns":{"servers":[{"type":"fakeip","inet4_range":"not-a-cidr"}]}}"#, "inet4_range"),
+            (r#"{"dns":{"servers":[{"type":"fakeip","inet4_range":"198.18.0.0/33"}]}}"#, "inet4_range"),
+            (r#"{"dns":{"servers":[{"type":"fakeip","unknown":true}]}}"#, "unknown"),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains("dns.servers[0]") && error.contains(field), "{error}");
+        }
     }
 
     #[test]
