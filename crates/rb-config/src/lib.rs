@@ -958,6 +958,34 @@ pub struct RouteOptions {
     pub default_fallback_delay: Duration,
 }
 
+fn validate_hosts_predefined(value: &Value) -> Result<(), ConfigError> {
+    let Some(servers) = value.get("dns").and_then(|dns| dns.get("servers")).and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, server) in servers.iter().enumerate() {
+        if server.get("type").and_then(Value::as_str) != Some("hosts") {
+            continue;
+        }
+        let Some(predefined) = server.get("predefined").and_then(Value::as_object) else { continue };
+        for (domain, addresses) in predefined {
+            let invalid = match addresses {
+                Value::String(address) => address.parse::<IpAddr>().is_err(),
+                Value::Array(values) => {
+                    values.iter().filter_map(Value::as_str).any(|address| address.parse::<IpAddr>().is_err())
+                }
+                _ => false,
+            };
+            if invalid {
+                return Err(ConfigError::Field {
+                    path: format!("dns.servers[{index}].predefined.{domain}"),
+                    message: "invalid IP address syntax".into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses a configuration, naming the path of a field that fails.
 pub fn parse(content: &str) -> Result<Options, ConfigError> {
     let clean = strip_json_comments(content.as_bytes()).map_err(ConfigError::Unsupported)?;
@@ -969,6 +997,7 @@ pub fn parse(content: &str) -> Result<Options, ConfigError> {
             }
         }
     }
+    validate_hosts_predefined(&value)?;
     let options: Options = serde_path_to_error::deserialize(value)
         .map_err(|error| ConfigError::Field { path: error.path().to_string(), message: error.inner().to_string() })?;
     options.validate()?;
