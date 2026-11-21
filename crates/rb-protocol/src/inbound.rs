@@ -1,16 +1,27 @@
 //! The `socks`, `http` and `mixed` inbounds: a TCP listener, the protocol
 //! handshake, then the connection handed to the router (sing-box
 //! `protocol/{socks,http,mixed}/inbound.go` with `common/listener`).
+//!
+//! A SOCKS5 UDP ASSOCIATE (in `socks` and `mixed`) opens a UDP socket on the
+//! address the client reached, reads the first packet and hands the whole
+//! association to the router as one packet connection, which lives until it
+//! is idle for `udp_timeout` or the control connection closes (sing
+//! `socks.HandleConnectionEx`).
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use rb_adapter::{BoxStream, ConnectionRouter, Inbound, InboundContext, Network, PrefixedStream, RouteError};
+use rb_adapter::{
+    BoxStream, CachedPacketConn, ConnectionRouter, Inbound, InboundContext, Network, PrefixedStream, RouteError,
+    SharedPacketConn, Socksaddr, MAX_PACKET_SIZE,
+};
 use rb_config::ProxyInbound as ProxyInboundOptions;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -34,11 +45,15 @@ impl ProxyKind {
     }
 }
 
+/// sing-box `C.UDPTimeout`.
+pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub struct ProxyInbound {
     tag: String,
     kind: ProxyKind,
     listen: SocketAddr,
     users: Arc<HashMap<String, String>>,
+    udp_timeout: Duration,
     router: Arc<dyn ConnectionRouter>,
     local_addr: OnceLock<SocketAddr>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -53,6 +68,11 @@ impl ProxyInbound {
             kind,
             listen: SocketAddr::new(ip, options.listen_port),
             users: Arc::new(users),
+            udp_timeout: if options.udp_timeout.0 .0.is_zero() {
+                DEFAULT_UDP_TIMEOUT
+            } else {
+                options.udp_timeout.0 .0
+            },
             router,
             local_addr: OnceLock::new(),
             task: Mutex::new(None),
@@ -124,6 +144,9 @@ impl ProxyInbound {
         };
         let result = match kind {
             ProxyKind::Socks => match socks::handshake(&mut stream, &self.users).await {
+                Ok(request) if request.command == socks::Command::UdpAssociate => {
+                    self.associate(stream, source, request.user).await
+                }
                 Ok(request) => self.route(source, request.destination, request.user, Box::new(stream)).await,
                 Err(error) => Err(error),
             },
@@ -145,6 +168,47 @@ impl ProxyInbound {
         if let Err(error) = result {
             debug!("inbound/{}[{}]: {source}: {error}", self.kind.name(), self.tag);
         }
+    }
+
+    /// Serves a UDP ASSOCIATE until the session ends or the control
+    /// connection closes; then the socket and the connection close together.
+    async fn associate(&self, mut control: TcpStream, source: SocketAddr, user: Option<String>) -> io::Result<()> {
+        let local = control.local_addr()?;
+        let socket = UdpSocket::bind(SocketAddr::new(local.ip(), 0))
+            .await
+            .map_err(|error| io::Error::new(error.kind(), format!("socks5: listen udp: {error}")))?;
+        let bind = socket.local_addr()?;
+        socks::write_bind_reply(&mut control, &Socksaddr::from(bind)).await?;
+        let conn: SharedPacketConn = Arc::new(socks::AssociatePacketConn::new(socket, source.ip()));
+        let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+        let mut closed = [0u8; 1];
+        let (length, destination) = tokio::select! {
+            read = tokio::time::timeout(self.udp_timeout, conn.read_packet(&mut buffer)) => match read {
+                Ok(read) => read?,
+                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "socks5: read first packet: timed out")),
+            },
+            _ = control.read(&mut closed) => return Ok(()),
+        };
+        buffer.truncate(length);
+        let conn: SharedPacketConn = Arc::new(CachedPacketConn::new(vec![(buffer, destination.clone())], conn));
+        match &user {
+            Some(user) => {
+                info!("inbound/{}[{}]: [{user}] inbound packet connection to {destination}", self.kind.name(), self.tag)
+            }
+            None => info!("inbound/{}[{}]: inbound packet connection to {destination}", self.kind.name(), self.tag),
+        }
+        let mut context = InboundContext::new(&self.tag, self.kind.name(), Network::Udp, source, destination);
+        context.user = user;
+        context.inbound_udp_timeout = Some(self.udp_timeout);
+        tokio::select! {
+            result = self.router.route_packet_connection(context, conn) => match result {
+                Ok(()) | Err(RouteError::Rejected) => {}
+                Err(error) => warn!("inbound/{}[{}]: {source}: {error}", self.kind.name(), self.tag),
+            },
+            // Anything on the control connection, or its end, ends the association.
+            _ = control.read(&mut closed) => debug!("inbound/{}[{}]: {source}: UDP association closed", self.kind.name(), self.tag),
+        }
+        Ok(())
     }
 
     async fn route(

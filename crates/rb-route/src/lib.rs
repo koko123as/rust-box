@@ -1,26 +1,73 @@
 //! The router, mirroring sing-box `route/route.go` (`matchRule`,
-//! `RouteConnectionEx`) and `route/conn.go` (`ConnectionManager`).
+//! `RouteConnectionEx`, `RoutePacketConnectionEx`), `route/conn.go`
+//! (`ConnectionManager.NewConnection`, `NewPacketConnection`) and
+//! `route/dns.go` (`hijack-dns`).
 
+pub mod nat;
 pub mod sniff;
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{
-    BoxStream, ConnectionRouter, DnsResolver, InboundContext, LookupOptions, Outbound, PrefixedStream, RouteError,
+    BoxStream, CachedPacketConn, ConnectionRouter, DnsResolver, InboundContext, LookupOptions, Network, Outbound,
+    PrefixedStream, RouteError, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE,
 };
-use rb_config::{RejectMethod, RouteOptions, RuleAction};
+use rb_config::{RejectMethod, RouteActionOptions, RouteOptions, RuleAction};
 use rb_rule::{compile, compile_route_match, Compiled, Metadata};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 use tracing::{debug, info};
 
-use sniff::{Sniffed, Verdict, SNIFFERS};
+use sniff::{Sniffed, Verdict, PACKET_SNIFFERS, STREAM_SNIFFERS};
 
 /// sing-box `C.ReadPayloadTimeout`, the default sniff timeout.
 pub const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
+/// sing-box `C.DNSTimeout`: a hijacked DNS session ends after this long idle.
+pub const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+/// sing-box `C.UDPTimeout`, the default inbound `udp_timeout`.
+pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Most packets read while sniffing one UDP session (a QUIC ClientHello
+/// split over Initial packets needs a few).
+const MAX_SNIFF_PACKETS: usize = 8;
+
+/// sing-box `C.ProtocolTimeouts`: UDP timeouts of sniffed protocols.
+pub fn protocol_timeout(protocol: &str) -> Option<Duration> {
+    match protocol {
+        "dns" | "ntp" | "stun" => Some(Duration::from_secs(10)),
+        "quic" | "dtls" => Some(Duration::from_secs(30)),
+        _ => None,
+    }
+}
+
+/// sing-box `C.PortProtocols`: the protocol a UDP port implies when nothing
+/// was sniffed.
+pub fn port_protocol(port: u16) -> Option<&'static str> {
+    match port {
+        53 => Some("dns"),
+        123 => Some("ntp"),
+        443 => Some("quic"),
+        3478 => Some("stun"),
+        _ => None,
+    }
+}
+
+/// The idle timeout of a routed UDP session: the route's `udp_timeout`,
+/// else the sniffed (or port) protocol's, never longer than the inbound's.
+pub fn udp_timeout(context: &InboundContext) -> Option<Duration> {
+    let route = context.udp_timeout.or_else(|| {
+        let protocol = context.protocol.as_deref().or_else(|| port_protocol(context.destination.port))?;
+        protocol_timeout(protocol)
+    });
+    match (route, context.inbound_udp_timeout) {
+        (Some(route), Some(inbound)) => Some(route.min(inbound)),
+        (route, inbound) => route.or(inbound),
+    }
+}
 
 pub struct Router {
     rules: Vec<Compiled<RuleAction>>,
@@ -45,6 +92,38 @@ impl std::error::Error for RouterError {}
 pub enum Decision {
     Route(String),
     Reject(RejectMethod),
+    HijackDns,
+}
+
+/// What sniffing reads from while the rules are matched.
+pub enum Input<'a> {
+    /// A TCP connection; sniffing puts the bytes it read back in front.
+    Stream(&'a mut Option<BoxStream>),
+    /// A UDP session; packets read while sniffing are collected in `cached`
+    /// and replayed in front of the connection afterwards.
+    Packet { conn: &'a SharedPacketConn, cached: &'a mut Vec<(Vec<u8>, Socksaddr)> },
+}
+
+fn apply_route_options(context: &mut InboundContext, options: &RouteActionOptions) {
+    if options.udp_disable_domain_unmapping {
+        context.udp_disable_domain_unmapping = true;
+    }
+    if options.udp_connect {
+        context.udp_connect = true;
+    }
+    if !options.udp_timeout.0.is_zero() {
+        context.udp_timeout = Some(options.udp_timeout.0);
+    }
+}
+
+/// The sniffers of a `sniff` action that apply to this kind of connection,
+/// in the action's order (all of them when the action names none).
+fn sniffer_names<'a>(configured: &'a [String], available: &[&'static str]) -> Vec<&'a str> {
+    if configured.is_empty() {
+        available.to_vec()
+    } else {
+        configured.iter().map(String::as_str).filter(|name| available.contains(name)).collect()
+    }
 }
 
 impl Router {
@@ -76,14 +155,24 @@ impl Router {
         Ok(Router { rules, outbounds, final_outbound, dns })
     }
 
-    /// Walks the rules: `sniff` and `resolve` add to the context and go on,
-    /// `route` and `reject` end the walk (sing-box `Router.matchRule`).
+    /// Matches the rules for a TCP connection (see [`Router::decide_input`]).
     pub async fn decide(
         &self,
         context: &mut InboundContext,
         client: &mut Option<BoxStream>,
     ) -> Result<Decision, RouteError> {
-        let mut sniffed = false;
+        self.decide_input(context, Input::Stream(client)).await
+    }
+
+    /// Walks the rules: `sniff`, `resolve` and `route-options` add to the
+    /// context and go on; `route`, `reject` and `hijack-dns` end the walk
+    /// (sing-box `Router.matchRule`).
+    pub async fn decide_input(
+        &self,
+        context: &mut InboundContext,
+        mut input: Input<'_>,
+    ) -> Result<Decision, RouteError> {
+        let mut last_sniffers: Option<&[String]> = None;
         for (index, rule) in self.rules.iter().enumerate() {
             let matched = {
                 let metadata = metadata(context);
@@ -94,28 +183,66 @@ impl Router {
             }
             let Some(action) = rule.action() else { continue };
             match action {
-                RuleAction::Route { outbound } => {
+                RuleAction::Route { outbound, options } => {
                     debug!(rule = index, outbound, "match");
+                    apply_route_options(context, options);
                     return Ok(Decision::Route(outbound.clone()));
+                }
+                RuleAction::RouteOptions(options) => {
+                    debug!(rule = index, "match: route-options");
+                    apply_route_options(context, options);
                 }
                 RuleAction::Reject(reject) => {
                     debug!(rule = index, "match: reject");
                     return Ok(Decision::Reject(reject.method));
                 }
+                RuleAction::HijackDns => {
+                    debug!(rule = index, "match: hijack-dns");
+                    return Ok(Decision::HijackDns);
+                }
                 RuleAction::Sniff { sniffer, timeout } => {
-                    if sniffed {
+                    if context.protocol.is_some() {
+                        debug!(rule = index, "duplicate sniff skipped");
                         continue;
                     }
-                    sniffed = true;
-                    if let Some(stream) = client.take() {
-                        let timeout = if timeout.0.is_zero() { DEFAULT_SNIFF_TIMEOUT } else { timeout.0 };
-                        let (stream, found) = sniff_stream(stream, sniffer, timeout).await;
-                        *client = Some(stream);
-                        if let Some(found) = found {
-                            debug!(rule = index, protocol = found.protocol, domain = ?found.domain, "sniffed");
-                            context.protocol = Some(found.protocol.to_string());
-                            context.sniff_host = found.domain;
+                    if sniff::skip_port(context.destination.port) {
+                        debug!(rule = index, "sniff skipped due to port considered as server-first");
+                        continue;
+                    }
+                    // A sniff that already failed with the same sniffers is not repeated.
+                    if last_sniffers == Some(sniffer.as_slice()) {
+                        continue;
+                    }
+                    last_sniffers = Some(sniffer.as_slice());
+                    let timeout = if timeout.0.is_zero() { DEFAULT_SNIFF_TIMEOUT } else { timeout.0 };
+                    let found = match &mut input {
+                        Input::Stream(client) => {
+                            let names = sniffer_names(sniffer, STREAM_SNIFFERS);
+                            match client.take() {
+                                Some(stream) if !names.is_empty() => {
+                                    let (stream, found) = sniff_stream(stream, &names, timeout).await;
+                                    **client = Some(stream);
+                                    found
+                                }
+                                stream => {
+                                    **client = stream;
+                                    None
+                                }
+                            }
                         }
+                        Input::Packet { conn, cached } => {
+                            let names = sniffer_names(sniffer, PACKET_SNIFFERS);
+                            if names.is_empty() {
+                                None
+                            } else {
+                                sniff_packets(conn, cached, &names, timeout).await.map_err(RouteError::Io)?
+                            }
+                        }
+                    };
+                    if let Some(found) = found {
+                        debug!(rule = index, protocol = found.protocol, domain = ?found.domain, "sniffed");
+                        context.protocol = Some(found.protocol.to_string());
+                        context.sniff_host = found.domain;
                     }
                 }
                 RuleAction::Resolve { server, strategy, disable_cache } => {
@@ -124,8 +251,7 @@ impl Router {
                         server: (!server.is_empty()).then(|| server.clone()),
                         strategy: *strategy,
                         disable_cache: *disable_cache,
-                        inbound: Some(context.inbound.clone()),
-                        ..Default::default()
+                        ..LookupOptions::for_context(context)
                     };
                     let addresses = self.dns.lookup(&domain, &options).await.map_err(RouteError::Resolve)?;
                     debug!(rule = index, domain, ?addresses, "resolved");
@@ -134,6 +260,125 @@ impl Router {
             }
         }
         Ok(Decision::Route(self.final_outbound.clone()))
+    }
+
+    fn outbound(&self, tag: &str) -> Result<&Arc<dyn Outbound>, RouteError> {
+        self.outbounds.get(tag).ok_or_else(|| {
+            RouteError::Dial(io::Error::new(io::ErrorKind::NotFound, format!("outbound not found: {tag}")))
+        })
+    }
+
+    /// Answers DNS over TCP on a hijacked connection (sing-box
+    /// `hijackDNSStream`): length-prefixed queries, one after another.
+    async fn hijack_dns_stream(&self, context: &InboundContext, mut client: BoxStream) -> io::Result<()> {
+        let options = LookupOptions::for_context(context);
+        loop {
+            let length = match tokio::time::timeout(DNS_TIMEOUT, client.read_u16()).await {
+                Ok(Ok(length)) => length as usize,
+                Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Ok(()),
+            };
+            let mut query = vec![0u8; length];
+            tokio::time::timeout(DNS_TIMEOUT, client.read_exact(&mut query))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))??;
+            let Some(response) = self.dns.exchange(&query, &options).await? else { continue };
+            let mut frame = Vec::with_capacity(response.len() + 2);
+            frame.extend_from_slice(&(response.len() as u16).to_be_bytes());
+            frame.extend_from_slice(&response);
+            client.write_all(&frame).await?;
+        }
+    }
+
+    /// Answers DNS queries on a hijacked UDP session (sing-box
+    /// `NewDNSPacketConnection`): every packet is a query, answered from
+    /// the address it was sent to. Queries are answered concurrently; the
+    /// session ends after [`DNS_TIMEOUT`] idle.
+    async fn hijack_dns_packets(&self, context: &InboundContext, client: SharedPacketConn) -> io::Result<()> {
+        let options = LookupOptions::for_context(context);
+        let timeout = context.inbound_udp_timeout.map_or(DNS_TIMEOUT, |inbound| inbound.min(DNS_TIMEOUT));
+        let activity = Arc::new(Activity::new());
+        let mut answers = tokio::task::JoinSet::new();
+        let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+        loop {
+            tokio::select! {
+                read = client.read_packet(&mut buffer) => {
+                    let (length, destination) = read?;
+                    activity.touch();
+                    let query = buffer[..length].to_vec();
+                    let (dns, client, options, activity) = (self.dns.clone(), client.clone(), options.clone(), activity.clone());
+                    answers.spawn(async move {
+                        if let Some(response) = dns.exchange(&query, &options).await? {
+                            client.write_packet(&response, &destination).await?;
+                            activity.touch();
+                        }
+                        Ok::<(), io::Error>(())
+                    });
+                }
+                Some(answered) = answers.join_next() => {
+                    if let Ok(Err(error)) = answered {
+                        return Err(error);
+                    }
+                }
+                _ = activity.idle(Some(timeout)) => return Ok(()),
+            }
+        }
+    }
+}
+
+/// When a session last moved a packet, for its idle timeout (sing-box
+/// `canceler.PacketConn`).
+struct Activity {
+    start: Instant,
+    last: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Activity { start: Instant::now(), last: AtomicU64::new(0) }
+    }
+
+    fn touch(&self) {
+        self.last.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Completes once nothing moved for `timeout`; never without one.
+    async fn idle(&self, timeout: Option<Duration>) {
+        let Some(timeout) = timeout else { return std::future::pending().await };
+        loop {
+            let deadline = self.start + Duration::from_millis(self.last.load(Ordering::Relaxed)) + timeout;
+            if deadline <= Instant::now() {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+/// Copies packets from `from` to `to` until one side fails, and returns why.
+async fn copy_packets(from: &SharedPacketConn, to: &SharedPacketConn, activity: &Activity) -> io::Error {
+    let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+    loop {
+        let (length, address) = match from.read_packet(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => return error,
+        };
+        activity.touch();
+        if let Err(error) = to.write_packet(&buffer[..length], &address).await {
+            return error;
+        }
+    }
+}
+
+/// Relays a UDP session in both directions until either side fails or it
+/// is idle for `timeout` (sing-box `packetConnectionCopy` under a canceler).
+pub async fn relay_packets(client: SharedPacketConn, remote: SharedPacketConn, timeout: Option<Duration>) {
+    let activity = Activity::new();
+    tokio::select! {
+        error = copy_packets(&client, &remote, &activity) => debug!(%error, "packet connection upload closed"),
+        error = copy_packets(&remote, &client, &activity) => debug!(%error, "packet connection download closed"),
+        _ = activity.idle(timeout) => debug!("packet connection timed out"),
     }
 }
 
@@ -154,12 +399,7 @@ fn metadata(context: &InboundContext) -> Metadata<'_> {
 
 /// Reads the client's first bytes until a sniffer decides or the timeout
 /// passes, and gives the stream back with those bytes in front.
-async fn sniff_stream(mut stream: BoxStream, sniffers: &[String], timeout: Duration) -> (BoxStream, Option<Sniffed>) {
-    let names: Vec<&str> = if sniffers.is_empty() {
-        SNIFFERS.to_vec()
-    } else {
-        sniffers.iter().map(String::as_str).filter(|name| SNIFFERS.contains(name)).collect()
-    };
+async fn sniff_stream(mut stream: BoxStream, names: &[&str], timeout: Duration) -> (BoxStream, Option<Sniffed>) {
     let mut buffer = Vec::with_capacity(4096);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut found = None;
@@ -171,7 +411,7 @@ async fn sniff_stream(mut stream: BoxStream, sniffers: &[String], timeout: Durat
         };
         buffer.extend_from_slice(&chunk[..read]);
         let mut need_more = false;
-        for name in &names {
+        for name in names {
             match sniff::sniff(name, &buffer) {
                 Verdict::Found(sniffed) => {
                     found = Some(sniffed);
@@ -188,6 +428,61 @@ async fn sniff_stream(mut stream: BoxStream, sniffers: &[String], timeout: Durat
     (Box::new(PrefixedStream::new(buffer, stream)), found)
 }
 
+/// Reads packets until a packet sniffer decides, the timeout passes between
+/// two packets, or [`MAX_SNIFF_PACKETS`] were read. Packets are kept in
+/// `cached` (sing-box `actionSniff` for packet connections).
+async fn sniff_packets(
+    conn: &SharedPacketConn,
+    cached: &mut Vec<(Vec<u8>, Socksaddr)>,
+    names: &[&str],
+    timeout: Duration,
+) -> io::Result<Option<Sniffed>> {
+    // Index of the first packet of a QUIC ClientHello split over packets.
+    let mut quic_from: Option<usize> = None;
+    let mut index = 0;
+    loop {
+        if index == cached.len() {
+            if cached.len() >= MAX_SNIFF_PACKETS {
+                break;
+            }
+            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+            match tokio::time::timeout(timeout, conn.read_packet(&mut buffer)).await {
+                Err(_) => break,
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok((length, address))) => {
+                    buffer.truncate(length);
+                    cached.push((buffer, address));
+                }
+            }
+        }
+        index += 1;
+        if let Some(from) = quic_from {
+            let packets: Vec<&[u8]> = cached[from..index].iter().map(|(data, _)| data.as_slice()).collect();
+            match sniff::quic(&packets) {
+                Verdict::Found(found) => return Ok(Some(found)),
+                Verdict::NeedMore => continue,
+                // sing-box has already marked the session as QUIC by now.
+                Verdict::NotThis => return Ok(Some(Sniffed { protocol: "quic", domain: None })),
+            }
+        }
+        let packet = &cached[index - 1].0;
+        let mut need_more = false;
+        for name in names {
+            match sniff::sniff_packet(name, packet) {
+                Verdict::Found(found) => return Ok(Some(found)),
+                Verdict::NeedMore => need_more = true,
+                Verdict::NotThis => {}
+            }
+        }
+        if !need_more {
+            return Ok(None);
+        }
+        debug!("attempt to sniff fragmented QUIC client hello");
+        quic_from = Some(index - 1);
+    }
+    Ok(quic_from.map(|_| Sniffed { protocol: "quic", domain: None }))
+}
+
 #[async_trait]
 impl ConnectionRouter for Router {
     async fn route_connection(&self, mut context: InboundContext, client: BoxStream) -> Result<(), RouteError> {
@@ -200,10 +495,14 @@ impl ConnectionRouter for Router {
                 info!(inbound = %context.inbound, destination = %context.destination, "rejected");
                 return Err(RouteError::Rejected);
             }
+            Decision::HijackDns => {
+                if let Err(error) = self.hijack_dns_stream(&context, client).await {
+                    debug!(%error, "hijacked DNS connection closed");
+                }
+                return Ok(());
+            }
         };
-        let outbound = self.outbounds.get(&tag).ok_or_else(|| {
-            RouteError::Dial(io::Error::new(io::ErrorKind::NotFound, format!("outbound not found: {tag}")))
-        })?;
+        let outbound = self.outbound(&tag)?;
         info!(
             "outbound/{}[{}]: outbound connection to {}",
             outbound.kind(),
@@ -219,6 +518,45 @@ impl ConnectionRouter for Router {
             Ok((up, down)) => debug!(destination = %context.destination, up, down, "connection closed"),
             Err(error) => debug!(destination = %context.destination, %error, "connection closed"),
         }
+        Ok(())
+    }
+
+    async fn route_packet_connection(
+        &self,
+        mut context: InboundContext,
+        client: SharedPacketConn,
+    ) -> Result<(), RouteError> {
+        context.network = Network::Udp;
+        let mut cached = Vec::new();
+        let decision = self.decide_input(&mut context, Input::Packet { conn: &client, cached: &mut cached }).await?;
+        let client: SharedPacketConn =
+            if cached.is_empty() { client } else { Arc::new(CachedPacketConn::new(cached, client)) };
+        let tag = match decision {
+            Decision::Route(tag) => tag,
+            Decision::Reject(_) => {
+                info!(inbound = %context.inbound, destination = %context.destination, "packet connection rejected");
+                return Err(RouteError::Rejected);
+            }
+            Decision::HijackDns => {
+                if let Err(error) = self.hijack_dns_packets(&context, client).await {
+                    debug!(%error, "hijacked DNS packet connection closed");
+                }
+                return Ok(());
+            }
+        };
+        let outbound = self.outbound(&tag)?;
+        info!(
+            "outbound/{}[{}]: outbound packet connection to {}",
+            outbound.kind(),
+            tag,
+            context
+                .sniff_host
+                .as_ref()
+                .map(|host| format!("{host}:{}", context.destination.port))
+                .unwrap_or_else(|| context.destination.to_string())
+        );
+        let remote = outbound.listen_packet(&context).await.map_err(RouteError::Dial)?;
+        relay_packets(client, remote, udp_timeout(&context)).await;
         Ok(())
     }
 }

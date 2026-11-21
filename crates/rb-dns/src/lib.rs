@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::{RData, Record};
 use rb_adapter::{apply_strategy, DnsResolver, LookupOptions};
 use rb_config::{DnsOptions, DnsRuleAction, DnsServer, DomainStrategy, RejectMethod};
 use rb_rule::{compile, compile_dns_match, Compiled, Metadata};
@@ -26,21 +28,33 @@ const DEFAULT_CACHE_CAPACITY: usize = 1024;
 type CacheKey = (String, String, u16);
 
 struct Cache {
-    entries: HashMap<CacheKey, (Vec<IpAddr>, Option<Instant>)>,
+    entries: HashMap<CacheKey, CacheEntry>,
     capacity: usize,
     disable_expire: bool,
 }
 
+struct CacheEntry {
+    addresses: Vec<IpAddr>,
+    ttl: u32,
+    expires: Option<Instant>,
+}
+
 impl Cache {
-    fn get(&mut self, key: &CacheKey) -> Option<Vec<IpAddr>> {
-        let (addresses, expires) = self.entries.get(key)?;
-        if let Some(expires) = expires {
-            if *expires <= Instant::now() {
-                self.entries.remove(key);
-                return None;
+    /// The cached addresses and their remaining TTL.
+    fn get(&mut self, key: &CacheKey) -> Option<Answer> {
+        let entry = self.entries.get(key)?;
+        let ttl = match entry.expires {
+            Some(expires) => {
+                let now = Instant::now();
+                if expires <= now {
+                    self.entries.remove(key);
+                    return None;
+                }
+                (expires - now).as_secs().max(1) as u32
             }
-        }
-        Some(addresses.clone())
+            None => entry.ttl,
+        };
+        Some(Answer { addresses: entry.addresses.clone(), ttl })
     }
 
     fn put(&mut self, key: CacheKey, addresses: Vec<IpAddr>, ttl: u32) {
@@ -49,7 +63,7 @@ impl Cache {
         }
         if self.entries.len() >= self.capacity {
             let now = Instant::now();
-            self.entries.retain(|_, (_, expires)| expires.is_none_or(|expires| expires > now));
+            self.entries.retain(|_, entry| entry.expires.is_none_or(|expires| expires > now));
             if self.entries.len() >= self.capacity {
                 if let Some(victim) = self.entries.keys().next().cloned() {
                     self.entries.remove(&victim);
@@ -57,8 +71,14 @@ impl Cache {
             }
         }
         let expires = (!self.disable_expire).then(|| Instant::now() + Duration::from_secs(u64::from(ttl)));
-        self.entries.insert(key, (addresses, expires));
+        self.entries.insert(key, CacheEntry { addresses, ttl, expires });
     }
+}
+
+/// Where the DNS rules send one query.
+enum Selection {
+    Server { server: String, strategy: DomainStrategy, disable_cache: bool },
+    Reject(RejectMethod),
 }
 
 /// The DNS router (sing-box `dns.Router` + `dns.Client`).
@@ -130,17 +150,19 @@ impl DnsRouter {
 
     /// Picks the server for one query: the first matching rule's, else
     /// `dns.final` (sing-box `Router.matchDNS`).
-    fn select(
-        &self,
-        domain: &str,
-        query_type: u16,
-        options: &LookupOptions,
-    ) -> io::Result<(String, DomainStrategy, bool)> {
+    fn select(&self, domain: &str, query_type: u16, options: &LookupOptions) -> Selection {
         if let Some(server) = &options.server {
-            return Ok((server.clone(), options.strategy, options.disable_cache));
+            return Selection::Server {
+                server: server.clone(),
+                strategy: options.strategy,
+                disable_cache: options.disable_cache,
+            };
         }
         let metadata = Metadata {
             inbound: options.inbound.as_deref().unwrap_or(""),
+            network: options.network.map(|network| network.as_str()),
+            user: options.user.as_deref(),
+            source: options.source,
             domain: Some(domain),
             query_type: Some(query_type),
             ..Default::default()
@@ -153,40 +175,47 @@ impl DnsRouter {
                 Some(DnsRuleAction::Route { server, strategy, disable_cache }) => {
                     tracing::debug!(domain, rule = index, server, "dns: match");
                     let strategy = if *strategy != DomainStrategy::AsIs { *strategy } else { options.strategy };
-                    return Ok((server.clone(), strategy, *disable_cache || options.disable_cache));
+                    return Selection::Server {
+                        server: server.clone(),
+                        strategy,
+                        disable_cache: *disable_cache || options.disable_cache,
+                    };
                 }
                 Some(DnsRuleAction::Reject(reject)) => {
                     tracing::debug!(domain, rule = index, "dns: reject");
-                    let kind = if reject.method == RejectMethod::Drop {
-                        io::ErrorKind::TimedOut
-                    } else {
-                        io::ErrorKind::ConnectionRefused
-                    };
-                    return Err(io::Error::new(kind, format!("{domain}: rejected by DNS rule")));
+                    return Selection::Reject(reject.method);
                 }
                 None => {}
             }
         }
-        Ok((self.final_server.clone(), options.strategy, options.disable_cache))
+        Selection::Server {
+            server: self.final_server.clone(),
+            strategy: options.strategy,
+            disable_cache: options.disable_cache,
+        }
     }
 
-    async fn query(
+    fn transport(&self, server: &str) -> io::Result<&Arc<Transport>> {
+        self.servers
+            .get(server)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("DNS server not found: {server}")))
+    }
+
+    /// Asks `server` for the A or AAAA records of `domain`, through the cache.
+    async fn query_server(
         &self,
+        server: &str,
+        disable_cache: bool,
         domain: &str,
         query_type: u16,
         options: &LookupOptions,
-    ) -> io::Result<(Vec<IpAddr>, DomainStrategy)> {
-        let (server, strategy, disable_cache) = self.select(domain, query_type, options)?;
-        let transport = self
-            .servers
-            .get(&server)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("DNS server not found: {server}")))?;
-        let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
-        let key = (server.clone(), domain.to_string(), query_type);
+    ) -> io::Result<Answer> {
+        let transport = self.transport(server)?;
+        let key = (server.to_string(), domain.to_string(), query_type);
         if !disable_cache {
             if let Some(cache) = &self.cache {
-                if let Some(addresses) = cache.lock().unwrap().get(&key) {
-                    return Ok((addresses, strategy));
+                if let Some(answer) = cache.lock().unwrap().get(&key) {
+                    return Ok(answer);
                 }
             }
         }
@@ -199,8 +228,107 @@ impl DnsRouter {
                 cache.lock().unwrap().put(key, answer.addresses.clone(), answer.ttl);
             }
         }
+        Ok(answer)
+    }
+
+    async fn query(
+        &self,
+        domain: &str,
+        query_type: u16,
+        options: &LookupOptions,
+    ) -> io::Result<(Vec<IpAddr>, DomainStrategy)> {
+        let (server, strategy, disable_cache) = match self.select(domain, query_type, options) {
+            Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+            Selection::Reject(method) => {
+                let kind = if method == RejectMethod::Drop {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::ConnectionRefused
+                };
+                return Err(io::Error::new(kind, format!("{domain}: rejected by DNS rule")));
+            }
+        };
+        let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
+        let answer = self.query_server(&server, disable_cache, domain, query_type, options).await?;
         Ok((answer.addresses, strategy))
     }
+
+    /// Answers one query message (sing-box `dns.Router.Exchange`).
+    ///
+    /// A and AAAA questions go through the same path as lookups (rules,
+    /// strategy, cache) and the answer is built from the addresses; other
+    /// types are forwarded as they are to the selected `udp`/`tcp` server.
+    async fn exchange_message(&self, request: &Message, options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
+        let Some(question) = request.queries().first().cloned() else {
+            return response(request, ResponseCode::FormErr, Vec::new()).map(Some);
+        };
+        let domain = question.name().to_ascii().trim_end_matches('.').to_ascii_lowercase();
+        let query_type = u16::from(question.query_type());
+        let (server, strategy, disable_cache) = match self.select(&domain, query_type, options) {
+            Selection::Server { server, strategy, disable_cache } => (server, strategy, disable_cache),
+            Selection::Reject(RejectMethod::Drop) => return Ok(None),
+            Selection::Reject(_) => return response(request, ResponseCode::Refused, Vec::new()).map(Some),
+        };
+        if query_type == QTYPE_A || query_type == QTYPE_AAAA {
+            let strategy = if strategy != DomainStrategy::AsIs { strategy } else { self.strategy };
+            // A strategy that rules this type out answers with no records.
+            if (strategy == DomainStrategy::Ipv4Only && query_type == QTYPE_AAAA)
+                || (strategy == DomainStrategy::Ipv6Only && query_type == QTYPE_A)
+            {
+                return response(request, ResponseCode::NoError, Vec::new()).map(Some);
+            }
+            return match self.query_server(&server, disable_cache, &domain, query_type, options).await {
+                Ok(answer) => {
+                    let records = answer
+                        .addresses
+                        .iter()
+                        .filter_map(|address| match address {
+                            IpAddr::V4(ip) if query_type == QTYPE_A => Some(RData::A((*ip).into())),
+                            IpAddr::V6(ip) if query_type == QTYPE_AAAA => Some(RData::AAAA((*ip).into())),
+                            _ => None,
+                        })
+                        .map(|data| Record::from_rdata(question.name().clone(), answer.ttl, data))
+                        .collect();
+                    response(request, ResponseCode::NoError, records).map(Some)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    response(request, ResponseCode::NXDomain, Vec::new()).map(Some)
+                }
+                Err(error) => {
+                    tracing::debug!(domain, %error, "dns: exchange failed");
+                    response(request, ResponseCode::ServFail, Vec::new()).map(Some)
+                }
+            };
+        }
+        let transport = self.transport(&server)?;
+        let timeout = options.timeout.unwrap_or(self.timeout);
+        let raw = request.to_vec().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        match tokio::time::timeout(timeout, transport.exchange(&raw, timeout)).await {
+            Ok(Ok(Some(answer))) => Ok(Some(answer)),
+            // The local resolver only knows addresses.
+            Ok(Ok(None)) => response(request, ResponseCode::NotImp, Vec::new()).map(Some),
+            Ok(Err(error)) => {
+                tracing::debug!(domain, %error, "dns: exchange failed");
+                response(request, ResponseCode::ServFail, Vec::new()).map(Some)
+            }
+            Err(_) => response(request, ResponseCode::ServFail, Vec::new()).map(Some),
+        }
+    }
+}
+
+/// A response to `request` with `code` and `answers`.
+fn response(request: &Message, code: ResponseCode, answers: Vec<Record>) -> io::Result<Vec<u8>> {
+    let mut message = Message::new();
+    message
+        .set_id(request.id())
+        .set_message_type(MessageType::Response)
+        .set_op_code(request.op_code())
+        .set_recursion_desired(request.recursion_desired())
+        .set_recursion_available(true)
+        .set_response_code(code);
+    message.add_queries(request.queries().to_vec());
+    message.add_answers(answers);
+    message.to_vec().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 fn port_or_default(port: u16) -> u16 {
@@ -250,6 +378,15 @@ impl DnsResolver for DnsRouter {
                 .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{domain}: no addresses"))));
         }
         Ok(addresses)
+    }
+
+    async fn exchange(&self, query: &[u8], options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
+        let request =
+            Message::from_vec(query).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if request.message_type() != MessageType::Query {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a DNS query"));
+        }
+        self.exchange_message(&request, options).await
     }
 }
 

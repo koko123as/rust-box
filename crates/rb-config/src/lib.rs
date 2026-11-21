@@ -15,10 +15,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use rule::{
-    DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode, RejectMethod, RejectOptions, RouteRule, Rule, RuleAction,
-    RuleMatch,
+    DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule,
+    Rule, RuleAction, RuleMatch, SNIFFERS,
 };
-pub use types::{DomainResolveOptions, DomainStrategy, Duration, Listable, QueryType, User};
+pub use types::{DomainResolveOptions, DomainStrategy, Duration, Listable, QueryType, UdpTimeout, User};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -164,6 +164,10 @@ pub struct ProxyInbound {
     pub listen_port: u16,
     #[serde(default)]
     pub users: Vec<User>,
+    /// UDP NAT expiration (`ListenOptions.udp_timeout`, 5m by default). The
+    /// `http` inbound accepts it like sing-box and has no UDP to apply it to.
+    #[serde(default)]
+    pub udp_timeout: UdpTimeout,
 }
 
 /// Outbounds (sing-box `option.Outbound`).
@@ -270,7 +274,7 @@ impl Options {
         }
         for (index, rule) in self.route.rules.iter().enumerate() {
             match rule.action() {
-                Some(RuleAction::Route { outbound }) if !outbound_known(outbound) => {
+                Some(RuleAction::Route { outbound, .. }) if !outbound_known(outbound) => {
                     return Err(field(format!("route.rules[{index}]"), format!("outbound not found: {outbound}")));
                 }
                 Some(RuleAction::Resolve { server, .. }) if !server.is_empty() && !server_known(server) => {
@@ -361,6 +365,27 @@ mod tests {
         let error =
             parse(r#"{"inbounds":[{"type":"mixed","listen_port":1,"tcp_fast_open":true}]}"#).unwrap_err().to_string();
         assert!(error.contains("tcp_fast_open"), "{error}");
+        let error =
+            parse(r#"{"route":{"rules":[{"action":"route-options","override_port":53}]}}"#).unwrap_err().to_string();
+        assert!(error.contains("route.rules[0]") && error.contains("override_port"), "{error}");
+    }
+
+    #[test]
+    fn udp_fields() {
+        let options = parse(
+            r#"{"inbounds":[{"type":"socks","listen_port":1,"udp_timeout":60}],
+                "outbounds":[{"type":"direct","tag":"d"}],
+                "route":{"rules":[{"network":"udp","outbound":"d","udp_connect":true,"udp_timeout":"10s"},
+                                  {"protocol":"dns","action":"hijack-dns"}]}}"#,
+        )
+        .unwrap();
+        let Inbound::Socks(socks) = &options.inbounds[0] else { panic!() };
+        assert_eq!(socks.udp_timeout.0 .0, std::time::Duration::from_secs(60));
+        assert!(matches!(
+            options.route.rules[0].action(),
+            Some(RuleAction::Route { options, .. }) if options.udp_connect
+        ));
+        assert_eq!(options.route.rules[1].action(), Some(&RuleAction::HijackDns));
     }
 
     #[test]

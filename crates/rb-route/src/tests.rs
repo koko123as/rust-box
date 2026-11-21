@@ -2,6 +2,7 @@ use super::*;
 use rb_adapter::{Host, Network, Socksaddr};
 use std::net::IpAddr;
 use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 struct FakeOutbound(&'static str);
 
@@ -27,12 +28,190 @@ impl DnsResolver for FakeDns {
         self.0.lock().unwrap().push(format!("{domain}@{}", options.server.clone().unwrap_or_default()));
         Ok(vec!["10.0.0.7".parse().unwrap()])
     }
+    async fn exchange(&self, query: &[u8], _options: &LookupOptions) -> io::Result<Option<Vec<u8>>> {
+        let mut answer = b"answer:".to_vec();
+        answer.extend_from_slice(&query[..2]);
+        Ok(Some(answer))
+    }
+}
+
+/// The client side of a UDP session: packets come from a channel, written
+/// packets are collected. Reads wait forever once the channel is drained.
+struct FakeClient {
+    incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, Socksaddr)>>,
+    written: Mutex<Vec<(Vec<u8>, String)>>,
+}
+
+impl FakeClient {
+    fn new(packets: Vec<(Vec<u8>, &str)>) -> Arc<Self> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for (data, destination) in packets {
+            let destination: std::net::SocketAddr = destination.parse().unwrap();
+            sender.send((data, destination.into())).unwrap();
+        }
+        std::mem::forget(sender);
+        Arc::new(FakeClient { incoming: tokio::sync::Mutex::new(receiver), written: Mutex::default() })
+    }
+}
+
+#[async_trait]
+impl rb_adapter::PacketConn for FakeClient {
+    async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
+        let (data, address) = self.incoming.lock().await.recv().await.unwrap();
+        buffer[..data.len()].copy_from_slice(&data);
+        Ok((data.len(), address))
+    }
+    async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
+        self.written.lock().unwrap().push((data.to_vec(), address.to_string()));
+        Ok(())
+    }
+}
+
+/// An outbound whose packet connection sends every packet straight back.
+#[derive(Default)]
+struct EchoOutbound(Mutex<Option<InboundContext>>);
+
+struct EchoRemote(
+    tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, Socksaddr)>>,
+    mpsc::UnboundedSender<(Vec<u8>, Socksaddr)>,
+);
+
+#[async_trait]
+impl rb_adapter::PacketConn for EchoRemote {
+    async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
+        let (data, address) = self.0.lock().await.recv().await.unwrap();
+        buffer[..data.len()].copy_from_slice(&data);
+        Ok((data.len(), address))
+    }
+    async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
+        self.1.send((data.to_vec(), address.clone())).map_err(|_| io::Error::other("closed"))
+    }
+}
+
+#[async_trait]
+impl Outbound for EchoOutbound {
+    fn tag(&self) -> &str {
+        "echo"
+    }
+    fn kind(&self) -> &'static str {
+        "echo"
+    }
+    async fn dial_tcp(&self, _context: &InboundContext) -> io::Result<BoxStream> {
+        Err(io::Error::other("echo"))
+    }
+    async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
+        *self.0.lock().unwrap() = Some(context.clone());
+        let (sender, receiver) = mpsc::unbounded_channel();
+        Ok(Arc::new(EchoRemote(tokio::sync::Mutex::new(receiver), sender)))
+    }
 }
 
 fn router(rules: &str, dns: Arc<FakeDns>) -> Router {
+    router_with(rules, dns, Arc::new(EchoOutbound::default()))
+}
+
+fn router_with(rules: &str, dns: Arc<FakeDns>, echo: Arc<EchoOutbound>) -> Router {
     let options: RouteOptions = serde_json::from_str(&format!(r#"{{"rules":{rules},"final":"proxy"}}"#)).unwrap();
-    let outbounds: Vec<Arc<dyn Outbound>> = vec![Arc::new(FakeOutbound("direct")), Arc::new(FakeOutbound("proxy"))];
+    let outbounds: Vec<Arc<dyn Outbound>> =
+        vec![Arc::new(FakeOutbound("direct")), Arc::new(FakeOutbound("proxy")), echo];
     Router::new(&options, outbounds, dns).unwrap()
+}
+
+fn udp_context(destination: &str) -> InboundContext {
+    let destination: std::net::SocketAddr = destination.parse().unwrap();
+    let mut context =
+        InboundContext::new("socks-in", "socks", Network::Udp, "127.0.0.1:40000".parse().unwrap(), destination.into());
+    context.inbound_udp_timeout = Some(Duration::from_millis(200));
+    context
+}
+
+#[tokio::test]
+async fn udp_sniff_dns_then_hijack() {
+    let router = router(r#"[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"}]"#, Arc::default());
+    let client = FakeClient::new(vec![(sniff::tests::dns_query_packet(), "1.1.1.1:53")]);
+    let started = std::time::Instant::now();
+    router.route_packet_connection(udp_context("1.1.1.1:53"), client.clone()).await.unwrap();
+    // Ends after the (inbound) idle timeout.
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let written = client.written.lock().unwrap().clone();
+    assert_eq!(written, vec![(b"answer:\x12\x34".to_vec(), "1.1.1.1:53".to_string())]);
+}
+
+#[tokio::test]
+async fn udp_route_options_relay_and_timeout() {
+    let echo = Arc::new(EchoOutbound::default());
+    let router = router_with(
+        r#"[{"network":"udp","action":"route-options","udp_timeout":"150ms","udp_connect":true},
+            {"network":"tcp","action":"reject"},
+            {"port":9999,"outbound":"echo","udp_disable_domain_unmapping":true}]"#,
+        Arc::default(),
+        echo.clone(),
+    );
+    let client = FakeClient::new(vec![(b"ping".to_vec(), "9.9.9.9:9999"), (b"pong".to_vec(), "8.8.8.8:9999")]);
+    let mut context = udp_context("9.9.9.9:9999");
+    context.inbound_udp_timeout = Some(Duration::from_secs(60));
+    let started = std::time::Instant::now();
+    router.route_packet_connection(context, client.clone()).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let written = client.written.lock().unwrap().clone();
+    assert_eq!(
+        written,
+        vec![(b"ping".to_vec(), "9.9.9.9:9999".to_string()), (b"pong".to_vec(), "8.8.8.8:9999".to_string())]
+    );
+    let seen = echo.0.lock().unwrap().clone().unwrap();
+    assert!(seen.udp_connect && seen.udp_disable_domain_unmapping);
+    assert_eq!(seen.udp_timeout, Some(Duration::from_millis(150)));
+    assert_eq!(seen.network, Network::Udp);
+}
+
+#[tokio::test]
+async fn udp_sniff_quic_server_name() {
+    let router = router(
+        r#"[{"action":"sniff","sniffer":["quic"]},{"domain":"www.google.com","outbound":"direct"}]"#,
+        Arc::default(),
+    );
+    let line = include_str!("testdata/quic_firefox.hex").trim();
+    let packet: Vec<u8> =
+        (0..line.len()).step_by(2).map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap()).collect();
+    let client: SharedPacketConn = FakeClient::new(vec![(packet, "142.250.1.1:443")]);
+    let mut cached = Vec::new();
+    let mut context = udp_context("142.250.1.1:443");
+    let decision =
+        router.decide_input(&mut context, Input::Packet { conn: &client, cached: &mut cached }).await.unwrap();
+    assert_eq!(decision, Decision::Route("direct".into()));
+    assert_eq!(context.protocol.as_deref(), Some("quic"));
+    assert_eq!(cached.len(), 1);
+    assert_eq!(udp_timeout(&context), Some(Duration::from_millis(200)));
+}
+
+#[tokio::test]
+async fn udp_reject_and_tcp_only_sniffers() {
+    let router = router(
+        r#"[{"action":"sniff","sniffer":"tls","timeout":"5s"},{"network":"udp","action":"reject"}]"#,
+        Arc::default(),
+    );
+    let client = FakeClient::new(vec![(b"x".to_vec(), "1.2.3.4:5")]);
+    let started = std::time::Instant::now();
+    let result = router.route_packet_connection(udp_context("1.2.3.4:5"), client).await;
+    assert!(matches!(result, Err(RouteError::Rejected)));
+    // A stream-only sniffer does not wait for packets.
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn udp_timeouts() {
+    let mut context = udp_context("1.1.1.1:53");
+    context.inbound_udp_timeout = Some(DEFAULT_UDP_TIMEOUT);
+    assert_eq!(udp_timeout(&context), Some(Duration::from_secs(10)));
+    context.destination.port = 443;
+    assert_eq!(udp_timeout(&context), Some(Duration::from_secs(30)));
+    context.destination.port = 5000;
+    assert_eq!(udp_timeout(&context), Some(DEFAULT_UDP_TIMEOUT));
+    context.protocol = Some("stun".into());
+    assert_eq!(udp_timeout(&context), Some(Duration::from_secs(10)));
+    context.udp_timeout = Some(Duration::from_secs(3600));
+    // Never longer than the inbound's.
+    assert_eq!(udp_timeout(&context), Some(DEFAULT_UDP_TIMEOUT));
 }
 
 fn context(host: &str, port: u16) -> InboundContext {

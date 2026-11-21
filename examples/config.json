@@ -10,7 +10,7 @@
     "strategy": "prefer_ipv4"
   },
   "inbounds": [
-    {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}
+    {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080, "udp_timeout": "5m"}
   ],
   "outbounds": [
     {"type": "direct", "tag": "direct"},
@@ -19,6 +19,7 @@
   "route": {
     "rules": [
       {"action": "sniff"},
+      {"protocol": "dns", "action": "hijack-dns"},
       {"protocol": "bittorrent", "action": "reject"},
       {"domain_suffix": ["ads.example"], "action": "reject"},
       {"ip_is_private": true, "outbound": "direct"}

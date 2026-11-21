@@ -104,6 +104,33 @@ impl<'de> Deserialize<'de> for Duration {
     }
 }
 
+/// An inbound's `udp_timeout`: a duration string, or a bare number of
+/// seconds (sing-box `option.UDPTimeoutCompat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UdpTimeout(pub Duration);
+
+impl<'de> Deserialize<'de> for UdpTimeout {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl de::Visitor<'_> for Visitor {
+            type Value = UdpTimeout;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a number of seconds or a duration string such as \"5m\"")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<UdpTimeout, E> {
+                Duration::parse(value).map(UdpTimeout).map_err(E::custom)
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<UdpTimeout, E> {
+                Ok(UdpTimeout(Duration(StdDuration::from_secs(value))))
+            }
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<UdpTimeout, E> {
+                u64::try_from(value).map_err(|_| E::custom("negative udp_timeout")).and_then(|v| self.visit_u64(v))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// sing-box `DomainStrategy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 pub enum DomainStrategy {
@@ -235,6 +262,15 @@ mod tests {
         assert_eq!(Duration::parse("1.5s").unwrap().0, StdDuration::from_millis(1500));
         assert!(Duration::parse("5x").is_err());
         assert!(Duration::parse("s").is_err());
+    }
+
+    #[test]
+    fn udp_timeout() {
+        let seconds: UdpTimeout = serde_json::from_str("30").unwrap();
+        assert_eq!(seconds.0 .0, StdDuration::from_secs(30));
+        let text: UdpTimeout = serde_json::from_str("\"5m\"").unwrap();
+        assert_eq!(text.0 .0, StdDuration::from_secs(300));
+        assert!(serde_json::from_str::<UdpTimeout>("-1").is_err());
     }
 
     #[test]

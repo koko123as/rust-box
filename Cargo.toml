@@ -28,6 +28,10 @@ regex = "1"
 hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
+aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
 
 [profile.release]
 lto = true
