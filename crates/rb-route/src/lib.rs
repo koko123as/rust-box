@@ -19,7 +19,7 @@ use rb_adapter::{
 };
 use rb_config::{RejectMethod, RouteActionOptions, RouteOptions, RuleAction};
 use rb_dialer::tls_fragment::TlsFragmentStream;
-use rb_rule::{compile, compile_route_match, Compiled, Metadata};
+use rb_rule::{compile, compile_route_match, Compiled, Context as RuleContext, Metadata, RuleSets};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 use tracing::{debug, info};
@@ -164,6 +164,7 @@ impl Router {
         outbounds: Vec<Arc<dyn Outbound>>,
         dns: Arc<dyn DnsResolver>,
         inbounds: Arc<InboundRegistry>,
+        rule_sets: &RuleSets,
     ) -> Result<Self, RouterError> {
         let final_outbound = if !options.r#final.is_empty() {
             options.r#final.clone()
@@ -178,7 +179,8 @@ impl Router {
             .iter()
             .enumerate()
             .map(|(index, rule)| {
-                compile(rule, &compile_route_match)
+                let context = RuleContext::new(rule_sets);
+                compile(rule, &|options| compile_route_match(options, &context))
                     .map_err(|error| RouterError(format!("route.rules[{index}]: {error}")))
             })
             .collect::<Result<_, _>>()?;
@@ -206,8 +208,8 @@ impl Router {
         let mut last_sniffers: Option<&[String]> = None;
         for (index, rule) in self.rules.iter().enumerate() {
             let matched = {
-                let metadata = metadata(context);
-                rule.matches(&metadata)
+                let mut metadata = metadata(context);
+                rule.matches(&mut metadata)
             };
             if !matched {
                 continue;
@@ -469,7 +471,7 @@ fn metadata(context: &InboundContext) -> Metadata<'_> {
         destination_ip: context.destination.ip(),
         destination_addresses: &context.destination_addresses,
         destination_port: Some(context.destination.port),
-        query_type: None,
+        ..Default::default()
     }
 }
 

@@ -1,0 +1,8 @@
+! AdGuard filter
+||ads.example.com^
+||tracker.example.net^$important
+@@||allowed.example.com^
+example.org
+/banner[0-9]+\.example/
+0.0.0.0 blocked.example
+||*.wild.example^

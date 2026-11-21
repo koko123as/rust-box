@@ -21,6 +21,11 @@ rb-dns.workspace = true
 rb-route.workspace = true
 rb-protocol.workspace = true
 rb-dialer.workspace = true
+rb-rule.workspace = true
+rb-rule-set.workspace = true
+rb-certificate.workspace = true
+rb-common.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -29,3 +34,4 @@ anyhow.workspace = true
 
 [dev-dependencies]
 rb-config.workspace = true
+tempfile.workspace = true

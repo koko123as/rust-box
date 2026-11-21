@@ -1,5 +1,7 @@
 //! The `rust-box` command, following sing-box's `cmd/sing-box`:
-//! `run`, `check`, `format` and `version`.
+//! `run`, `check`, `version` and `rule-set`.
+
+mod rule_set_cmd;
 
 use std::path::PathBuf;
 
@@ -11,8 +13,8 @@ use rust_box::{RustBox, VERSION};
 #[command(name = "rust-box", version = VERSION, about = "A Rust reimplementation modeled on sing-box")]
 struct Cli {
     /// Configuration file path
-    #[arg(short = 'c', long = "config", global = true, default_value = "config.json")]
-    config: PathBuf,
+    #[arg(short = 'c', long = "config")]
+    config: Option<PathBuf>,
     /// Working directory
     #[arg(short = 'D', long = "directory", global = true)]
     directory: Option<PathBuf>,
@@ -23,11 +25,33 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run service
-    Run,
+    Run(ConfigArgs),
     /// Check configuration
-    Check,
+    Check(ConfigArgs),
     /// Print version
     Version,
+    /// Manage rule-sets
+    #[command(name = "rule-set")]
+    RuleSet {
+        #[command(subcommand)]
+        command: rule_set_cmd::RuleSetCommand,
+    },
+}
+
+/// `-c` is accepted before or after `run`/`check`; it is not a global
+/// flag because `rule-set merge` has its own `-c` (as in sing-box, where
+/// the subcommand's flag shadows the persistent one).
+#[derive(clap::Args)]
+struct ConfigArgs {
+    /// Configuration file path
+    #[arg(short = 'c', long = "config")]
+    config: Option<PathBuf>,
+}
+
+impl Cli {
+    fn config_path(&self, args: &ConfigArgs) -> PathBuf {
+        args.config.clone().or_else(|| self.config.clone()).unwrap_or_else(|| PathBuf::from("config.json"))
+    }
 }
 
 fn load(path: &PathBuf) -> Result<rb_config::Options> {
@@ -72,19 +96,23 @@ fn main() -> Result<()> {
         std::env::set_current_dir(directory)
             .with_context(|| format!("set working directory {}", directory.display()))?;
     }
-    match cli.command {
+    match &cli.command {
+        Command::RuleSet { .. } => {
+            let Command::RuleSet { command } = cli.command else { unreachable!() };
+            rule_set_cmd::run(command)
+        }
         Command::Version => {
             println!("rust-box version {VERSION}");
             println!("Modeled on sing-box 1.14.4 configuration (subset)");
             Ok(())
         }
-        Command::Check => {
-            let options = load(&cli.config)?;
+        Command::Check(args) => {
+            let options = load(&cli.config_path(args))?;
             RustBox::new(&options)?;
             Ok(())
         }
-        Command::Run => {
-            let options = load(&cli.config)?;
+        Command::Run(args) => {
+            let options = load(&cli.config_path(args))?;
             init_log(&options.log)?;
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {

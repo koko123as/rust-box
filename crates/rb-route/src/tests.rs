@@ -114,7 +114,7 @@ fn router_with(rules: &str, dns: Arc<FakeDns>, echo: Arc<EchoOutbound>) -> Route
     let options: RouteOptions = serde_json::from_str(&format!(r#"{{"rules":{rules},"final":"proxy"}}"#)).unwrap();
     let outbounds: Vec<Arc<dyn Outbound>> =
         vec![Arc::new(FakeOutbound("direct")), Arc::new(FakeOutbound("proxy")), echo];
-    Router::new(&options, outbounds, dns, rb_adapter::InboundRegistry::new()).unwrap()
+    Router::new(&options, outbounds, dns, rb_adapter::InboundRegistry::new(), &rb_rule::RuleSets::new()).unwrap()
 }
 
 fn udp_context(destination: &str) -> InboundContext {

@@ -32,8 +32,13 @@ silently ignored.
    listen fields (`shared/listen`) including the inbound `detour`; HTTP
    proxy keep-alive. Dial fields are also accepted on `udp` and `tcp` DNS
    servers.
-4. **Rule-sets**: inline, local and remote `source`/`binary` (SRS) rule-sets,
-   `rule_set` rule items.
+4. **Rule-sets** (done): inline, local and remote `source`/`binary` (SRS)
+   rule-sets (`rb-rule-set`), headless rules, `rule_set` items in route and
+   DNS rules, the DNS router's legacy mode and rule-set update validation,
+   file watching (`rb-fswatch`), the top-level `certificate` store
+   (`rb-certificate`) for HTTPS downloads, and the `rule-set` commands
+   (`compile`, `decompile`, `format`, `upgrade`, `merge`, `match`,
+   `convert`).
 5. **TLS and first encrypted protocols**: rustls client/server, `shadowsocks`
    (AEAD and 2022), `trojan`, `vless`, `vmess`, `socks`/`http` outbounds,
    multiplex (`sing-mux`).
@@ -182,3 +187,39 @@ approved by the user):
 - Not ported: sing-box's connection tracking and power reports in the
   default dialer, and the `direct` outbound's check against connecting back
   into a TUN range.
+
+## Known differences in milestone 4
+
+The `rule-set` commands were compared with the real sing-box v1.14.4 binary
+(`crates/rust-box/tests/rule_set_cli.rs`, fixtures written by sing-box in
+`crates/rust-box/tests/data/rule-set`): the decompressed `.srs` content of
+`compile` and `convert`, and the output of `decompile`, `format`, `upgrade`,
+`merge` and `match`, are byte-identical. The compressed `.srs` bytes differ,
+since Go's and Rust's zlib encoders produce different (equally valid)
+streams.
+
+- No cache file (milestone 9): remote rule-sets are downloaded at every
+  start instead of being restored from `cache.db`, and rule-sets are not
+  reference-counted (a rule-set no rule uses is still loaded and updated).
+- The remote `http_client` option and the top-level `http_clients` section
+  are rejected as not supported yet; the deprecated `download_detour` is
+  honored (with sing-box's deprecation warning).
+- `process_*`, `package_name*`, `network_type`, `network_is_expensive`,
+  `network_is_constrained`, `wifi_ssid`/`wifi_bssid` and the interface
+  address items are parsed, written to and read from SRS, but never match:
+  rust-box has no process searcher and no platform interface yet. As in
+  sing-box, `rule-set match` leaves the network items out (no network
+  manager outside a box).
+- The DNS rule actions and items of later milestones (`match_response`,
+  `evaluate`, `respond`) are not implemented.
+- Empty lists follow sing-box's decoder: `"domain": []` is the same as an
+  unset field, and a rule list made only of empty rules (`[{}]`,
+  `[{"domain":[]}]`) is no list at all, while an empty rule next to a real
+  one fails with "missing conditions".
+- Error and log wording: errors are printed as `Error: ...` (anyhow) rather
+  than logrus' `FATAL[0000] ...`, and `upgrade` prints a plain
+  `INFO[0000] already up-to-date`; Go's JSON decoder messages are mimicked
+  for the common cases only.
+- `-c` is not a global flag: it is accepted before or after `run`/`check`,
+  so that `rule-set merge` can have its own `-c` (in sing-box the
+  subcommand flag shadows the persistent one).

@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": "only.v2.test"
+    },
+    {
+      "type": "logical",
+      "mode": "or",
+      "rules": [
+        {
+          "network": "udp"
+        },
+        {
+          "port": 53
+        }
+      ]
+    }
+  ]
+}
