@@ -648,7 +648,7 @@ with_dial_fields! {
 }
 
 /// The `tls`, `multiplex` and `transport` checks of the trojan, vless and
-/// vmess outbounds: WebSocket and HTTPUpgrade are supported transports.
+/// vmess outbounds.
 fn check_proxy_outbound(
     path: &str,
     tls: Option<&OutboundTlsOptions>,
@@ -2227,10 +2227,6 @@ mod tests {
             (r#"{"inbounds":[{"type":"trojan","transport":{}}]}"#, "unknown transport type: "),
             (r#"{"outbounds":[{"type":"vless","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
             (
-                r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#,
-                "outbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
-            (
                 r#"{"inbounds":[{"type":"vless","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
                 "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
@@ -2280,6 +2276,7 @@ mod tests {
     #[test]
     fn grpc_transport_is_supported_and_rejects_unsupported_keepalive() {
         assert!(parse(r#"{"outbounds":[{"type":"trojan","transport":{"type":"grpc","service_name":"edge"}}]}"#).is_ok());
+        assert!(parse(r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).is_ok());
         assert!(parse(r#"{"inbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).is_ok());
         let error = parse(r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#)
             .unwrap_err()
