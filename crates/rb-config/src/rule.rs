@@ -201,7 +201,21 @@ fn rcode_from_name(name: &str) -> Option<i32> {
 /// A DNS resource-record matcher. The raw zone-format or base64 form is kept
 /// for the DNS rule compiler to validate and compare against response records.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsRecordOptions(pub String);
+pub struct DnsRecordOptions {
+    pub value: String,
+    binary: Option<Vec<u8>>,
+}
+
+impl DnsRecordOptions {
+    pub fn binary(&self) -> Option<&[u8]> {
+        self.binary.as_deref()
+    }
+
+    pub fn normalize(&mut self, value: String) {
+        self.value = value;
+        self.binary = None;
+    }
+}
 
 impl<'de> Deserialize<'de> for DnsRecordOptions {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -209,7 +223,8 @@ impl<'de> Deserialize<'de> for DnsRecordOptions {
         if value.trim().is_empty() {
             return Err(de::Error::custom("empty DNS record"));
         }
-        Ok(Self(value))
+        let binary = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &value).ok();
+        Ok(Self { value, binary })
     }
 }
 
@@ -679,7 +694,7 @@ mod tests {
         let Rule::Default { matcher, .. } = rule else { panic!() };
         assert_eq!(matcher.match_response, DnsMatchResponse { enabled: true, tag: String::new() });
         assert_eq!(matcher.response_rcode, Some(DnsResponseCode(3)));
-        assert_eq!(matcher.response_answer.0[0].0, "example.com. 60 IN A 192.0.2.1");
+        assert_eq!(matcher.response_answer.0[0].value, "example.com. 60 IN A 192.0.2.1");
 
         let tagged: DnsRule = serde_json::from_str(r#"{"match_response":"lookup","action":"reject"}"#).unwrap();
         let Rule::Default { matcher, .. } = tagged else { panic!() };

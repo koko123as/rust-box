@@ -4,8 +4,12 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use hickory_proto::rr::{Name, Record};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
+use hickory_proto::serialize::txt::Parser;
 use rb_common::domain::{AdGuardMatcher, Matcher as DomainMatcher};
 use rb_common::ipset::IpSet;
+use rb_config::DnsRecordOptions;
 use regex::Regex;
 
 use crate::{Metadata, RuleError};
@@ -30,6 +34,11 @@ pub(crate) enum Item {
         source: bool,
     },
     IpAcceptAny,
+    ResponseRcode(i32),
+    ResponseRecord {
+        section: ResponseSection,
+        records: Vec<Record>,
+    },
     Port {
         ports: HashSet<u16>,
         source: bool,
@@ -41,6 +50,41 @@ pub(crate) enum Item {
     /// Items that need what rust-box does not have (a process searcher, a
     /// platform network monitor): they never match.
     Never,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResponseSection {
+    Answer,
+    Ns,
+    Extra,
+}
+
+/// Parses one DNS RR in sing-box's zone or standard base64 wire format.
+pub(crate) fn parse_dns_record(options: &DnsRecordOptions, field: &str) -> Result<Record, RuleError> {
+    if let Some(binary) = options.binary() {
+        let mut decoder = BinDecoder::new(binary);
+        let record = Record::read(&mut decoder).map_err(|_| RuleError(format!("{field}: parse binary DNS record")))?;
+        if !decoder.is_empty() {
+            return Err(RuleError(format!("{field}: parse binary DNS record")));
+        }
+        return Ok(record);
+    }
+
+    let input = format!("$TTL 3600\n{}\n", options.value);
+    let (_, record_sets) = Parser::new(input, None, Some(Name::root()))
+        .parse()
+        .map_err(|_| RuleError(format!("{field}: bad DNS record: {}", options.value)))?;
+    let mut records = record_sets.values().flat_map(|set| set.records_without_rrsigs());
+    let record =
+        records.next().cloned().ok_or_else(|| RuleError(format!("{field}: bad DNS record: {}", options.value)))?;
+    if records.next().is_some() {
+        return Err(RuleError(format!("{field}: bad DNS record: {}", options.value)));
+    }
+    Ok(record)
+}
+
+pub(crate) fn describe_dns_record(record: &Record) -> String {
+    format!("{}\t{}\t{}\t{}\t{}", record.name(), record.ttl(), record.dns_class(), record.record_type(), record.data())
 }
 
 /// sing-box `N.IsPublicAddr`, negated (Go `netip.Addr` predicates, which
@@ -167,6 +211,16 @@ impl Item {
                 } else {
                     !metadata.destination_addresses.is_empty()
                 }
+            }
+            Item::ResponseRcode(expected) => metadata.dns_response.is_some_and(|response| response.rcode == *expected),
+            Item::ResponseRecord { section, records } => {
+                let Some(response) = metadata.dns_response else { return false };
+                let actual_records = match section {
+                    ResponseSection::Answer => response.answers,
+                    ResponseSection::Ns => response.ns,
+                    ResponseSection::Extra => response.extra,
+                };
+                records.iter().any(|expected| actual_records.iter().any(|actual| expected == actual))
             }
             Item::Port { ports, source } => ports.contains(&port_of(metadata, *source)),
             Item::PortRange { ranges, source } => {

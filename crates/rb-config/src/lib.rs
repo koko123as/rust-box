@@ -24,8 +24,8 @@ use serde_json::Value;
 
 pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrategy};
 pub use rule::{
-    DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule,
-    Rule, RuleAction, RuleMatch, SNIFFERS,
+    DnsMatchResponse, DnsRecordOptions, DnsResponseCode, DnsRule, DnsRuleAction, DnsRuleMatch, LogicalMode,
+    RejectMethod, RejectOptions, RouteActionOptions, RouteRule, Rule, RuleAction, RuleMatch, SNIFFERS,
 };
 pub use rule_set::{
     DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,

@@ -1494,6 +1494,7 @@ dependencies = [
 name = "rb-rule"
 version = "0.1.0"
 dependencies = [
+ "hickory-proto",
  "rb-common",
  "rb-config",
  "regex",

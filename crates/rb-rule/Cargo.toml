@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rb-config.workspace = true
 rb-common.workspace = true
+hickory-proto = { workspace = true, features = ["text-parsing"] }
 regex.workspace = true
 
 [dev-dependencies]
