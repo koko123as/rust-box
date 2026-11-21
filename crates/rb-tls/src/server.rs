@@ -33,6 +33,9 @@ struct Inner {
     crypto: Crypto,
     handshake_timeout: Duration,
     material: Mutex<Material>,
+    /// File watchers debounce each path independently, so certificate and
+    /// key reload callbacks must not publish stale copies concurrently.
+    reload_lock: Mutex<()>,
     config: RwLock<Arc<ServerConfig>>,
     watcher: Mutex<Option<rb_fswatch::Watcher>>,
 }
@@ -156,6 +159,7 @@ impl TlsServer {
                 },
                 crypto,
                 material: Mutex::new(material),
+                reload_lock: Mutex::new(()),
                 config: RwLock::new(Arc::new(config)),
                 watcher: Mutex::new(None),
             }),
@@ -237,6 +241,7 @@ fn absolute(path: &str) -> PathBuf {
 impl Inner {
     /// sing-box `certificateUpdated`.
     fn certificate_updated(&self, path: &Path) -> Result<(), String> {
+        let _reload = self.reload_lock.lock().unwrap();
         let options = &self.options;
         let is = |configured: &str| !configured.is_empty() && absolute(configured) == path;
         let mut material = self.material.lock().unwrap().clone();
