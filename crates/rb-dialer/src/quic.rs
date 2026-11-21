@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, UdpPoller};
+use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, TransportConfig, UdpPoller, VarInt};
 use rb_adapter::{Host, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE};
+use rb_config::QuicOptions;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -28,17 +29,77 @@ pub async fn connect(
     tls: Arc<rustls::ClientConfig>,
     server_name: &str,
 ) -> io::Result<(Endpoint, Connection)> {
+    connect_with_options(packet_conn, destination, tls, server_name, &QuicOptions::default()).await
+}
+
+/// Connects Quinn over the routed packet connection and applies the shared
+/// sing-box `HTTP2Options` used by DNS, TUIC, Hysteria2 and V2Ray QUIC.
+pub async fn connect_with_options(
+    packet_conn: SharedPacketConn,
+    destination: Socksaddr,
+    tls: Arc<rustls::ClientConfig>,
+    server_name: &str,
+    options: &QuicOptions,
+) -> io::Result<(Endpoint, Connection)> {
     let socket = QuicPacketSocket::new(packet_conn, destination);
     let peer = socket.peer_addr;
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| io::Error::other(format!("QUIC TLS configuration: {error}")))?;
     let mut endpoint =
         Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, Arc::new(quinn::TokioRuntime))?;
-    endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+    let mut client = ClientConfig::new(Arc::new(crypto));
+    client.transport_config(Arc::new(transport_config(options)?));
+    endpoint.set_default_client_config(client);
     let connecting =
         endpoint.connect(peer, server_name).map_err(|error| io::Error::other(format!("QUIC connect: {error}")))?;
     let connection = connecting.await.map_err(|error| io::Error::other(format!("QUIC handshake: {error}")))?;
     Ok((endpoint, connection))
+}
+
+/// Builds the Quinn transport parameters corresponding to sing-box's shared
+/// QUIC options. Zero/omitted values retain Quinn's protocol defaults, just as
+/// `sing-quic.ApplyQUICOptions` leaves its underlying QUIC config untouched.
+pub fn transport_config(options: &QuicOptions) -> io::Result<TransportConfig> {
+    let mut config = TransportConfig::default();
+    if !options.idle_timeout.0.is_zero() {
+        let timeout = options
+            .idle_timeout
+            .0
+            .try_into()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("QUIC idle_timeout: {error}")))?;
+        config.max_idle_timeout(Some(timeout));
+    }
+    if !options.keep_alive_period.0.is_zero() {
+        config.keep_alive_interval(Some(options.keep_alive_period.0));
+    }
+    if let Some(window) = options.stream_receive_window {
+        config.stream_receive_window(quic_varint(window.value(), "stream_receive_window")?);
+    }
+    if let Some(window) = options.connection_receive_window {
+        config.receive_window(quic_varint(window.value(), "connection_receive_window")?);
+    }
+    if options.max_concurrent_streams > 0 {
+        let streams = u64::try_from(options.max_concurrent_streams).map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("QUIC max_concurrent_streams: {error}"))
+        })?;
+        let streams = VarInt::from_u64(streams).map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("QUIC max_concurrent_streams: {error}"))
+        })?;
+        config.max_concurrent_bidi_streams(streams);
+    }
+    if options.initial_packet_size > 0 {
+        // sing-quic v0.7.2 casts the configured positive int to uint16.
+        config.initial_mtu(options.initial_packet_size as u16);
+    }
+    if options.disable_path_mtu_discovery {
+        config.mtu_discovery_config(None);
+    }
+    Ok(config)
+}
+
+fn quic_varint(value: u64, name: &str) -> io::Result<VarInt> {
+    VarInt::from_u64(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("QUIC {name}: {error}")))
 }
 
 struct QuicPacketSocket {
@@ -277,7 +338,27 @@ mod tests {
     use rb_adapter::{PacketConn, SharedPacketConn, Socksaddr};
     use tokio::sync::mpsc;
 
-    use super::QuicPacketSocket;
+    use super::{transport_config, QuicPacketSocket};
+    use rb_config::{MemoryBytes, QuicOptions};
+
+    #[test]
+    fn shared_quic_options_map_and_reject_unrepresentable_windows() {
+        let options = QuicOptions {
+            stream_receive_window: Some(MemoryBytes(256 * 1024)),
+            connection_receive_window: Some(MemoryBytes(4 * 1024 * 1024)),
+            max_concurrent_streams: 128,
+            initial_packet_size: 1400,
+            disable_path_mtu_discovery: true,
+            ..Default::default()
+        };
+        assert!(transport_config(&options).is_ok());
+
+        let options = QuicOptions { stream_receive_window: Some(MemoryBytes(u64::MAX)), ..Default::default() };
+        match transport_config(&options) {
+            Err(error) => assert!(error.to_string().contains("stream_receive_window")),
+            Ok(_) => panic!("window larger than QUIC's varint range must be rejected"),
+        }
+    }
 
     struct MockPacketConn {
         incoming: tokio::sync::Mutex<mpsc::Receiver<(Vec<u8>, Socksaddr)>>,
