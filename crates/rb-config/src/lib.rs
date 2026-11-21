@@ -1304,7 +1304,17 @@ impl Options {
                 Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
-            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, false)?;
+            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
+            if let Inbound::Vless(options) = inbound {
+                if options.users.iter().any(|user| user.flow == "xtls-rprx-vision")
+                    && options.transport.as_ref().is_some_and(|t| matches!(&t.config, V2RayTransportConfig::Grpc(_)))
+                {
+                    return Err(field(
+                        format!("inbounds[{index}].transport"),
+                        "`transport` is not supported by rust-box yet with flow `xtls-rprx-vision`".into(),
+                    ));
+                }
+            }
             if let Inbound::Trojan(trojan) = inbound {
                 trojan.validate_fallback(&format!("inbounds[{index}]"))?;
             }
@@ -2268,8 +2278,9 @@ mod tests {
     }
 
     #[test]
-    fn grpc_transport_is_outbound_only_and_rejects_unsupported_keepalive() {
+    fn grpc_transport_is_supported_and_rejects_unsupported_keepalive() {
         assert!(parse(r#"{"outbounds":[{"type":"trojan","transport":{"type":"grpc","service_name":"edge"}}]}"#).is_ok());
+        assert!(parse(r#"{"inbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).is_ok());
         let error = parse(r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#)
             .unwrap_err()
             .to_string();
@@ -2284,8 +2295,31 @@ mod tests {
             error.contains("outbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet"),
             "{error}"
         );
-        let error = parse(r#"{"inbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).unwrap_err().to_string();
-        assert!(error.contains("inbounds[0].transport: `transport` is not supported by rust-box yet"), "{error}");
+        let error = parse(r#"{"inbounds":[{"type":"trojan","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc","ping_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(
+            r#"{"inbounds":[{"type":"vless","users":[{"uuid":"bf000d23-0752-40b4-affe-68f7707a9661","flow":"xtls-rprx-vision"}],"transport":{"type":"grpc"}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "inbounds[0].transport: `transport` is not supported by rust-box yet with flow `xtls-rprx-vision`"
+            ),
+            "{error}"
+        );
         let error = parse(r#"{"outbounds":[{"type":"vless","flow":"xtls-rprx-vision","transport":{"type":"grpc"}}]}"#)
             .unwrap_err()
             .to_string();

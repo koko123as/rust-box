@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -235,6 +235,7 @@ pub struct VlessInbound {
     flows: Vec<String>,
     tls: Option<rb_tls::TlsServer>,
     transport: Option<crate::v2ray::StreamTransport>,
+    this: OnceLock<Weak<Self>>,
     /// Whether TLS runs over a [`RecordStream`] (some user has Vision).
     record_stream: bool,
     detour: Option<String>,
@@ -272,6 +273,7 @@ impl VlessInbound {
             flows: options.users.iter().map(|user| user.flow.clone()).collect(),
             tls,
             transport,
+            this: OnceLock::new(),
             record_stream,
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             local_addr: OnceLock::new(),
@@ -305,6 +307,38 @@ impl VlessInbound {
             }
             None => ClientConn::Plain(stream),
         };
+        if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
+            if self.record_stream {
+                error!(
+                    "{}: process connection from {source}: gRPC transport is not supported with VLESS Vision",
+                    self.log_prefix()
+                );
+                return;
+            }
+            let server = crate::v2ray::grpc_lite::GrpcLiteServer::new(conn.boxed(), options);
+            let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                error!("{}: gRPC handler is not initialized", self.log_prefix());
+                return;
+            };
+            loop {
+                let stream = match server.accept().await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        error!("{}: process gRPC connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                let inbound = inbound.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let log_prefix = inbound.log_prefix();
+                    if let Err(error) = inbound.serve(ClientConn::Transport(stream), context).await {
+                        error!("{log_prefix}: process gRPC stream from {source}: {error}");
+                    }
+                });
+            }
+        }
         let conn = match (&self.transport, conn) {
             (Some(crate::v2ray::StreamTransport::WebSocket(options)), conn) => {
                 let stream = match crate::v2ray::websocket::server(conn.boxed(), options).await {
@@ -423,6 +457,7 @@ impl Inbound for VlessInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let _ = self.this.set(Arc::downgrade(&self));
         if let Some(tls) = &self.tls {
             tls.start().map_err(io::Error::other)?;
         }

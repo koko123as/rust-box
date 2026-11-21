@@ -4,7 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ pub struct VmessInbound {
     users: Arc<ServerUsers>,
     tls: Option<rb_tls::TlsServer>,
     transport: Option<crate::v2ray::StreamTransport>,
+    this: OnceLock<Weak<Self>>,
     detour: Option<String>,
     local_addr: OnceLock<SocketAddr>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -58,6 +59,7 @@ impl VmessInbound {
             users: Arc::new(ServerUsers::new(&users)),
             tls,
             transport,
+            this: OnceLock::new(),
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             local_addr: OnceLock::new(),
             tasks: Mutex::new(Vec::new()),
@@ -81,6 +83,31 @@ impl VmessInbound {
             },
             None => stream,
         };
+        if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
+            let server = crate::v2ray::grpc_lite::GrpcLiteServer::new(stream, options);
+            let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                error!("{}: gRPC handler is not initialized", self.log_prefix());
+                return;
+            };
+            loop {
+                let stream = match server.accept().await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        error!("{}: process gRPC connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                let inbound = inbound.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let log_prefix = inbound.log_prefix();
+                    if let Err(error) = inbound.serve(stream, context).await {
+                        error!("{log_prefix}: process gRPC stream from {source}: {error}");
+                    }
+                });
+            }
+        }
         if let Some(transport) = &self.transport {
             stream = match crate::v2ray::transport_server(stream, transport).await {
                 Ok(stream) => stream,
@@ -146,6 +173,7 @@ impl Inbound for VmessInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let _ = self.this.set(Arc::downgrade(&self));
         if self.users.has_legacy() {
             // sing-vmess `Service.Start`: the legacy keys move every ten
             // seconds.

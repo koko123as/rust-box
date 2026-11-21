@@ -382,6 +382,32 @@ impl TrojanInbound {
             },
             None => (stream, None),
         };
+        if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
+            let server = crate::v2ray::grpc_lite::GrpcLiteServer::new(stream, options);
+            let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                error!("{}: gRPC handler is not initialized", self.log_prefix());
+                return;
+            };
+            loop {
+                let stream = match server.accept().await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        error!("{}: process gRPC connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                let inbound = inbound.clone();
+                let context = context.clone();
+                let alpn = alpn.clone();
+                tokio::spawn(async move {
+                    let log_prefix = inbound.log_prefix();
+                    if let Err(error) = inbound.serve(stream, context, alpn).await {
+                        error!("{log_prefix}: process gRPC stream from {source}: {error}");
+                    }
+                });
+            }
+        }
         let stream = match &self.transport {
             Some(transport) => match crate::v2ray::transport_server(stream, transport).await {
                 Ok(stream) => stream,

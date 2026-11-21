@@ -1,6 +1,6 @@
 //! gRPC-lite message framing over an asynchronous byte stream.
-use super::h2::H2Client;
-use http::{header, Request, StatusCode};
+use super::h2::{H2Client, H2Server};
+use http::{header, Request, Response, StatusCode};
 use rb_adapter::Host;
 use rb_adapter::{BoxStream, Socksaddr};
 use std::io;
@@ -321,15 +321,125 @@ fn escape_service_name(value: &str) -> String {
     result
 }
 
+/// Server-side gRPC-lite HTTP/2 session for one configured service path.
+pub(crate) struct GrpcLiteServer {
+    h2: H2Server,
+    path: String,
+}
+
+impl GrpcLiteServer {
+    pub(crate) fn new(stream: BoxStream, options: &rb_config::V2RayGrpcOptions) -> Self {
+        Self { h2: H2Server::new(stream), path: format!("/{}/Tun", options.service_name) }
+    }
+
+    /// Accept the next valid gRPC-lite stream, rejecting unrelated HTTP/2 requests.
+    pub(crate) async fn accept(&self) -> io::Result<Option<BoxStream>> {
+        loop {
+            let Some(incoming) = self.h2.accept().await? else { return Ok(None) };
+            let request = &incoming.request;
+            let valid = request.method() == http::Method::POST
+                && decoded_path_matches(request.uri().path(), &self.path)
+                && request
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .is_some_and(|value| value.as_bytes().starts_with(b"application/grpc"));
+            let status = if valid { StatusCode::OK } else { StatusCode::NOT_FOUND };
+            let mut builder = Response::builder().status(status);
+            if valid {
+                builder = builder.header(header::CONTENT_TYPE, "application/grpc").header("te", "trailers");
+            }
+            let response = builder.body(()).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let mut stream = incoming.respond(response)?;
+            if valid {
+                return Ok(Some(Box::new(GrpcLiteStream::new(stream))));
+            }
+            tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+        }
+    }
+}
+
+fn decoded_path_matches(path: &str, expected: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return false;
+            }
+            let Some(high) = hex_value(bytes[index + 1]) else { return false };
+            let Some(low) = hex_value(bytes[index + 2]) else { return false };
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    decoded == expected.as_bytes()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2ray::h2::H2Client;
     use std::io::Cursor;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn service_name_escaping_matches_go_path_escape() {
         assert_eq!(escape_service_name("a/b;c,d?e:f@g+h$i&j=k% l"), "a%2Fb%3Bc%2Cd%3Fe:f@g+h$i&j=k%25%20l");
+    }
+
+    #[test]
+    fn server_path_decodes_percent_escapes_before_comparing() {
+        assert!(decoded_path_matches("/svc%2fname/Tun", "/svc/name/Tun"));
+        assert!(decoded_path_matches("/svc%2Fname/Tun", "/svc/name/Tun"));
+        assert!(!decoded_path_matches("/svc%2Gname/Tun", "/svc/name/Tun"));
+        assert!(!decoded_path_matches("/svc%2", "/svc/Tun"));
+        assert!(!decoded_path_matches("/svc%2Fname/Tun?x=1", "/svc/name/Tun"));
+    }
+
+    #[tokio::test]
+    async fn server_rejects_bad_request_then_accepts_grpc_lite_on_same_connection() {
+        let (client_io, server_io) = duplex(1 << 20);
+        let options = rb_config::V2RayGrpcOptions { service_name: "svc/name".into(), ..Default::default() };
+        let server = GrpcLiteServer::new(Box::new(server_io), &options);
+        let client = H2Client::new(Box::new(client_io)).await.unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut stream = server.accept().await.unwrap().unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).await.unwrap();
+            payload
+        });
+
+        let bad = Request::builder().method("GET").uri("https://example.com/wrong/Tun").body(()).unwrap();
+        let (response, _body) = client.open(bad).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let good = Request::builder()
+            .method("POST")
+            .uri("https://example.com/svc%2fname/Tun?ignored=yes")
+            .header(header::CONTENT_TYPE, "application/grpc+proto")
+            .body(())
+            .unwrap();
+        let (response, body) = client.open(good).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "application/grpc");
+        assert_eq!(response.headers().get("te").unwrap(), "trailers");
+        let mut framed = GrpcLiteStream::new(body);
+        framed.write_all(b"payload").await.unwrap();
+        framed.shutdown().await.unwrap();
+        assert_eq!(server_task.await.unwrap(), b"payload");
     }
 
     #[tokio::test]

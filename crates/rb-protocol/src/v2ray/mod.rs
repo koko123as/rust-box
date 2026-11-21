@@ -86,9 +86,15 @@ pub(crate) fn transport_tls_server(
     tls: &InboundTlsOptions,
     transport: Option<&StreamTransport>,
 ) -> Result<rb_tls::TlsServer, String> {
-    if transport.is_some() {
-        rb_tls::TlsServer::new_with_default_alpn(tls, &["http/1.1"])
-    } else {
-        rb_tls::TlsServer::new(tls)
+    match transport {
+        Some(StreamTransport::Grpc(_)) => {
+            let mut options = tls.clone();
+            if !options.alpn.iter().any(|protocol| protocol == "h2") {
+                options.alpn.0.insert(0, "h2".into());
+            }
+            rb_tls::TlsServer::new(&options)
+        }
+        Some(_) => rb_tls::TlsServer::new_with_default_alpn(tls, &["http/1.1"]),
+        None => rb_tls::TlsServer::new(tls),
     }
 }
