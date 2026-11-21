@@ -14,8 +14,9 @@ use std::task::{Context, Poll, Waker};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, TransportConfig, UdpPoller, VarInt};
-use rb_adapter::{Host, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE};
+use rb_adapter::{BoxStream, Host, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE};
 use rb_config::QuicOptions;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -82,6 +83,38 @@ pub fn server_endpoint(
         QuicServerSocket::new(socket)?,
         Arc::new(quinn::TokioRuntime),
     )
+}
+
+/// Adapts a Quinn bidirectional stream to the project's TCP stream trait and
+/// keeps its endpoint alive for the duration of the routed connection.
+pub fn bidi_stream(endpoint: Endpoint, send: quinn::SendStream, recv: quinn::RecvStream) -> BoxStream {
+    Box::new(QuicBidiStream { _endpoint: endpoint, send, recv })
+}
+
+struct QuicBidiStream {
+    _endpoint: Endpoint,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl AsyncRead for QuicBidiStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.recv).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for QuicBidiStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send).poll_shutdown(cx)
+    }
 }
 
 /// Builds the Quinn transport parameters corresponding to sing-box's shared
