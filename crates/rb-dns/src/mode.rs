@@ -390,10 +390,9 @@ mod tests {
             ),
             (r#"[{"action":"route","server":"local","race":true}]"#, "`race` requires `match_response`"),
             (
-                r#"[{"action":"evaluate","server":"local","tag":"answer"},
-                    {"type":"logical","mode":"and","rules":[{"match_response":"answer"}],
-                     "action":"respond"}]"#,
-                "respond on a logical rule cannot bind a `match_response` tag",
+                r#"[{"type":"logical","mode":"and","rules":[{"domain":"example.com"}],
+                     "action":"route","server":"local","race":true}]"#,
+                "`race` requires `match_response` in sub-rules",
             ),
             (
                 r#"[{"action":"evaluate","server":"local","tag":"answer"},
