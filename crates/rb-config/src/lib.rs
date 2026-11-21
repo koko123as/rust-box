@@ -236,6 +236,10 @@ pub enum Inbound {
     Http(ProxyInbound),
     #[serde(rename = "shadowsocks")]
     Shadowsocks(ShadowsocksInbound),
+    #[serde(rename = "trojan")]
+    Trojan(TrojanInbound),
+    #[serde(rename = "vless")]
+    Vless(VlessInbound),
 }
 
 impl Inbound {
@@ -243,6 +247,8 @@ impl Inbound {
         match self {
             Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => &options.tag,
             Inbound::Shadowsocks(options) => &options.tag,
+            Inbound::Trojan(options) => &options.tag,
+            Inbound::Vless(options) => &options.tag,
         }
     }
     pub fn kind(&self) -> &'static str {
@@ -251,6 +257,8 @@ impl Inbound {
             Inbound::Socks(_) => "socks",
             Inbound::Http(_) => "http",
             Inbound::Shadowsocks(_) => "shadowsocks",
+            Inbound::Trojan(_) => "trojan",
+            Inbound::Vless(_) => "vless",
         }
     }
 
@@ -259,6 +267,8 @@ impl Inbound {
         match self {
             Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.listen_options(),
             Inbound::Shadowsocks(options) => options.listen_options(),
+            Inbound::Trojan(options) => options.listen_options(),
+            Inbound::Vless(options) => options.listen_options(),
         }
     }
 
@@ -267,6 +277,8 @@ impl Inbound {
         match self {
             Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.removed_field_error(),
             Inbound::Shadowsocks(options) => options.removed_field_error(),
+            Inbound::Trojan(options) => options.removed_field_error(),
+            Inbound::Vless(options) => options.removed_field_error(),
         }
     }
 }
@@ -400,6 +412,10 @@ pub enum Outbound {
     Http(HttpOutbound),
     #[serde(rename = "shadowsocks")]
     Shadowsocks(ShadowsocksOutbound),
+    #[serde(rename = "trojan")]
+    Trojan(TrojanOutbound),
+    #[serde(rename = "vless")]
+    Vless(VlessOutbound),
 }
 
 impl Outbound {
@@ -410,6 +426,8 @@ impl Outbound {
             Outbound::Socks(options) => &options.tag,
             Outbound::Http(options) => &options.tag,
             Outbound::Shadowsocks(options) => &options.tag,
+            Outbound::Trojan(options) => &options.tag,
+            Outbound::Vless(options) => &options.tag,
         }
     }
 
@@ -422,6 +440,8 @@ impl Outbound {
             Outbound::Socks(options) => Some(options.dialer_options()),
             Outbound::Http(options) => Some(options.dialer_options()),
             Outbound::Shadowsocks(options) => Some(options.dialer_options()),
+            Outbound::Trojan(options) => Some(options.dialer_options()),
+            Outbound::Vless(options) => Some(options.dialer_options()),
         }
     }
 }
@@ -538,6 +558,214 @@ with_dial_fields! {
         /// not, which makes sing-box ignore it).
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
+    }
+}
+
+/// The `tls`, `multiplex` and `transport` checks of the trojan and vless
+/// outbounds: multiplex and V2Ray transports are not implemented yet.
+fn check_proxy_outbound(
+    path: &str,
+    tls: Option<&OutboundTlsOptions>,
+    multiplex: Option<&OutboundMultiplexOptions>,
+    transport: &Option<V2RayTransportOptions>,
+) -> Result<(), ConfigError> {
+    let field = |path: String, message: String| ConfigError::Field { path, message };
+    if let Some(tls) = tls {
+        tls.validate(&format!("{path}.tls"))?;
+    }
+    if multiplex.is_some_and(|multiplex| multiplex.enabled) {
+        return Err(field(format!("{path}.multiplex"), "`multiplex` is not supported by rust-box yet".into()));
+    }
+    if transport.is_some() {
+        return Err(field(format!("{path}.transport"), "`transport` is not supported by rust-box yet".into()));
+    }
+    Ok(())
+}
+
+/// sing-box `V2RayTransportOptions`: parsed as far as its `type` (one of
+/// `http`, `ws`, `quic`, `grpc`, `httpupgrade`, else "unknown transport
+/// type: X" as sing-box); V2Ray transports are not implemented yet, so a
+/// transport that parses is refused with its path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct V2RayTransportOptions {
+    pub r#type: String,
+    pub options: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for V2RayTransportOptions {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let options = serde_json::Value::deserialize(deserializer)?;
+        let serde_json::Value::Object(object) = &options else {
+            return Err(serde::de::Error::custom("invalid type: expected an object"));
+        };
+        let r#type = match object.get("type") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(value)) => value.clone(),
+            Some(_) => return Err(serde::de::Error::custom("invalid type: expected a string for `type`")),
+        };
+        if !matches!(r#type.as_str(), "http" | "ws" | "quic" | "grpc" | "httpupgrade") {
+            return Err(serde::de::Error::custom(format!("unknown transport type: {}", r#type)));
+        }
+        Ok(V2RayTransportOptions { r#type, options })
+    }
+}
+
+/// sing-box `ServerOptions` (`server`, `server_port`) as an object, as the
+/// trojan inbound's `fallback` uses it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerOptions {
+    #[serde(default)]
+    pub server: String,
+    #[serde(default)]
+    pub server_port: u16,
+}
+
+with_listen_fields! {
+    /// sing-box `TrojanInboundOptions`.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrojanInbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub users: Vec<TrojanUser>,
+        #[serde(default)]
+        pub tls: Option<InboundTlsOptions>,
+        #[serde(default)]
+        pub fallback: Option<ServerOptions>,
+        /// ALPN protocol to fallback server (`null` values count as an
+        /// empty server, as sing-box's nil pointer would not build).
+        #[serde(default)]
+        pub fallback_for_alpn: std::collections::BTreeMap<String, Option<ServerOptions>>,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<InboundMultiplexOptions>,
+        /// V2Ray transports are not supported yet: rejected when set.
+        #[serde(default)]
+        pub transport: Option<V2RayTransportOptions>,
+    }
+}
+
+impl TrojanInbound {
+    /// sing-box `trojan.NewInbound`'s fallback checks.
+    pub fn validate_fallback(&self, path: &str) -> Result<(), ConfigError> {
+        let field = |message: String| ConfigError::Field { path: path.to_string(), message };
+        let tls = self.tls.as_ref().is_some_and(|tls| tls.enabled);
+        if !self.fallback_for_alpn.is_empty() {
+            if !tls {
+                return Err(field("fallback for ALPN is not supported without TLS".into()));
+            }
+            for (protocol, destination) in &self.fallback_for_alpn {
+                let server = destination.as_ref().map_or("", |destination| destination.server.as_str());
+                if server.is_empty() {
+                    let port = destination.as_ref().map_or(0, |destination| destination.server_port);
+                    return Err(field(format!("invalid fallback address for ALPN {protocol}: :{port}")));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// sing-box `TrojanUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrojanUser {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+with_listen_fields! {
+    /// sing-box `VLESSInboundOptions`.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct VlessInbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub users: Vec<VlessUser>,
+        #[serde(default)]
+        pub tls: Option<InboundTlsOptions>,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<InboundMultiplexOptions>,
+        /// V2Ray transports are not supported yet: rejected when set.
+        #[serde(default)]
+        pub transport: Option<V2RayTransportOptions>,
+    }
+}
+
+/// sing-box `VLESSUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VlessUser {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(default)]
+    pub flow: String,
+}
+
+with_dial_fields! {
+    /// sing-box `TrojanOutboundOptions` (`DialerOptions` + `ServerOptions`).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrojanOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub password: String,
+        #[serde(default)]
+        pub network: NetworkList,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<OutboundMultiplexOptions>,
+        /// V2Ray transports are not supported yet: rejected when set.
+        #[serde(default)]
+        pub transport: Option<V2RayTransportOptions>,
+    }
+}
+
+with_dial_fields! {
+    /// sing-box `VLESSOutboundOptions` (`DialerOptions` + `ServerOptions`).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct VlessOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub uuid: String,
+        #[serde(default)]
+        pub flow: String,
+        #[serde(default)]
+        pub network: NetworkList,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+        /// Not supported yet: rejected when enabled.
+        #[serde(default)]
+        pub multiplex: Option<OutboundMultiplexOptions>,
+        /// V2Ray transports are not supported yet: rejected when set.
+        #[serde(default)]
+        pub transport: Option<V2RayTransportOptions>,
+        /// `xudp` (the default when absent), `packetaddr`, or empty for
+        /// none; anything else fails when the outbound is built, as in
+        /// sing-box.
+        #[serde(default)]
+        pub packet_encoding: Option<String>,
     }
 }
 
@@ -735,17 +963,37 @@ impl Options {
             if !detour.is_empty() && !inbound_tags.contains(detour) {
                 return Err(field(format!("inbounds[{index}].detour"), format!("inbound detour not found: {detour}")));
             }
-            if let Inbound::Shadowsocks(shadowsocks) = inbound {
-                if shadowsocks.multiplex.as_ref().is_some_and(|multiplex| multiplex.enabled) {
-                    return Err(field(
-                        format!("inbounds[{index}].multiplex"),
-                        "`multiplex` is not supported by rust-box yet".into(),
-                    ));
-                }
+            let multiplex = match inbound {
+                Inbound::Shadowsocks(options) => options.multiplex.as_ref(),
+                Inbound::Trojan(options) => options.multiplex.as_ref(),
+                Inbound::Vless(options) => options.multiplex.as_ref(),
+                _ => None,
+            };
+            if multiplex.is_some_and(|multiplex| multiplex.enabled) {
+                return Err(field(
+                    format!("inbounds[{index}].multiplex"),
+                    "`multiplex` is not supported by rust-box yet".into(),
+                ));
+            }
+            let transport = match inbound {
+                Inbound::Trojan(options) => options.transport.as_ref(),
+                Inbound::Vless(options) => options.transport.as_ref(),
+                _ => None,
+            };
+            if transport.is_some() {
+                return Err(field(
+                    format!("inbounds[{index}].transport"),
+                    "`transport` is not supported by rust-box yet".into(),
+                ));
+            }
+            if let Inbound::Trojan(trojan) = inbound {
+                trojan.validate_fallback(&format!("inbounds[{index}]"))?;
             }
             let tls = match inbound {
                 Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.tls.as_ref(),
                 Inbound::Shadowsocks(_) => None,
+                Inbound::Trojan(options) => options.tls.as_ref(),
+                Inbound::Vless(options) => options.tls.as_ref(),
             };
             if let Some(tls) = tls {
                 // sing-box's socks inbound has no `tls` field.
@@ -794,6 +1042,14 @@ impl Options {
                         ));
                     }
                     self.check_dialer(&path, &shadowsocks.dialer_options(), &server_known)?;
+                }
+                Outbound::Trojan(trojan) => {
+                    check_proxy_outbound(&path, trojan.tls.as_ref(), trojan.multiplex.as_ref(), &trojan.transport)?;
+                    self.check_dialer(&path, &trojan.dialer_options(), &server_known)?;
+                }
+                Outbound::Vless(vless) => {
+                    check_proxy_outbound(&path, vless.tls.as_ref(), vless.multiplex.as_ref(), &vless.transport)?;
+                    self.check_dialer(&path, &vless.dialer_options(), &server_known)?;
                 }
                 _ => {}
             }
@@ -1236,6 +1492,79 @@ mod tests {
             (
                 r#"{"outbounds":[{"type":"shadowsocks","multiplex":{"protocol":"smux","foo":1}}]}"#,
                 "unknown field `foo`",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn trojan_and_vless_options() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"trojan","tag":"t","listen_port":443,"users":[{"name":"a","password":"p"}],
+                   "tls":{"enabled":true,"insecure":true},"fallback":{"server":"127.0.0.1","server_port":8080},
+                   "fallback_for_alpn":{"h2":{"server":"127.0.0.1","server_port":8081}},
+                   "multiplex":{"enabled":false}},
+                  {"type":"vless","tag":"v","users":[{"name":"b","uuid":"bf000d23-0752-40b4-affe-68f7707a9661",
+                   "flow":"xtls-rprx-vision"}],"tls":{"enabled":false}}],
+                "outbounds":[
+                  {"type":"trojan","tag":"to","server":"example.com","server_port":443,"password":"p",
+                   "network":"tcp","tls":{"enabled":true,"server_name":"example.com"},"multiplex":{"enabled":false}},
+                  {"type":"vless","tag":"vo","server":"127.0.0.1","server_port":443,
+                   "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","flow":"xtls-rprx-vision",
+                   "packet_encoding":"packetaddr"},
+                  {"type":"vless","tag":"vn","packet_encoding":""}]}"#,
+        )
+        .unwrap();
+        let Inbound::Trojan(trojan) = &options.inbounds[0] else { panic!() };
+        assert_eq!(trojan.users[0], TrojanUser { name: "a".into(), password: "p".into() });
+        assert_eq!(trojan.fallback, Some(ServerOptions { server: "127.0.0.1".into(), server_port: 8080 }));
+        assert_eq!(trojan.fallback_for_alpn["h2"].as_ref().unwrap().server_port, 8081);
+        let Inbound::Vless(vless) = &options.inbounds[1] else { panic!() };
+        assert_eq!(vless.users[0].flow, "xtls-rprx-vision");
+        let Outbound::Trojan(outbound) = &options.outbounds[0] else { panic!() };
+        assert_eq!(outbound.network.build(), vec!["tcp"]);
+        let Outbound::Vless(outbound) = &options.outbounds[1] else { panic!() };
+        assert_eq!(outbound.packet_encoding.as_deref(), Some("packetaddr"));
+        let Outbound::Vless(outbound) = &options.outbounds[2] else { panic!() };
+        assert_eq!(outbound.packet_encoding.as_deref(), Some(""));
+
+        for (config, needle) in [
+            (
+                r#"{"inbounds":[{"type":"trojan","transport":{"type":"ws","path":"/"}}]}"#,
+                "inbounds[0].transport: `transport` is not supported by rust-box yet",
+            ),
+            (r#"{"inbounds":[{"type":"trojan","transport":{}}]}"#, "unknown transport type: "),
+            (r#"{"outbounds":[{"type":"vless","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
+            (
+                r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#,
+                "outbounds[0].transport: `transport` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"vless","multiplex":{"enabled":true}}]}"#,
+                "inbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"trojan","multiplex":{"enabled":true,"protocol":"h2mux"}}]}"#,
+                "outbounds[0].multiplex: `multiplex` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"trojan","fallback_for_alpn":{"h2":{"server":"a","server_port":1}}}]}"#,
+                "inbounds[0]: fallback for ALPN is not supported without TLS",
+            ),
+            (
+                r#"{"inbounds":[{"type":"trojan","tls":{"enabled":true},"fallback_for_alpn":{"h2":{"server_port":1}}}]}"#,
+                "invalid fallback address for ALPN h2: :1",
+            ),
+            (r#"{"inbounds":[{"type":"trojan","users":[{"uuid":"x"}]}]}"#, "unknown field `uuid`"),
+            (r#"{"inbounds":[{"type":"vless","users":[{"password":"x"}]}]}"#, "unknown field `password`"),
+            (r#"{"inbounds":[{"type":"vless","network":"tcp"}]}"#, "unknown field `network`"),
+            (r#"{"outbounds":[{"type":"vless","method":"x"}]}"#, "unknown field `method`"),
+            (
+                r#"{"outbounds":[{"type":"trojan","tls":{"enabled":true,"utls":{"enabled":true}}}]}"#,
+                "outbounds[0].tls.utls",
             ),
         ] {
             let error = parse(config).unwrap_err().to_string();

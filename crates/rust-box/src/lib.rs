@@ -134,6 +134,9 @@ impl RustBox {
                     ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
+                OutboundOptions::Trojan(_) | OutboundOptions::Vless(_) => {
+                    return Err(anyhow!("outbounds[{index}]: not supported by rust-box yet"));
+                }
             });
         }
         if outbounds.is_empty() {
@@ -169,6 +172,9 @@ impl RustBox {
                     ShadowsocksInbound::new(shadowsocks, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
+                InboundOptions::Trojan(_) | InboundOptions::Vless(_) => {
+                    return Err(anyhow!("inbounds[{index}]: not supported by rust-box yet"));
+                }
             };
             inbounds.push(built);
         }
