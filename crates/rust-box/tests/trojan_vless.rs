@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use rust_box::RustBox;
@@ -23,6 +23,19 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const UUID: &str = "bf000d23-0752-40b4-affe-68f7707a9661";
 const VISION: &str = "xtls-rprx-vision";
+
+fn init_test_logging() {
+    if std::env::var_os("RUST_BOX_TEST_LOG").is_none() {
+        return;
+    }
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -76,6 +89,7 @@ fn local(port: u16) -> SocketAddr {
 
 /// Starts a rust-box with `config`; returns it and its inbounds' addresses.
 async fn start(config: &Value) -> (RustBox, Vec<SocketAddr>) {
+    init_test_logging();
     let options = rb_config::parse(&config.to_string()).unwrap();
     let instance = RustBox::new(&options).unwrap();
     instance.start().await.unwrap();
@@ -178,7 +192,9 @@ async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
 
 /// 200 KB both ways through `proxy` to the TCP echo server.
 async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
-    let stream = socks5_connect(proxy, echo).await;
+    let stream = tokio::time::timeout(Duration::from_secs(30), socks5_connect(proxy, echo))
+        .await
+        .expect("SOCKS5 TCP CONNECT handshake timed out");
     let payload: Vec<u8> = (0..200_000u32).map(|index| (index % 253) as u8).collect();
     let (mut reader, mut writer) = stream.into_split();
     let data = payload.clone();
@@ -196,6 +212,12 @@ async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
 
 /// A SOCKS5 UDP ASSOCIATE through `proxy`, datagrams to `echo` and back.
 async fn assert_udp_echo(proxy: SocketAddr, echo: SocketAddr) {
+    tokio::time::timeout(Duration::from_secs(30), assert_udp_echo_inner(proxy, echo))
+        .await
+        .expect("SOCKS5 UDP ASSOCIATE timed out");
+}
+
+async fn assert_udp_echo_inner(proxy: SocketAddr, echo: SocketAddr) {
     let mut control = TcpStream::connect(proxy).await.unwrap();
     control.write_all(&[5, 1, 0]).await.unwrap();
     let mut reply = [0u8; 2];
