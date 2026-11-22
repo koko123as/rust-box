@@ -51,7 +51,8 @@ fn kernel_state(name: &str) -> String {
     let addresses: String = run(&["addr", "show", name])
         .lines()
         .filter(|line| line.contains("inet") && !line.contains("fe80"))
-        .map(|line| format!("{line}\n"))
+        // Duplicate address detection may still be running.
+        .map(|line| format!("{}\n", line.replace(" tentative", "")))
         .collect();
     [
         run(&["rule"]),
@@ -189,4 +190,62 @@ async fn tun_auto_route_matches_sing_box() {
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, signal: i32) -> i32;
+}
+
+/// Full auto_route (the default route into the TUN) in a network
+/// namespace: with `auto_detect_interface` the direct outbound binds to the
+/// namespace's real interface and reaches a server outside; this is the
+/// setup that loops without it, in sing-box as in rust-box.
+#[tokio::test(flavor = "multi_thread")]
+async fn tun_full_auto_route_with_auto_detect_interface() {
+    if !enabled() {
+        return;
+    }
+    let _guard = LOCK.lock().await;
+    let sh = |script: &str| {
+        let status = Command::new("sh").args(["-c", script]).status().unwrap();
+        assert!(status.success(), "{script}");
+    };
+    let _ = Command::new("ip").args(["netns", "del", "rbtestns"]).status();
+    let _ = Command::new("ip").args(["link", "del", "rbtveth0"]).status();
+    sh("ip netns add rbtestns && ip link add rbtveth0 type veth peer name rbtveth1 && \
+        ip link set rbtveth1 netns rbtestns && ip addr add 10.210.0.1/24 dev rbtveth0 && \
+        ip addr add 10.211.0.1/32 dev rbtveth0 && ip link set rbtveth0 up && \
+        ip netns exec rbtestns sh -c 'ip link set lo up && ip link set rbtveth1 up && \
+        ip addr add 10.210.0.2/24 dev rbtveth1 && ip route add default via 10.210.0.1'");
+    let server = TcpListener::bind("10.211.0.1:0").await.unwrap();
+    let port = server.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = server.accept().await {
+            let _ = stream.write_all(b"outside").await;
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"log":{"level":"error"},
+            "inbounds":[{"type":"tun","interface_name":"tun0","address":"172.19.0.1/30","auto_route":true,"strict_route":true}],
+            "outbounds":[{"type":"direct"}],"route":{"auto_detect_interface":true}}"#,
+    )
+    .unwrap();
+    let mut child = Command::new("ip")
+        .args(["netns", "exec", "rbtestns", env!("CARGO_BIN_EXE_rust-box"), "run", "-c"])
+        .arg(&path)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let output = Command::new("ip")
+        .args(["netns", "exec", "rbtestns", "bash", "-c"])
+        .arg(format!("exec 3<>/dev/tcp/10.211.0.1/{port} && timeout 5 cat <&3"))
+        .output()
+        .unwrap();
+    let routed = Command::new("ip").args(["netns", "exec", "rbtestns", "ip", "route", "get", "10.211.0.1"]).output();
+    // SAFETY: signalling our own child.
+    unsafe { libc_kill(child.id() as i32, 2) };
+    let _ = child.wait();
+    let _ = Command::new("ip").args(["netns", "del", "rbtestns"]).status();
+    let _ = Command::new("ip").args(["link", "del", "rbtveth0"]).status();
+    assert!(String::from_utf8_lossy(&routed.unwrap().stdout).contains("tun0"));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "outside");
 }
