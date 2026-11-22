@@ -19,6 +19,7 @@ use crate::{
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
+    congestion::PacketNumberSpace,
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -1427,7 +1428,7 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, info);
+                self.on_packet_acked(now, space, packet, info);
             }
         }
 
@@ -1510,11 +1511,24 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+    fn on_packet_acked(&mut self, now: Instant, space: SpaceId, packet_number: u64, info: SentPacket) {
         self.remove_in_flight(&info);
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
+            self.path.congestion.on_packet_acked(
+                match space {
+                    SpaceId::Initial => PacketNumberSpace::Initial,
+                    SpaceId::Handshake => PacketNumberSpace::Handshake,
+                    SpaceId::Data => PacketNumberSpace::Data,
+                },
+                packet_number,
+                now,
+                info.time_sent,
+                info.size.into(),
+                self.app_limited,
+                &self.path.rtt,
+            );
             self.path.congestion.on_ack(now, info.time_sent, info.size.into(), self.app_limited, &self.path.rtt);
         }
 
@@ -1652,6 +1666,19 @@ impl Connection {
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
                 self.config.qlog_sink.emit_packet_lost(packet, &info, loss_delay, pn_space, now, self.orig_rem_cid);
+                self.path.congestion.on_packet_lost(
+                    match pn_space {
+                        SpaceId::Initial => PacketNumberSpace::Initial,
+                        SpaceId::Handshake => PacketNumberSpace::Handshake,
+                        SpaceId::Data => PacketNumberSpace::Data,
+                    },
+                    packet,
+                    now,
+                    info.time_sent,
+                    info.size.into(),
+                    info.ack_eliciting,
+                    self.path.in_flight.bytes,
+                );
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
@@ -2319,7 +2346,7 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, info);
+                    self.on_packet_acked(now, SpaceId::Initial, 0, info);
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials

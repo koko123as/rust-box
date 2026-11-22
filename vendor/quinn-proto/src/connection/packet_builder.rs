@@ -4,6 +4,7 @@ use tracing::{debug, trace, trace_span};
 
 use super::{spaces::SentPacket, Connection, SentFrames};
 use crate::{
+    congestion::PacketNumberSpace,
     connection::ConnectionSide,
     frame::{self, Close, FrameStruct},
     packet::{Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId, FIXED_BIT},
@@ -181,7 +182,8 @@ impl PacketBuilder {
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
         let space_id = self.space;
-        let (size, padded) = self.finish(conn, now, buffer);
+        let (packet_bytes, padded) = self.finish(conn, now, buffer);
+        let size = packet_bytes;
         let sent = match sent {
             Some(sent) => sent,
             None => return,
@@ -203,6 +205,19 @@ impl PacketBuilder {
         };
 
         conn.path.sent(exact_number, packet, &mut conn.spaces[space_id]);
+        conn.path.congestion.on_packet_sent(
+            match space_id {
+                SpaceId::Initial => PacketNumberSpace::Initial,
+                SpaceId::Handshake => PacketNumberSpace::Handshake,
+                SpaceId::Data => PacketNumberSpace::Data,
+            },
+            exact_number,
+            now,
+            packet_bytes as u64,
+            ack_eliciting,
+            conn.path.in_flight.bytes,
+            conn.app_limited,
+        );
         conn.stats.path.sent_packets += 1;
         conn.reset_keep_alive(now);
         if size != 0 {

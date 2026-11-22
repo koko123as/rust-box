@@ -13,8 +13,59 @@ pub use bbr::{Bbr, BbrConfig};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 
+/// QUIC packet number space, without exposing Quinn's internal space identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum PacketNumberSpace {
+    /// Initial packet number space.
+    Initial,
+    /// Handshake packet number space.
+    Handshake,
+    /// Application Data packet number space (including 0-RTT).
+    Data,
+}
+
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
+    /// A tracked packet was sent. `bytes_in_flight` is sampled after accounting for it.
+    #[allow(unused_variables)]
+    fn on_packet_sent(
+        &mut self,
+        space: PacketNumberSpace,
+        packet_number: u64,
+        sent: Instant,
+        bytes: u64,
+        ack_eliciting: bool,
+        bytes_in_flight: u64,
+        app_limited: bool,
+    ) {
+    }
+    /// A packet was acknowledged in its packet number space.
+    #[allow(unused_variables)]
+    fn on_packet_acked(
+        &mut self,
+        space: PacketNumberSpace,
+        packet_number: u64,
+        ack_time: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+    }
+    /// A packet was declared lost. `bytes_in_flight` is sampled before removing it.
+    #[allow(unused_variables)]
+    fn on_packet_lost(
+        &mut self,
+        space: PacketNumberSpace,
+        packet_number: u64,
+        loss_time: Instant,
+        sent: Instant,
+        bytes: u64,
+        ack_eliciting: bool,
+        bytes_in_flight: u64,
+    ) {
+    }
     /// One or more packets were just sent
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}

@@ -501,6 +501,205 @@ fn congestion() {
     pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
 }
 
+#[derive(Clone, Debug)]
+enum PacketCallbackEvent {
+    Sent(crate::congestion::PacketNumberSpace, u64),
+    Acked(usize, crate::congestion::PacketNumberSpace, u64),
+    EndAcks(usize),
+    Lost(crate::congestion::PacketNumberSpace, u64, bool, u64, u64),
+    CongestionEvent(u64),
+}
+
+#[derive(Default)]
+struct PacketCallbackState {
+    events: Vec<PacketCallbackEvent>,
+    ack_batch: usize,
+}
+
+#[derive(Default)]
+struct PacketCallbackLog(Mutex<PacketCallbackState>);
+
+struct PacketCallbackFactory(Arc<PacketCallbackLog>);
+
+impl crate::congestion::ControllerFactory for PacketCallbackFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn crate::congestion::Controller> {
+        Box::new(PacketCallbackController(self.0.clone()))
+    }
+}
+
+struct PacketCallbackController(Arc<PacketCallbackLog>);
+
+impl crate::congestion::Controller for PacketCallbackController {
+    fn on_packet_sent(
+        &mut self,
+        space: crate::congestion::PacketNumberSpace,
+        packet_number: u64,
+        _sent: Instant,
+        _bytes: u64,
+        _ack_eliciting: bool,
+        _bytes_in_flight: u64,
+        _app_limited: bool,
+    ) {
+        self.0 .0.lock().unwrap().events.push(PacketCallbackEvent::Sent(space, packet_number));
+    }
+
+    fn on_packet_acked(
+        &mut self,
+        space: crate::congestion::PacketNumberSpace,
+        packet_number: u64,
+        _ack_time: Instant,
+        _sent: Instant,
+        _bytes: u64,
+        _app_limited: bool,
+        _rtt: &crate::connection::RttEstimator,
+    ) {
+        let mut state = self.0 .0.lock().unwrap();
+        let batch = state.ack_batch;
+        state.events.push(PacketCallbackEvent::Acked(batch, space, packet_number));
+    }
+
+    fn on_end_acks(
+        &mut self,
+        _now: Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        _largest_packet_num_acked: Option<u64>,
+    ) {
+        let mut state = self.0 .0.lock().unwrap();
+        let batch = state.ack_batch;
+        state.events.push(PacketCallbackEvent::EndAcks(batch));
+        state.ack_batch += 1;
+    }
+
+    fn on_packet_lost(
+        &mut self,
+        space: crate::congestion::PacketNumberSpace,
+        packet_number: u64,
+        _loss_time: Instant,
+        _sent: Instant,
+        bytes: u64,
+        ack_eliciting: bool,
+        bytes_in_flight: u64,
+    ) {
+        self.0 .0.lock().unwrap().events.push(PacketCallbackEvent::Lost(
+            space,
+            packet_number,
+            ack_eliciting,
+            bytes,
+            bytes_in_flight,
+        ));
+    }
+
+    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent_congestion: bool, lost_bytes: u64) {
+        self.0 .0.lock().unwrap().events.push(PacketCallbackEvent::CongestionEvent(lost_bytes));
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        1_000_000
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::congestion::Controller> {
+        Box::new(Self(self.0.clone()))
+    }
+
+    fn initial_window(&self) -> u64 {
+        1_000_000
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+#[test]
+fn packet_callbacks_track_real_pair_stream_packets_and_acks() {
+    let _guard = subscribe();
+    let log = Arc::new(PacketCallbackLog::default());
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(PacketCallbackFactory(log.clone())));
+    config.transport = Arc::new(transport);
+
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(config);
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let payload = vec![42; 32 * 1024];
+    pair.client_conn_mut(client_ch).set_send_window(payload.len() as u64);
+    pair.client_send(client_ch, stream).write(&payload).unwrap();
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.client.drive_outgoing(pair.time);
+    assert!(pair.client.outbound.len() >= 4, "enough application packets are needed to trigger packet-threshold loss");
+    pair.client.outbound.pop_front().expect("drop one application packet");
+    pair.drive();
+
+    let state = log.0.lock().unwrap();
+    let events = &state.events;
+    let sent: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            PacketCallbackEvent::Sent(space, number) => Some((*space, *number)),
+            _ => None,
+        })
+        .collect();
+    let acked: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            PacketCallbackEvent::Acked(batch, space, number) => Some((*batch, *space, *number)),
+            _ => None,
+        })
+        .collect();
+    assert!(!sent.is_empty(), "real Pair traffic must produce packet-sent callbacks");
+    assert!(!acked.is_empty(), "real Pair ACKs must produce per-packet callbacks");
+    for (batch, space, number) in acked {
+        assert!(sent.contains(&(space, number)), "ACK for {space:?} packet {number} must match an earlier send");
+        let ack_position = events
+            .iter()
+            .position(|event| matches!(event, PacketCallbackEvent::Acked(found_batch, s, n) if *found_batch == batch && *s == space && *n == number))
+            .unwrap();
+        let send_position = events
+            .iter()
+            .position(|event| matches!(event, PacketCallbackEvent::Sent(s, n) if *s == space && *n == number))
+            .unwrap();
+        assert!(send_position < ack_position, "packet ACK callback must follow its send callback");
+        let end_position = events
+            .iter()
+            .position(|event| matches!(event, PacketCallbackEvent::EndAcks(end_batch) if *end_batch == batch));
+        assert!(
+            end_position.is_some_and(|position| ack_position < position),
+            "each ACK batch must end after its packet callbacks"
+        );
+    }
+
+    let (loss_position, lost_space, lost_number) = events
+        .iter()
+        .enumerate()
+        .find_map(|(position, event)| match event {
+            PacketCallbackEvent::Lost(space, number, true, bytes, bytes_in_flight) if *bytes > 0 => {
+                assert!(*bytes_in_flight >= *bytes, "in-flight snapshot must include the packet being declared lost");
+                Some((position, *space, *number))
+            }
+            _ => None,
+        })
+        .expect("dropping an application packet must produce an ack-eliciting loss callback");
+    let send_position = events
+        .iter()
+        .position(|event| matches!(event, PacketCallbackEvent::Sent(space, number) if *space == lost_space && *number == lost_number))
+        .expect("lost packet must previously have been reported as sent");
+    assert!(send_position < loss_position, "loss callback must follow its send callback");
+    assert!(
+        events[loss_position + 1..]
+            .iter()
+            .any(|event| matches!(event, PacketCallbackEvent::CongestionEvent(bytes) if *bytes > 0)),
+        "per-packet loss callbacks must precede the aggregate loss congestion event"
+    );
+}
+
 #[test]
 fn high_latency_handshake() {
     let _guard = subscribe();
