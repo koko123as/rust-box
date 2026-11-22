@@ -57,6 +57,31 @@ async fn tcp_echo() -> SocketAddr {
     address
 }
 
+struct TcpAcceptObserver {
+    address: SocketAddr,
+    accepted: tokio::sync::mpsc::UnboundedReceiver<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TcpAcceptObserver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn tcp_accept_observer() -> TcpAcceptObserver {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = accepted_tx.send(());
+            drop(stream);
+        }
+    });
+    TcpAcceptObserver { address, accepted, task }
+}
+
 /// A TCP server that writes `banner` first, then echoes.
 async fn banner_echo(banner: &'static [u8]) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -196,8 +221,12 @@ async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
     stream
 }
 
-/// A SOCKS5 CONNECT through `proxy` that must be rejected before reaching `target`.
-async fn assert_socks5_connect_rejected(proxy: SocketAddr, target: SocketAddr) {
+/// A SOCKS5 CONNECT with invalid credentials must not reach the target listener.
+async fn assert_socks5_connect_rejected(
+    proxy: SocketAddr,
+    target: SocketAddr,
+    target_accepts: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
     let mut stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(proxy))
         .await
         .expect("SOCKS5 proxy connection timed out")
@@ -217,10 +246,21 @@ async fn assert_socks5_connect_rejected(proxy: SocketAddr, target: SocketAddr) {
     stream.write_all(&request).await.unwrap();
     let mut response = [0u8; 2];
     match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut response)).await {
-        Ok(Ok(_)) => assert_ne!(response[1], 0, "SOCKS5 CONNECT unexpectedly accepted wrong credentials"),
-        Ok(Err(_)) => test_progress("wrong credentials rejected by closing the SOCKS5 connection"),
+        Ok(Ok(_)) if response[1] == 0 => {
+            test_progress("wrong-credential SOCKS5 CONNECT returned success; sending a target probe");
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(b"rust-box-wrong-credential-probe"))
+                .await;
+        }
+        Ok(Ok(_)) => test_progress("wrong credentials received a SOCKS5 failure reply"),
+        Ok(Err(error)) => test_progress(&format!("wrong credentials closed SOCKS5 before a reply: {error}")),
         Err(_) => panic!("SOCKS5 CONNECT rejection timed out"),
     }
+    match tokio::time::timeout(Duration::from_secs(2), target_accepts.recv()).await {
+        Ok(Some(())) => panic!("wrong credentials reached the target TCP listener"),
+        Ok(None) => panic!("target TCP listener observer stopped unexpectedly"),
+        Err(_) => test_progress("wrong credentials did not reach the target TCP listener"),
+    }
+    drop(stream);
 }
 
 /// 200 KB both ways through `proxy` to the TCP echo server.
@@ -677,7 +717,7 @@ async fn interop_from_sing_box(inbound: Value, outbound: impl FnOnce(SocketAddr)
 
 /// A sing-box client with invalid credentials must not reach a RustBox inbound.
 async fn interop_reject_wrong_credentials(inbound: Value, outbound: impl FnOnce(SocketAddr) -> Value) {
-    let target = tcp_echo().await;
+    let mut target = tcp_accept_observer().await;
     test_progress("wrong-credential interop: starting RustBox inbound");
     let (server, servers) = start(&server_config(inbound)).await;
     let port = free_port();
@@ -686,7 +726,7 @@ async fn interop_reject_wrong_credentials(inbound: Value, outbound: impl FnOnce(
         return;
     };
     test_progress("wrong-credential interop: sing-box client ready");
-    assert_socks5_connect_rejected(local(port), target).await;
+    assert_socks5_connect_rejected(local(port), target.address, &mut target.accepted).await;
     drop(client);
     test_progress("wrong-credential interop: closing RustBox inbound");
     tokio::time::timeout(Duration::from_secs(30), server.close())
