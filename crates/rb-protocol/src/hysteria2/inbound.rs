@@ -131,8 +131,17 @@ impl Hysteria2Inbound {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let (auth_tx, auth_rx) = oneshot::channel();
         let udp_enabled = connection.max_datagram_size().is_some();
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let dispatch_authenticated = authenticated.clone();
         let adapter = h3_quinn::Connection::new_with_bidi_dispatch(connection.clone(), move |stream| {
-            let _ = raw_tx.send(stream);
+            if !dispatch_authenticated.load(Ordering::Acquire) {
+                let mut stream = stream;
+                let error_code = VarInt::from_u32(1);
+                let _ = stream.send.reset(error_code);
+                let _ = stream.recv.stop(error_code);
+            } else {
+                let _ = raw_tx.send(stream);
+            }
         });
         let inbound = self.clone();
         let h3_driver = tokio::spawn(async move {
@@ -147,6 +156,7 @@ impl Hysteria2Inbound {
                     controller,
                     udp_enabled,
                 },
+                authenticated,
             )
             .await;
         });
@@ -192,6 +202,7 @@ impl Hysteria2Inbound {
         mut raw_rx: mpsc::UnboundedReceiver<h3_quinn::RawBidiStream>,
         mut h3_driver: JoinHandle<()>,
     ) {
+        let udp_enabled = connection.max_datagram_size().is_some();
         let sessions: UdpSessions = Arc::new(AsyncMutex::new(HashMap::new()));
         let mut tasks = JoinSet::new();
         let mut expire = tokio::time::interval(Duration::from_secs(1));
@@ -211,7 +222,7 @@ impl Hysteria2Inbound {
                     }
                     None => break,
                 },
-                datagram = connection.read_datagram() => match datagram {
+                datagram = connection.read_datagram(), if udp_enabled => match datagram {
                     Ok(datagram) => {
                         if let Err(error) = self.handle_udp_datagram(&connection, &sessions, user.clone(), datagram.as_ref(), &mut tasks).await {
                             debug!("{}: invalid UDP datagram: {error}", self.prefix());
@@ -291,13 +302,7 @@ impl Hysteria2Inbound {
             }
             sessions
                 .entry(message.session_id)
-                .or_insert_with(|| {
-                    Arc::new(Hysteria2UdpSession::new(
-                        message.session_id,
-                        connection.clone(),
-                        connection.max_datagram_size().unwrap_or(HYSTERIA2_UDP_MTU).min(HYSTERIA2_UDP_MTU),
-                    ))
-                })
+                .or_insert_with(|| Arc::new(Hysteria2UdpSession::new(message.session_id, connection.clone())))
                 .clone()
         };
         if let Some(destination) = session.input(message).await? {
@@ -430,8 +435,12 @@ impl Hysteria2Inbound {
     }
 }
 
-async fn drive_h3<C>(adapter: C, auth_tx: oneshot::Sender<Result<Option<String>, AuthFailure>>, auth: H3AuthConfig)
-where
+async fn drive_h3<C>(
+    adapter: C,
+    auth_tx: oneshot::Sender<Result<Option<String>, AuthFailure>>,
+    auth: H3AuthConfig,
+    authenticated: Arc<AtomicBool>,
+) where
     C: h3::quic::Connection<bytes::Bytes> + Send + 'static,
     C::BidiStream: Send + 'static,
     C::RecvStream: Send + 'static,
@@ -498,6 +507,7 @@ where
                         debug!("Hysteria2 finish auth response: {error}");
                         return;
                     }
+                    authenticated.store(true, Ordering::Release);
                     let _ = auth_tx.send(Ok(user));
                 }
                 Err(error) => {
@@ -511,7 +521,11 @@ where
                 }
             }
         } else {
-            let response = Response::builder().status(StatusCode::NOT_FOUND).body(());
+            let response = if is_auth_request(&request) {
+                auth_response(auth.receive_bps, auth.receive_bps == 0 && auth.ignore_client_bandwidth, auth.udp_enabled)
+            } else {
+                Response::builder().status(StatusCode::NOT_FOUND).body(()).map_err(other)
+            };
             if let Ok(response) = response {
                 let _ = stream.send_response(response).await;
                 let _ = stream.finish().await;
@@ -531,11 +545,7 @@ fn authenticate_request(
     ignore_client_bandwidth: bool,
     controller: &quinn::congestion::Hysteria2NegotiatedConfig,
 ) -> Result<Option<String>, AuthFailure> {
-    let uri = request.uri();
-    if request.method() != Method::POST
-        || uri.path() != AUTH_PATH
-        || uri.authority().map(|authority| authority.as_str()) != Some(AUTH_HOST)
-    {
+    if !is_auth_request(request) {
         return Err(AuthFailure::Rejected);
     }
     let password =
@@ -560,6 +570,12 @@ fn authenticate_request(
         return Err(AuthFailure::BbrMeta2Unsupported);
     }
     Ok((!user.is_empty()).then(|| user.clone()))
+}
+
+fn is_auth_request(request: &Request<()>) -> bool {
+    request.method() == Method::POST
+        && request.uri().path() == AUTH_PATH
+        && request.uri().authority().map(|authority| authority.as_str()) == Some(AUTH_HOST)
 }
 
 fn auth_response(receive_bps: u64, receive_auto: bool, udp_enabled: bool) -> io::Result<Response<()>> {
@@ -694,10 +710,10 @@ struct Hysteria2UdpSession {
 }
 
 impl Hysteria2UdpSession {
-    fn new(session_id: u32, connection: Connection, max_datagram: usize) -> Self {
+    fn new(session_id: u32, connection: Connection) -> Self {
         Self {
             session_id,
-            packet_conn: Arc::new(Hysteria2PacketConn::new(session_id, connection, max_datagram)),
+            packet_conn: Arc::new(Hysteria2PacketConn::new(session_id, connection)),
             reassembler: Mutex::new(Reassembler::new(256, MAX_UDP_SIZE)),
             route_started: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
@@ -732,7 +748,6 @@ struct Hysteria2PacketConn {
     session_id: u32,
     connection: Connection,
     packet_id: AtomicU32,
-    max_datagram: usize,
     tx: mpsc::Sender<(Vec<u8>, Socksaddr)>,
     rx: AsyncMutex<mpsc::Receiver<(Vec<u8>, Socksaddr)>>,
     closed_tx: watch::Sender<bool>,
@@ -740,19 +755,10 @@ struct Hysteria2PacketConn {
 }
 
 impl Hysteria2PacketConn {
-    fn new(session_id: u32, connection: Connection, max_datagram: usize) -> Self {
+    fn new(session_id: u32, connection: Connection) -> Self {
         let (tx, rx) = mpsc::channel(UDP_QUEUE_SIZE);
         let (closed_tx, closed_rx) = watch::channel(false);
-        Self {
-            session_id,
-            connection,
-            packet_id: AtomicU32::new(0),
-            max_datagram,
-            tx,
-            rx: AsyncMutex::new(rx),
-            closed_tx,
-            closed_rx,
-        }
+        Self { session_id, connection, packet_id: AtomicU32::new(0), tx, rx: AsyncMutex::new(rx), closed_tx, closed_rx }
     }
 
     async fn enqueue(&self, data: Vec<u8>, destination: Socksaddr) -> io::Result<()> {
@@ -798,7 +804,7 @@ impl PacketConn for Hysteria2PacketConn {
         if address.domain().is_some_and(|domain| domain.len() > MAX_FQDN_LENGTH) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Hysteria2 destination FQDN exceeds 255 bytes"));
         }
-        let message = UdpMessage {
+        let mut message = UdpMessage {
             session_id: self.session_id,
             packet_id: self.packet_id.fetch_add(1, Ordering::Relaxed) as u16,
             fragment_id: 0,
@@ -806,17 +812,53 @@ impl PacketConn for Hysteria2PacketConn {
             destination: address.to_string(),
             payload: data.to_vec(),
         };
-        for fragment in fragment(&message, self.max_datagram)? {
-            self.connection
-                .send_datagram(fragment.encode()?.into())
-                .map_err(|error| io::Error::other(format!("Hysteria2 send UDP datagram: {error:?}")))?;
+        let Some(mut max_datagram) = self.connection.max_datagram_size() else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Hysteria2 QUIC datagrams are unavailable"));
+        };
+        max_datagram = max_datagram.min(HYSTERIA2_UDP_MTU);
+        let overhead = UdpMessage { payload: Vec::new(), ..message.clone() }.encode()?.len();
+        for attempt in 0..=DATAGRAM_MTU_RETRIES {
+            let fragments = fragment(&message, max_datagram)?;
+            let mut too_large = false;
+            for fragment in fragments {
+                match self.connection.send_datagram(fragment.encode()?.into()) {
+                    Ok(()) => {}
+                    Err(quinn::SendDatagramError::TooLarge) => {
+                        too_large = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(io::Error::other(format!("Hysteria2 send UDP datagram: {error:?}")));
+                    }
+                }
+            }
+            if !too_large {
+                return Ok(());
+            }
+            if attempt == DATAGRAM_MTU_RETRIES {
+                break;
+            }
+            let next_mtu = next_datagram_mtu(max_datagram, self.connection.max_datagram_size(), overhead)
+                .ok_or_else(|| io::Error::other("Hysteria2 UDP datagram remains too large after MTU adjustment"))?;
+            // A new packet ID prevents fragments already sent with the previous MTU from
+            // being mixed with the retry's differently partitioned packet.
+            message.packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed) as u16;
+            max_datagram = next_mtu;
         }
-        Ok(())
+        Err(io::Error::other("Hysteria2 UDP datagram exceeds the path MTU retry limit"))
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         Some(self.connection.remote_address())
     }
+}
+
+const DATAGRAM_MTU_RETRIES: usize = 32;
+
+fn next_datagram_mtu(current: usize, live_limit: Option<usize>, header_len: usize) -> Option<usize> {
+    let live_limit = live_limit.unwrap_or(current).min(HYSTERIA2_UDP_MTU);
+    let candidate = if live_limit < current { live_limit } else { current.saturating_sub(32) };
+    (candidate > header_len).then_some(candidate)
 }
 
 struct Hysteria2TcpStream {
@@ -882,4 +924,25 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod udp_mtu_tests {
+    use super::*;
+
+    #[test]
+    fn retry_uses_a_newly_reported_smaller_live_limit() {
+        assert_eq!(next_datagram_mtu(1197, Some(1000), 24), Some(1000));
+    }
+
+    #[test]
+    fn retry_downshifts_when_the_live_limit_is_stale() {
+        assert_eq!(next_datagram_mtu(1197, Some(1197), 24), Some(1165));
+        assert_eq!(next_datagram_mtu(1197, None, 24), Some(1165));
+    }
+
+    #[test]
+    fn retry_stops_when_no_room_remains_for_payload() {
+        assert_eq!(next_datagram_mtu(100, Some(100), 68), None);
+    }
 }
