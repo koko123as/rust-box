@@ -41,6 +41,27 @@ fn error(message: impl Into<String>) -> RuleSetError {
 /// router exists.
 pub type ValidatorSlot = Arc<OnceLock<Box<UpdateValidator>>>;
 
+/// A remote rule-set as the cache file keeps it (sing-box
+/// `adapter.SavedBinary`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedRuleSet {
+    pub content: Vec<u8>,
+    pub last_updated: SystemTime,
+    pub last_etag: String,
+    /// SHA-256 of the URL it was downloaded from (empty when unknown).
+    pub url_hash: Vec<u8>,
+}
+
+/// Where remote rule-sets are kept across restarts (the cache file's
+/// `rule_set` bucket).
+pub trait RuleSetCache: Send + Sync {
+    fn load_rule_set(&self, tag: &str) -> Option<SavedRuleSet>;
+    fn save_rule_set(&self, tag: &str, saved: &SavedRuleSet) -> Result<(), String>;
+}
+
+/// The cache, installed once the cache file exists.
+pub type CacheSlot = Arc<OnceLock<Arc<dyn RuleSetCache>>>;
+
 /// What rule-sets need from the box.
 #[derive(Clone)]
 pub struct Env {
@@ -50,6 +71,7 @@ pub struct Env {
     /// `download_detour` (sing-box's implicit default HTTP client).
     pub default_outbound: String,
     pub validator: ValidatorSlot,
+    pub cache: CacheSlot,
 }
 
 /// Parses rule-set content in `format` (`loadBytes` / `reloadFile`).
@@ -70,6 +92,7 @@ enum Source {
 
 struct Remote {
     url: String,
+    url_hash: [u8; 32],
     initial_path: Option<PathBuf>,
     format: String,
     update_interval: Duration,
@@ -82,6 +105,7 @@ struct RemoteState {
     last_updated: Option<SystemTime>,
     last_etag: Option<String>,
     client: Option<http::Client>,
+    cache: Option<Arc<dyn RuleSetCache>>,
 }
 
 /// A rule-set of any type.
@@ -133,6 +157,10 @@ impl ManagedRuleSet {
                 (
                     Source::Remote(Remote {
                         url: remote.url.replace(TAG_PLACEHOLDER, tag),
+                        url_hash: {
+                            use sha2::Digest;
+                            sha2::Sha256::digest(remote.url.replace(TAG_PLACEHOLDER, tag).as_bytes()).into()
+                        },
                         initial_path,
                         format: options.format.clone(),
                         update_interval,
@@ -199,7 +227,37 @@ impl ManagedRuleSet {
             Source::Remote(remote) => {
                 let client =
                     self.client(remote, env).map_err(|e| error(format!("create rule-set http client: {e}")))?;
-                remote.state.lock().unwrap().client = Some(client);
+                let cache = env.cache.get().cloned();
+                {
+                    let mut state = remote.state.lock().unwrap();
+                    state.client = Some(client);
+                    state.cache = cache.clone();
+                }
+                if let Some(saved) = cache.as_ref().and_then(|cache| cache.load_rule_set(&self.tag)) {
+                    if !saved.url_hash.is_empty() && saved.url_hash != remote.url_hash {
+                        tracing::info!(
+                            "rule-set {}: cached rule-set was downloaded from another URL, will refetch",
+                            self.tag
+                        );
+                    } else {
+                        match parse_content(&remote.format, &saved.content)
+                            .and_then(|rules| compile(&rules))
+                            .and_then(|content| self.replace(content))
+                        {
+                            Ok(()) => {
+                                let mut state = remote.state.lock().unwrap();
+                                state.last_updated = Some(saved.last_updated);
+                                state.last_etag = (!saved.last_etag.is_empty()).then_some(saved.last_etag);
+                            }
+                            Err(e) => {
+                                tracing::warn!("rule-set {}: restore cached rule-set, will refetch: {e}", self.tag)
+                            }
+                        }
+                    }
+                }
+                if remote.state.lock().unwrap().last_updated.is_some() {
+                    return Ok(());
+                }
                 if let Some(path) = &remote.initial_path {
                     let loaded = std::fs::read(path)
                         .map_err(|e| error(e.to_string()))
@@ -247,7 +305,22 @@ impl ManagedRuleSet {
         match response.status {
             200 => {}
             304 => {
-                remote.state.lock().unwrap().last_updated = Some(SystemTime::now());
+                let now = SystemTime::now();
+                let cache = {
+                    let mut state = remote.state.lock().unwrap();
+                    state.last_updated = Some(now);
+                    state.cache.clone()
+                };
+                if let Some(cache) = cache {
+                    if let Some(mut saved) = cache.load_rule_set(&self.tag) {
+                        saved.last_updated = now;
+                        saved.url_hash = remote.url_hash.to_vec();
+                        if let Err(e) = cache.save_rule_set(&self.tag, &saved) {
+                            tracing::error!("rule-set {}: save rule-set updated time: {e}", self.tag);
+                            return Ok(());
+                        }
+                    }
+                }
                 tracing::info!("update rule-set {}: not modified", self.tag);
                 return Ok(());
             }
@@ -255,11 +328,26 @@ impl ManagedRuleSet {
         }
         let rules = parse_content(&remote.format, &response.body)?;
         self.replace(compile(&rules)?)?;
-        let mut state = remote.state.lock().unwrap();
-        if let Some(etag) = response.etag.filter(|etag| !etag.is_empty()) {
-            state.last_etag = Some(etag);
+        let now = SystemTime::now();
+        let (cache, etag) = {
+            let mut state = remote.state.lock().unwrap();
+            if let Some(etag) = response.etag.filter(|etag| !etag.is_empty()) {
+                state.last_etag = Some(etag);
+            }
+            state.last_updated = Some(now);
+            (state.cache.clone(), state.last_etag.clone().unwrap_or_default())
+        };
+        if let Some(cache) = cache {
+            let saved = SavedRuleSet {
+                content: response.body,
+                last_updated: now,
+                last_etag: etag,
+                url_hash: remote.url_hash.to_vec(),
+            };
+            if let Err(e) = cache.save_rule_set(&self.tag, &saved) {
+                tracing::error!("rule-set {}: save rule-set cache: {e}", self.tag);
+            }
         }
-        state.last_updated = Some(SystemTime::now());
         tracing::info!("updated rule-set {}", self.tag);
         Ok(())
     }
