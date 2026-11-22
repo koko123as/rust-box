@@ -40,6 +40,7 @@ const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW
 
 type UdpSessions = Arc<AsyncMutex<HashMap<u32, Arc<Hysteria2UdpSession>>>>;
 
+#[derive(Debug)]
 enum AuthFailure {
     Rejected,
     BbrMeta2Unsupported,
@@ -944,5 +945,60 @@ mod udp_mtu_tests {
     #[test]
     fn retry_stops_when_no_room_remains_for_payload() {
         assert_eq!(next_datagram_mtu(100, Some(100), 68), None);
+    }
+
+    fn auth_request(password: &str, client_rx: Option<&str>) -> Request<()> {
+        let mut request = Request::builder().method(Method::POST).uri(format!("https://{AUTH_HOST}{AUTH_PATH}"));
+        if !password.is_empty() {
+            request = request.header("hysteria-auth", password);
+        }
+        if let Some(client_rx) = client_rx {
+            request = request.header("hysteria-cc-rx", client_rx);
+        }
+        request.body(()).unwrap()
+    }
+
+    #[test]
+    fn auth_maps_password_to_user_and_accepts_brutal_bandwidth() {
+        let request = auth_request("alice-secret", Some("2000000"));
+        let users = HashMap::from([("alice-secret".to_string(), "alice".to_string())]);
+        let controller = quinn::congestion::Hysteria2NegotiatedConfig::default();
+
+        let user = authenticate_request(&request, &users, 1_000_000, 0, false, &controller).unwrap();
+
+        assert_eq!(user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn auth_rejects_unknown_password() {
+        let request = auth_request("wrong", Some("1000000"));
+        let users = HashMap::from([("alice-secret".to_string(), "alice".to_string())]);
+        let controller = quinn::congestion::Hysteria2NegotiatedConfig::default();
+
+        assert!(matches!(authenticate_request(&request, &users, 0, 0, false, &controller), Err(AuthFailure::Rejected)));
+    }
+
+    #[test]
+    fn auth_explicitly_rejects_the_unimplemented_meta2_branch() {
+        let request = auth_request("alice-secret", None);
+        let users = HashMap::from([("alice-secret".to_string(), "alice".to_string())]);
+        let controller = quinn::congestion::Hysteria2NegotiatedConfig::default();
+
+        assert!(matches!(
+            authenticate_request(&request, &users, 0, 0, false, &controller),
+            Err(AuthFailure::BbrMeta2Unsupported)
+        ));
+    }
+
+    #[test]
+    fn auth_response_has_sing_quic_status_and_headers() {
+        let response = auth_response(123_456, false, true).unwrap();
+
+        assert_eq!(response.status().as_u16(), AUTH_OK_STATUS);
+        assert_eq!(response.headers()["hysteria-udp"], "true");
+        assert_eq!(response.headers()["hysteria-cc-rx"], "123456");
+        let padding = response.headers()["hysteria-padding"].to_str().unwrap();
+        assert!((256..2048).contains(&padding.len()));
+        assert!(padding.bytes().all(|byte| PADDING_CHARS.contains(&byte)));
     }
 }
