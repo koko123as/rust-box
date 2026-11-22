@@ -222,9 +222,8 @@ impl StreamsState {
     fn ensure_remote_streams(&mut self, dir: Dir) {
         let index = dir as usize;
         let available = MAX_STREAM_COUNT.saturating_sub(self.max_remote[index]);
-        let new_count = self.max_concurrent_remote_count[index]
-            .saturating_sub(self.allocated_remote_count[index])
-            .min(available);
+        let new_count =
+            self.max_concurrent_remote_count[index].saturating_sub(self.allocated_remote_count[index]).min(available);
         self.allocated_remote_count[index] += new_count;
         self.max_remote[index] += new_count;
     }
@@ -912,10 +911,7 @@ impl StreamsState {
     /// Materialize state for a permitted remote stream on first use.
     pub(super) fn ensure_remote_stream_state(&mut self, id: StreamId) -> bool {
         let direction = id.dir() as usize;
-        if id.initiator() == self.side
-            || id.index() >= self.max_remote[direction]
-            || self.is_remote_stream_closed(id)
-        {
+        if id.initiator() == self.side || id.index() >= self.max_remote[direction] || self.is_remote_stream_closed(id) {
             return false;
         }
 
@@ -932,8 +928,7 @@ impl StreamsState {
     fn is_remote_stream_closed(&self, id: StreamId) -> bool {
         let direction = id.dir() as usize;
         let index = id.index();
-        index < self.closed_remote_prefix[direction]
-            || self.closed_remote_out_of_order[direction].contains(&index)
+        index < self.closed_remote_prefix[direction] || self.closed_remote_out_of_order[direction].contains(&index)
     }
 
     fn is_remote_stream_half_closed(&self, id: StreamId, half: StreamHalf) -> bool {
@@ -944,9 +939,7 @@ impl StreamsState {
             StreamHalf::Send => 1,
             StreamHalf::Recv => 2,
         };
-        self.closed_remote_halves[id.dir() as usize]
-            .get(&id.index())
-            .is_some_and(|closed| closed & bit != 0)
+        self.closed_remote_halves[id.dir() as usize].get(&id.index()).is_some_and(|closed| closed & bit != 0)
     }
 
     fn mark_remote_stream_half_closed(&mut self, id: StreamId, half: StreamHalf) {
@@ -1814,9 +1807,12 @@ mod tests {
         for _ in 0..2 {
             client.set_max_concurrent(Dir::Uni, 200u32.into());
             client.set_max_concurrent(Dir::Bi, 201u32.into());
-            assert_eq!(client.recv.len(), 200 + 201);
             assert_eq!(client.max_remote[Dir::Uni as usize], 200);
             assert_eq!(client.max_remote[Dir::Bi as usize], 201);
+            assert_eq!(client.max_concurrent(Dir::Uni), 200);
+            assert_eq!(client.max_concurrent(Dir::Bi), 201);
+            assert!(client.send.is_empty());
+            assert!(client.recv.is_empty());
         }
     }
 
@@ -2047,9 +2043,10 @@ mod tests {
         assert!(client.send.is_empty());
         assert!(client.recv.is_empty());
 
-        client
-            .received(frame::Stream { id, offset: 0, fin: false, data: Bytes::new() }, 0)
-            .unwrap();
+        assert_eq!(
+            client.received(frame::Stream { id, offset: 0, fin: false, data: Bytes::new() }, 0),
+            Ok(ShouldTransmit(false))
+        );
 
         assert_eq!(client.send.len(), 1);
         assert_eq!(client.recv.len(), 1);
@@ -2064,9 +2061,10 @@ mod tests {
     fn late_frames_do_not_reopen_closed_remote_streams() {
         let mut client = make(Side::Client);
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
-        client
-            .received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 0u32.into() })
-            .unwrap();
+        assert_eq!(
+            client.received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 0u32.into() }),
+            Ok(ShouldTransmit(false))
+        );
         let mut pending = Retransmits::default();
         assert_eq!(
             RecvStream { id, state: &mut client, pending: &mut pending }.received_reset().unwrap(),
@@ -2076,9 +2074,7 @@ mod tests {
         assert_eq!(client.closed_remote_prefix[Dir::Uni as usize], 1);
         assert!(!client.recv.contains_key(&id));
         assert_eq!(
-            client
-                .received(frame::Stream { id, offset: 0, fin: true, data: Bytes::new() }, 0)
-                .unwrap(),
+            client.received(frame::Stream { id, offset: 0, fin: true, data: Bytes::new() }, 0).unwrap(),
             ShouldTransmit(false)
         );
         assert!(!client.recv.contains_key(&id));
@@ -2089,9 +2085,10 @@ mod tests {
         let mut client = make(Side::Client);
         for index in [1, 0] {
             let id = StreamId::new(Side::Server, Dir::Uni, index);
-            client
-                .received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 0u32.into() })
-                .unwrap();
+            assert_eq!(
+                client.received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 0u32.into() }),
+                Ok(ShouldTransmit(false))
+            );
             let mut pending = Retransmits::default();
             assert_eq!(
                 RecvStream { id, state: &mut client, pending: &mut pending }.received_reset().unwrap(),
@@ -2100,9 +2097,10 @@ mod tests {
             if index == 1 {
                 assert_eq!(client.closed_remote_prefix[Dir::Uni as usize], 0);
                 assert!(client.closed_remote_out_of_order[Dir::Uni as usize].contains(&1));
-                client
-                    .received(frame::Stream { id, offset: 0, fin: true, data: Bytes::new() }, 0)
-                    .unwrap();
+                assert_eq!(
+                    client.received(frame::Stream { id, offset: 0, fin: true, data: Bytes::new() }, 0),
+                    Ok(ShouldTransmit(false))
+                );
                 assert!(!client.recv.contains_key(&id));
             }
         }
@@ -2116,14 +2114,16 @@ mod tests {
         let mut client = make(Side::Client);
         let conn_state = ConnState::Established;
         let id = StreamId::new(Side::Server, Dir::Bi, 0);
-        client
-            .received(frame::Stream { id, offset: 0, fin: false, data: Bytes::new() }, 0)
-            .unwrap();
+        assert_eq!(
+            client.received(frame::Stream { id, offset: 0, fin: false, data: Bytes::new() }, 0),
+            Ok(ShouldTransmit(false))
+        );
         assert_eq!(Streams { state: &mut client, conn_state: &conn_state }.accept(Dir::Bi), Some(id));
 
-        client
-            .received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 0u32.into() })
-            .unwrap();
+        assert_eq!(
+            client.received_reset(frame::ResetStream { id, error_code: 0u32.into(), final_offset: 0u32.into() }),
+            Ok(ShouldTransmit(false))
+        );
         let mut pending = Retransmits::default();
         assert_eq!(
             RecvStream { id, state: &mut client, pending: &mut pending }.received_reset().unwrap(),
@@ -2133,9 +2133,10 @@ mod tests {
         assert!(client.send.contains_key(&id));
         assert_eq!(client.closed_remote_halves[Dir::Bi as usize].get(&0), Some(&2));
 
-        client
-            .received(frame::Stream { id, offset: 0, fin: true, data: Bytes::new() }, 0)
-            .unwrap();
+        assert_eq!(
+            client.received(frame::Stream { id, offset: 0, fin: true, data: Bytes::new() }, 0),
+            Ok(ShouldTransmit(false))
+        );
         assert!(!client.recv.contains_key(&id), "a late frame must not reopen the receive half");
 
         let mut pending = Retransmits::default();
