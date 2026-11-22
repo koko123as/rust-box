@@ -835,8 +835,6 @@ fn check_hysteria2_outbound(path: &str, options: &Hysteria2Outbound) -> Result<(
         ("server_ports", !options.server_ports.is_empty()),
         ("hop_interval", !options.hop_interval.0.is_zero()),
         ("hop_interval_max", !options.hop_interval_max.0.is_zero()),
-        ("up_mbps", options.up_mbps != 0),
-        ("down_mbps", options.down_mbps != 0),
         ("bbr_profile", !options.bbr_profile.is_empty()),
         ("brutal_debug", options.brutal_debug),
     ] {
@@ -2496,6 +2494,17 @@ mod tests {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(expected), "{config}: {error}");
         }
+    }
+
+    #[test]
+    fn hysteria2_outbound_accepts_bandwidth_options_for_negotiation() {
+        let options = parse(
+            r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":true,"up_mbps":10,"down_mbps":20}]}"#,
+        )
+        .unwrap();
+        let Outbound::Hysteria2(hysteria2) = &options.outbounds[0] else { panic!() };
+        assert_eq!(hysteria2.up_mbps, 10);
+        assert_eq!(hysteria2.down_mbps, 20);
     }
 
     #[test]
