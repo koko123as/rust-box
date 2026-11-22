@@ -901,6 +901,10 @@ extension_struct! {
         ExtensionType::ALProtocolNegotiation =>
             pub(crate) protocols: Option<Vec<ProtocolName>>,
 
+        /// Application settings protocols (Chrome's newer ALPS codepoint)
+        ExtensionType::ApplicationSettings =>
+            pub(crate) application_settings: Option<Vec<ProtocolName>>,
+
         /// Available client certificate types (RFC7250)
         ExtensionType::ClientCertificateType =>
             pub(crate) client_certificate_types: Option<Vec<CertificateType>>,
@@ -990,6 +994,7 @@ impl ClientExtensions<'_> {
             ec_point_formats,
             signature_schemes,
             protocols,
+            application_settings,
             client_certificate_types,
             server_certificate_types,
             extended_master_secret_request,
@@ -1018,6 +1023,7 @@ impl ClientExtensions<'_> {
             ec_point_formats,
             signature_schemes,
             protocols,
+            application_settings,
             client_certificate_types,
             server_certificate_types,
             extended_master_secret_request,

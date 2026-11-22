@@ -368,6 +368,27 @@ fn client_extensions_decode_checks_duplicates() {
 }
 
 #[test]
+fn client_extensions_application_settings_new_roundtrip() {
+    let protocols = vec![ProtocolName::from(b"h2".to_vec())];
+    let extensions = ClientExtensions {
+        application_settings: Some(protocols),
+        ..Default::default()
+    };
+
+    let encoded = extensions.get_encoding();
+    assert_eq!(encoded, b"\x00\x09\x44\xcd\x00\x05\x00\x03\x02h2");
+
+    let decoded = ClientExtensions::read_bytes(&encoded).unwrap();
+    assert!(decoded.application_settings.is_some());
+    assert_eq!(decoded.get_encoding(), encoded);
+    assert!(
+        ClientExtensions::default()
+            .get_encoding()
+            .is_empty()
+    );
+}
+
+#[test]
 fn client_extensions_ordering() {
     // the important thing here is that PSK requests come last,
     // ECH requests come second to last, and order of other extensions
