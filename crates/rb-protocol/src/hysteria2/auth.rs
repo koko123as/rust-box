@@ -62,6 +62,32 @@ impl AuthResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionControl {
+    Brutal { send_bps: u64 },
+    BbrMeta2,
+}
+
+impl AuthResponse {
+    /// Selects the client's congestion controller after Hysteria2 bandwidth negotiation.
+    ///
+    /// This follows sing-quic's `actualTx` calculation: the server's RX offer is
+    /// capped by the client's configured send rate, with zero values falling back
+    /// to that configured rate. `RxAuto` always selects BBR-meta2.
+    pub fn congestion_control(&self, configured_send_bps: u64) -> CongestionControl {
+        let actual_tx = if self.receive_bps == 0 || self.receive_bps > configured_send_bps {
+            configured_send_bps
+        } else {
+            self.receive_bps
+        };
+        if !self.receive_auto && actual_tx > 0 {
+            CongestionControl::Brutal { send_bps: actual_tx }
+        } else {
+            CongestionControl::BbrMeta2
+        }
+    }
+}
+
 fn parse_go_bool(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "1" | "t" | "true")
 }
@@ -113,5 +139,20 @@ mod tests {
         headers.insert("hysteria-udp", HeaderValue::from_static("unknown"));
         headers.insert("hysteria-cc-rx", HeaderValue::from_static("not-a-number"));
         assert_eq!(AuthResponse::from_headers(&headers), AuthResponse::default());
+    }
+
+    #[test]
+    fn auth_response_selects_congestion_control_after_bandwidth_negotiation() {
+        let response = AuthResponse { udp_enabled: true, receive_bps: 8_000_000, receive_auto: false };
+        assert_eq!(response.congestion_control(10_000_000), CongestionControl::Brutal { send_bps: 8_000_000 });
+        assert_eq!(response.congestion_control(4_000_000), CongestionControl::Brutal { send_bps: 4_000_000 });
+        assert_eq!(response.congestion_control(0), CongestionControl::BbrMeta2);
+
+        let automatic = AuthResponse { receive_auto: true, ..response };
+        assert_eq!(automatic.congestion_control(4_000_000), CongestionControl::BbrMeta2);
+        assert_eq!(
+            AuthResponse::default().congestion_control(4_000_000),
+            CongestionControl::Brutal { send_bps: 4_000_000 }
+        );
     }
 }
