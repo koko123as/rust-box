@@ -1460,12 +1460,6 @@ impl Options {
                 }
             }
             check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
-            if transport.is_some_and(|transport| matches!(&transport.config, V2RayTransportConfig::Grpc(_))) {
-                return Err(field(
-                    format!("inbounds[{index}].transport"),
-                    "`transport` is not supported by rust-box yet".into(),
-                ));
-            }
             if let Inbound::Hysteria2(options) = inbound {
                 check_hysteria2_inbound(&format!("inbounds[{index}]"), options)?;
             }
@@ -2386,10 +2380,6 @@ mod tests {
                 "outbounds[0].transport.permit_without_stream: `permit_without_stream` is not supported by rust-box yet",
             ),
             (
-                r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc"}}]}"#,
-                "inbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
-            (
                 r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#,
                 "inbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
             ),
@@ -2711,6 +2701,8 @@ mod tests {
         let V2RayTransportConfig::HttpUpgrade(httpupgrade) = httpupgrade.config else { panic!() };
         assert_eq!((httpupgrade.host.as_str(), httpupgrade.path.as_str()), ("edge.test", "/upgrade"));
         assert!(httpupgrade.headers.is_empty());
+
+        parse(r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc"}}]}"#).unwrap();
 
         let quic: V2RayTransportOptions = serde_json::from_str(r#"{"type":"quic","key":"legacy"}"#).unwrap();
         assert!(matches!(quic.config, V2RayTransportConfig::Quic(_)));
