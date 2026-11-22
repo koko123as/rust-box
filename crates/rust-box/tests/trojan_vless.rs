@@ -731,6 +731,39 @@ async fn interop_quic_to_sing_box(inbound: Value, port: u16, outbound: Value) {
 }
 
 #[tokio::test]
+async fn interop_trojan_v2ray_transports_with_sing_box() {
+    let pki = pki();
+    for (name, transport) in [
+        ("websocket", json!({"type": "ws", "path": "/ws"})),
+        ("http2", json!({"type": "http", "host": ["example.test"], "path": "/"})),
+        ("grpc", json!({"type": "grpc", "service_name": "trojan-test"})),
+        ("httpupgrade", json!({"type": "httpupgrade", "host": "example.test", "path": "/upgrade"})),
+    ] {
+        eprintln!("Trojan transport interop: {name}");
+
+        let port = free_port();
+        let mut inbound = trojan_inbound(port, Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        let mut outbound = trojan_outbound(local(port), Some(client_tls(&pki)));
+        outbound["transport"] = transport.clone();
+        interop_to_sing_box(inbound, port, outbound, false).await;
+
+        let mut inbound = trojan_inbound(0, Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        interop_from_sing_box(
+            inbound,
+            |server| {
+                let mut outbound = trojan_outbound(server, Some(client_tls(&pki)));
+                outbound["transport"] = transport;
+                outbound
+            },
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn interop_rust_box_tuic_to_sing_box() {
     let pki = pki();
     let port = free_port();

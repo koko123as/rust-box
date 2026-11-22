@@ -171,3 +171,48 @@ async fn interop_vmess_over_tls() {
     })
     .await;
 }
+
+/// V2Ray stream transports only carry TCP; keep this interop probe TCP-only.
+async fn interop_vmess_transport_to_sing_box(inbound: Value, port: u16, outbound: Value) {
+    let echo = tcp_echo().await;
+    let Some(_sing_box) = sing_box(&server_config(inbound), port).await else { return };
+    let (_client, clients) = start(&client_config(0, outbound)).await;
+    assert_tcp_echo(clients[0], echo).await;
+}
+
+async fn interop_sing_box_vmess_transport_to_rust_box(inbound: Value, outbound: impl FnOnce(SocketAddr) -> Value) {
+    let echo = tcp_echo().await;
+    let (_server, servers) = start(&server_config(inbound)).await;
+    let port = free_port();
+    let Some(_sing_box) = sing_box(&client_config(port, outbound(servers[0])), port).await else { return };
+    assert_tcp_echo(local(port), echo).await;
+}
+
+#[tokio::test]
+async fn interop_vmess_v2ray_transports_with_sing_box() {
+    let pki = pki();
+    for (name, transport) in [
+        ("websocket", json!({"type": "ws", "path": "/ws"})),
+        ("http2", json!({"type": "http", "host": ["example.test"], "path": "/"})),
+        ("grpc", json!({"type": "grpc", "service_name": "vmess-test"})),
+        ("httpupgrade", json!({"type": "httpupgrade", "host": "example.test", "path": "/upgrade"})),
+    ] {
+        eprintln!("VMess transport interop: {name}");
+
+        let port = free_port();
+        let mut inbound = vmess_inbound(port, 0, Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        let mut outbound = vmess_outbound(local(port), &PLAIN, Some(client_tls(&pki)));
+        outbound["transport"] = transport.clone();
+        interop_vmess_transport_to_sing_box(inbound, port, outbound).await;
+
+        let mut inbound = vmess_inbound(0, 0, Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        interop_sing_box_vmess_transport_to_rust_box(inbound, |server| {
+            let mut outbound = vmess_outbound(server, &PLAIN, Some(client_tls(&pki)));
+            outbound["transport"] = transport;
+            outbound
+        })
+        .await;
+    }
+}
