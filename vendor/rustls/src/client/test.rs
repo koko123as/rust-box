@@ -26,25 +26,29 @@ mod tests {
 
     use super::super::*;
     use crate::client::AlwaysResolvesClientRawPublicKeys;
-    use crate::crypto::cipher::MessageEncrypter;
+    use crate::crypto::cipher::{MessageDecrypter, MessageEncrypter};
     use crate::crypto::tls13::OkmBlock;
-    use crate::enums::CertificateType;
+    use crate::enums::{CertificateType, HandshakeType};
     use crate::msgs::base::{Payload, PayloadU8};
     use crate::msgs::ccs::ChangeCipherSpecPayload;
+    use crate::msgs::codec::Codec;
     use crate::msgs::client_hello_profile::{
         ClientHelloExtensionProfile, ClientHelloExtensionProfileEntry,
     };
     use crate::msgs::enums::ECCurveType;
     use crate::msgs::handshake::{
-        CertificateChain, EcParameters, HelloRetryRequestExtensions, KeyShareEntry, ProtocolName,
-        ServerEcdhParams, ServerExtensions, ServerKeyExchange, ServerKeyExchangeParams,
-        ServerKeyExchangePayload, SingleProtocolName,
+        CertificateChain, CertificateEntry, CertificatePayloadTls13, EcParameters,
+        HelloRetryRequestExtensions, KeyShareEntry, ProtocolName, ServerEcdhParams,
+        ServerExtensions, ServerKeyExchange, ServerKeyExchangeParams, ServerKeyExchangePayload,
+        SingleProtocolName,
     };
-    use crate::msgs::message::PlainMessage;
+    use crate::msgs::message::{InboundOpaqueMessage, PlainMessage};
     use crate::pki_types::pem::PemObject;
     use crate::pki_types::{PrivateKeyDer, UnixTime};
     use crate::sign::CertifiedKey;
-    use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
+    use crate::tls13::key_schedule::{
+        derive_traffic_iv, derive_traffic_key, hkdf_expand_label_block,
+    };
     use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use crate::{DigitallySignedStruct, DistinguishedName, KeyLog, version};
 
@@ -585,6 +589,250 @@ mod tests {
         Ok(conn)
     }
 
+    #[test]
+    fn client_sends_encrypted_application_settings_before_finished_and_hashes_it() {
+        let fake_server_crypto = Arc::new(FakeServerCrypto::new());
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptTestServerCertificate))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.application_settings_protocols = Some(vec![b"h2".to_vec()]);
+        config.key_log = fake_server_crypto.clone();
+
+        let mut client = ClientConnection::new(
+            config.into(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut client_hello_record = Vec::new();
+        client.write_tls(&mut client_hello_record).unwrap();
+        assert_eq!(
+            client_hello_record[0],
+            u8::from(ContentType::Handshake),
+            "first client record must contain ClientHello"
+        );
+        let client_hello_record_len =
+            u16::from_be_bytes([client_hello_record[3], client_hello_record[4]]) as usize;
+        let client_hello_end = 5 + client_hello_record_len;
+        assert!(client_hello_end <= client_hello_record.len());
+        let client_hello_handshake = &client_hello_record[5..client_hello_end];
+        assert_eq!(
+            client_hello_handshake[0],
+            u8::from(HandshakeType::ClientHello)
+        );
+
+        if std::env::var_os("RUSTLS_M10_CLIENT_HELLO_DUMP").is_some() {
+            let hex = hex::encode(&client_hello_record[..client_hello_end]);
+            std::eprintln!("RUSTLS_M10_CLIENT_HELLO={hex}");
+        }
+
+        // The transcript is over handshake messages, not TLS record headers.
+        let mut transcript = client_hello_handshake.to_vec();
+        let server_hello = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_3,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        key_share: Some(KeyShareEntry {
+                            group: NamedGroup::X25519,
+                            payload: PayloadU16::new(vec![0xaa; 32]),
+                        }),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        };
+        let server_hello_record = server_hello.into_wire_bytes();
+        transcript.extend_from_slice(&server_hello_record[5..]);
+        client.read_tls(&mut server_hello_record.as_slice()).unwrap();
+        client.process_new_packets().unwrap();
+
+        let server_encrypted_extensions = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::EncryptedExtensions(Box::new(ServerExtensions {
+                    selected_protocol: Some(SingleProtocolName::new(ProtocolName::from(
+                        b"h2".to_vec(),
+                    ))),
+                    application_settings: Some(Payload::empty()),
+                    ..ServerExtensions::default()
+                })),
+            )),
+        };
+        let server_certificate = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::CertificateTls13(CertificatePayloadTls13 {
+                    context: PayloadU8::empty(),
+                    entries: vec![CertificateEntry::new(CertificateDer::from(
+                        b"test-only synthetic certificate".to_vec(),
+                    ))],
+                }),
+            )),
+        };
+        let server_certificate_verify = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::CertificateVerify(DigitallySignedStruct::new(
+                    SignatureScheme::RSA_PSS_SHA256,
+                    vec![0xaa],
+                )),
+            )),
+        };
+
+        let suite = super::provider::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .unwrap();
+        let mut server_encrypter = fake_server_crypto.server_handshake_encrypter();
+        let mut server_flight = Vec::new();
+        server_flight.extend(encrypt_handshake_and_update_transcript(
+            server_encrypted_extensions,
+            server_encrypter.as_mut(),
+            0,
+            &mut transcript,
+        ));
+        server_flight.extend(encrypt_handshake_and_update_transcript(
+            server_certificate,
+            server_encrypter.as_mut(),
+            1,
+            &mut transcript,
+        ));
+        server_flight.extend(encrypt_handshake_and_update_transcript(
+            server_certificate_verify,
+            server_encrypter.as_mut(),
+            2,
+            &mut transcript,
+        ));
+
+        let server_finished_verify_data = tls13_finished_verify_data(
+            fake_server_crypto.server_handshake_secret.get().unwrap(),
+            &transcript,
+            suite,
+        );
+        server_flight.extend(encrypt_handshake_and_update_transcript(
+            Message {
+                version: ProtocolVersion::TLSv1_3,
+                payload: MessagePayload::handshake(HandshakeMessagePayload(
+                    HandshakePayload::Finished(Payload::new(server_finished_verify_data)),
+                )),
+            },
+            server_encrypter.as_mut(),
+            3,
+            &mut transcript,
+        ));
+
+        client.read_tls(&mut server_flight.as_slice()).unwrap();
+        client.process_new_packets().unwrap();
+        assert!(!client.is_handshaking());
+        assert_eq!(client.alpn_protocol(), Some(b"h2".as_slice()));
+
+        let mut encrypted_client_flight = Vec::new();
+        client.write_tls(&mut encrypted_client_flight).unwrap();
+        assert!(!encrypted_client_flight.is_empty());
+
+        let mut client_transcript = transcript.clone();
+        let mut client_decrypter = fake_server_crypto.client_handshake_decrypter();
+        let mut client_handshake_messages = Vec::new();
+        let mut record_sequence = 0;
+        let mut record_offset = 0;
+        let mut client_finished_verify_data = None;
+
+        while record_offset < encrypted_client_flight.len() {
+            let header_end = record_offset + 5;
+            assert!(header_end <= encrypted_client_flight.len());
+            let record_len = u16::from_be_bytes([
+                encrypted_client_flight[record_offset + 3],
+                encrypted_client_flight[record_offset + 4],
+            ]) as usize;
+            let record_end = header_end + record_len;
+            assert!(record_end <= encrypted_client_flight.len());
+            let content_type = encrypted_client_flight[record_offset];
+
+            if content_type == u8::from(ContentType::ChangeCipherSpec) {
+                assert_eq!(&encrypted_client_flight[header_end..record_end], &[1]);
+                record_offset = record_end;
+                continue;
+            }
+
+            assert_eq!(
+                content_type,
+                u8::from(ContentType::ApplicationData)
+            );
+            let mut ciphertext = encrypted_client_flight[header_end..record_end].to_vec();
+            let decrypted = client_decrypter
+                .decrypt(
+                    InboundOpaqueMessage::new(
+                        ContentType::ApplicationData,
+                        ProtocolVersion::TLSv1_2,
+                        &mut ciphertext,
+                    ),
+                    record_sequence,
+                )
+                .unwrap();
+            record_sequence += 1;
+            assert_eq!(decrypted.typ, ContentType::Handshake);
+            assert_eq!(decrypted.version, ProtocolVersion::TLSv1_3);
+
+            let mut reader = Reader::init(decrypted.payload);
+            while reader.any_left() {
+                let message = HandshakeMessagePayload::read_version(
+                    &mut reader,
+                    ProtocolVersion::TLSv1_3,
+                )
+                .unwrap();
+                let encoded = message.get_encoding();
+                match message.0 {
+                    HandshakePayload::EncryptedExtensions(extensions) => {
+                        assert_eq!(
+                            extensions.collect_used(),
+                            vec![ExtensionType::ApplicationSettings]
+                        );
+                        assert!(extensions
+                            .application_settings
+                            .as_ref()
+                            .unwrap()
+                            .bytes()
+                            .is_empty());
+                        client_handshake_messages.push(HandshakeType::EncryptedExtensions);
+                        client_transcript.extend_from_slice(&encoded);
+                    }
+                    HandshakePayload::Finished(verify_data) => {
+                        let expected = tls13_finished_verify_data(
+                            fake_server_crypto.client_handshake_secret.get().unwrap(),
+                            &client_transcript,
+                            suite,
+                        );
+                        assert_eq!(verify_data.bytes(), expected.as_slice());
+                        let missing_alps = tls13_finished_verify_data(
+                            fake_server_crypto.client_handshake_secret.get().unwrap(),
+                            &transcript,
+                            suite,
+                        );
+                        assert_ne!(verify_data.bytes(), missing_alps.as_slice());
+                        client_finished_verify_data = Some(verify_data.bytes().to_vec());
+                        client_handshake_messages.push(HandshakeType::Finished);
+                    }
+                    other => panic!("unexpected client handshake message: {other:?}"),
+                }
+            }
+            record_offset = record_end;
+        }
+
+        assert_eq!(
+            client_handshake_messages,
+            [HandshakeType::EncryptedExtensions, HandshakeType::Finished]
+        );
+        assert!(client_finished_verify_data.is_some());
+    }
+
     fn client_requiring_rpk_receives_server_ee(
         encrypted_extensions: ServerExtensions<'_>,
     ) -> Result<(), Error> {
@@ -634,6 +882,36 @@ mod tests {
         conn.read_tls(&mut enc_ee.encode().as_slice())
             .unwrap();
         conn.process_new_packets().map(|_| ())
+    }
+
+    fn encrypt_handshake_and_update_transcript(
+        message: Message<'_>,
+        encrypter: &mut dyn MessageEncrypter,
+        sequence: u64,
+        transcript: &mut Vec<u8>,
+    ) -> Vec<u8> {
+        let plaintext = PlainMessage::from(message);
+        transcript.extend_from_slice(plaintext.payload.bytes());
+        encrypter
+            .encrypt(plaintext.borrow_outbound(), sequence)
+            .unwrap()
+            .encode()
+    }
+
+    fn tls13_finished_verify_data(
+        traffic_secret: &[u8],
+        transcript: &[u8],
+        suite: &crate::tls13::Tls13CipherSuite,
+    ) -> Vec<u8> {
+        let traffic_secret = OkmBlock::new(traffic_secret);
+        let expander = suite.hkdf_provider.expander_for_okm(&traffic_secret);
+        let finished_key = hkdf_expand_label_block(expander.as_ref(), b"finished", &[]);
+        let transcript_hash = suite.common.hash_provider.hash(transcript);
+        suite
+            .hkdf_provider
+            .hmac_sign(&finished_key, transcript_hash.as_ref())
+            .as_ref()
+            .to_vec()
     }
 
     #[test]
@@ -827,14 +1105,54 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct AcceptTestServerCertificate;
+
+    impl ServerCertVerifier for AcceptTestServerCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::RSA_PSS_SHA256]
+        }
+    }
+
+    #[derive(Debug)]
     struct FakeServerCrypto {
         server_handshake_secret: OnceLock<Vec<u8>>,
+        client_handshake_secret: OnceLock<Vec<u8>>,
     }
 
     impl FakeServerCrypto {
         fn new() -> Self {
             Self {
                 server_handshake_secret: OnceLock::new(),
+                client_handshake_secret: OnceLock::new(),
             }
         }
 
@@ -857,6 +1175,20 @@ mod tests {
             let iv = derive_traffic_iv(expander.as_ref());
             cipher_suite.aead_alg.encrypter(key, iv)
         }
+
+        fn client_handshake_decrypter(&self) -> Box<dyn MessageDecrypter> {
+            let cipher_suite = super::provider::cipher_suite::TLS13_AES_128_GCM_SHA256
+                .tls13()
+                .unwrap();
+
+            let secret = self.client_handshake_secret.get().unwrap();
+            let expander = cipher_suite
+                .hkdf_provider
+                .expander_for_okm(&OkmBlock::new(secret));
+            let key = derive_traffic_key(expander.as_ref(), cipher_suite.aead_alg);
+            let iv = derive_traffic_iv(expander.as_ref());
+            cipher_suite.aead_alg.decrypter(key, iv)
+        }
     }
 
     impl KeyLog for FakeServerCrypto {
@@ -867,6 +1199,10 @@ mod tests {
         fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
             if label == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
                 self.server_handshake_secret
+                    .set(secret.to_vec())
+                    .unwrap();
+            } else if label == "CLIENT_HANDSHAKE_TRAFFIC_SECRET" {
+                self.client_handshake_secret
                     .set(secret.to_vec())
                     .unwrap();
             }
