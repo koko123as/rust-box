@@ -224,11 +224,14 @@ impl Controller for BrutalController {
     }
 
     fn window(&self) -> u64 {
+        let packet_granular_floor = self.max_datagram_size.saturating_add(1);
         let Some(smoothed_rtt) = self.smoothed_rtt else {
-            return RTT_UNAVAILABLE_WINDOW;
+            return RTT_UNAVAILABLE_WINDOW.max(packet_granular_floor);
         };
-        ((self.bytes_per_second as f64 * smoothed_rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER / self.ack_rate)
-            .min(u64::MAX as f64)) as u64
+        let bandwidth_delay_product =
+            ((self.bytes_per_second as f64 * smoothed_rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER / self.ack_rate)
+                .min(u64::MAX as f64)) as u64;
+        bandwidth_delay_product.max(packet_granular_floor)
     }
 
     fn pacing_delay(&self, now: Instant, bytes: u64, _mtu: u16) -> Option<Duration> {
@@ -277,6 +280,20 @@ mod tests {
         controller.on_packet_sent(PacketNumberSpace::Data, 0, now, 12_000, 12_000, true, 12_000, false);
         assert_eq!(controller.pacing_delay(now, 1200, 1200), Some(Duration::from_micros(1200)));
         assert_eq!(controller.pacing_delay(now + Duration::from_millis(2), 1200, 1200), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn low_rtt_window_allows_one_datagram_under_quinn_packet_gate() {
+        let now = Instant::now();
+        let mut controller = BrutalController::new(125_000, now, 1200);
+        controller.smoothed_rtt = Some(Duration::from_micros(100));
+
+        // The raw Brutal BDP is 25 bytes, but Quinn checks the planned packet
+        // against the window. Preserve the upstream CanSend behavior: with no
+        // bytes in flight, one full datagram must remain sendable.
+        assert_eq!(controller.window(), 1201);
+        assert!(controller.max_datagram_size < controller.window());
+        assert_eq!(controller.initial_window(), RTT_UNAVAILABLE_WINDOW);
     }
 
     #[test]
