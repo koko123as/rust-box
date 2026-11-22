@@ -2459,7 +2459,7 @@ mod tests {
                 "inbounds[0].realm: `realm` is not supported by rust-box yet",
             ),
             (
-                r#"{"inbounds":[{"type":"hysteria2","detour":"next"}]}"#,
+                r#"{"inbounds":[{"type":"hysteria2","detour":"next"}],"outbounds":[{"type":"direct","tag":"next"}]}"#,
                 "inbounds[0].detour: `detour` is not supported by rust-box yet",
             ),
             (
