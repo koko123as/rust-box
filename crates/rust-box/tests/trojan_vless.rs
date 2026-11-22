@@ -645,3 +645,39 @@ async fn interop_sing_box_vless_vision_to_rust_box() {
     assert_tcp_echo(local(port), tcp_echo().await).await;
     assert_udp_echo(local(port), udp).await;
 }
+
+/// Exercises each V2Ray stream transport in both directions against the
+/// pinned sing-box CLI. TCP is sufficient here: the transport wraps the
+/// already-routed VLESS stream, independently of UDP packet encodings.
+#[tokio::test]
+async fn interop_vless_v2ray_transports_with_sing_box() {
+    let pki = pki();
+    for (name, transport) in [
+        ("websocket", json!({"type": "ws", "path": "/ws"})),
+        ("http2", json!({"type": "http", "host": ["example.test"], "path": "/"})),
+        ("grpc", json!({"type": "grpc", "service_name": "vless-test"})),
+        ("httpupgrade", json!({"type": "httpupgrade", "host": "example.test", "path": "/upgrade"})),
+    ] {
+        eprintln!("VLESS transport interop: {name}");
+
+        let port = free_port();
+        let mut inbound = vless_inbound(port, "", Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        let mut outbound = vless_outbound(local(port), "", None, Some(client_tls(&pki)));
+        outbound["transport"] = transport.clone();
+        interop_to_sing_box(inbound, port, outbound, false).await;
+
+        let mut inbound = vless_inbound(0, "", Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        interop_from_sing_box(
+            inbound,
+            |server| {
+                let mut outbound = vless_outbound(server, "", None, Some(client_tls(&pki)));
+                outbound["transport"] = transport;
+                outbound
+            },
+            false,
+        )
+        .await;
+    }
+}
