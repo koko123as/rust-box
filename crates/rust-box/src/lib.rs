@@ -24,9 +24,9 @@ use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_group::{GroupContext, Selector, UrlTest};
 use rb_protocol::{
-    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, ProxyInbound, ProxyKind, ShadowsocksInbound,
-    ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound, VlessInbound,
-    VlessOutbound, VmessInbound, VmessOutbound, WireGuardOutbound,
+    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, NaiveOutbound, ProxyInbound, ProxyKind,
+    ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound,
+    VlessInbound, VlessOutbound, VmessInbound, VmessOutbound, WireGuardOutbound,
 };
 use rb_route::{Management, Router};
 use rb_rule::{RuleSet, RuleSets};
@@ -200,6 +200,10 @@ impl RustBox {
                 ),
                 OutboundOptions::Http(http) => Arc::new(
                     HttpOutbound::new(http, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
+                OutboundOptions::Naive(naive) => Arc::new(
+                    NaiveOutbound::new(naive, tag, &dialer_env, &certificates)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
                 OutboundOptions::Shadowsocks(shadowsocks) => {

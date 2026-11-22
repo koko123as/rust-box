@@ -539,6 +539,8 @@ pub enum Outbound {
     Selector(SelectorOutbound),
     #[serde(rename = "urltest")]
     UrlTest(UrlTestOutbound),
+    #[serde(rename = "naive")]
+    Naive(NaiveOutbound),
     #[serde(rename = "tuic")]
     Tuic(TuicOutbound),
     #[serde(rename = "hysteria2")]
@@ -558,6 +560,7 @@ impl Outbound {
             Outbound::Vmess(options) => &options.tag,
             Outbound::Selector(options) => &options.tag,
             Outbound::UrlTest(options) => &options.tag,
+            Outbound::Naive(options) => &options.tag,
             Outbound::Tuic(options) => &options.tag,
             Outbound::Hysteria2(options) => &options.tag,
         }
@@ -576,6 +579,7 @@ impl Outbound {
             Outbound::Vless(options) => Some(options.dialer_options()),
             Outbound::Vmess(options) => Some(options.dialer_options()),
             Outbound::Selector(_) | Outbound::UrlTest(_) => None,
+            Outbound::Naive(options) => Some(options.dialer_options()),
             Outbound::Tuic(options) => Some(options.dialer_options()),
             Outbound::Hysteria2(options) => Some(options.dialer_options()),
         }
@@ -715,6 +719,72 @@ fn check_proxy_outbound(
         return Err(field(format!("{path}.multiplex.brutal"), "`brutal` is not supported by rust-box yet".into()));
     }
     check_v2ray_transport(&format!("{path}.transport"), transport.as_ref(), true)?;
+    Ok(())
+}
+
+fn check_naive_outbound(path: &str, options: &NaiveOutbound) -> Result<(), ConfigError> {
+    let field = |name: &str, message: String| ConfigError::Field { path: format!("{path}.{name}"), message };
+    if options.server.is_empty() {
+        return Err(field("server", "server is required".into()));
+    }
+    if options.server_port == 0 {
+        return Err(field("server_port", "server_port is required".into()));
+    }
+    if options.insecure_concurrency < 0 {
+        return Err(field("insecure_concurrency", "must not be negative".into()));
+    }
+    if options.quic {
+        return Err(field("quic", "QUIC is not supported by rust-box yet".into()));
+    }
+    if options.udp_over_tcp.as_ref().is_some_and(|uot| uot.enabled) {
+        return Err(field("udp_over_tcp", "UDP-over-TCP is not supported by rust-box yet".into()));
+    }
+    if !matches!(options.quic_congestion_control.as_str(), "" | "bbr" | "bbr2" | "cubic" | "reno") {
+        return Err(field(
+            "quic_congestion_control",
+            format!("unknown quic congestion control: {}", options.quic_congestion_control),
+        ));
+    }
+    if let Some(window) = options.stream_receive_window {
+        if window.0 < 2 || window.0 > i32::MAX as u64 {
+            return Err(field("stream_receive_window", "must be between 2 bytes and 2147483647 bytes".into()));
+        }
+    }
+    let Some(tls) = options.tls.as_ref() else {
+        return Err(field("tls", "TLS is required".into()));
+    };
+    if !tls.enabled {
+        return Err(field("tls.enabled", "TLS is required".into()));
+    }
+    tls.validate(&format!("{path}.tls"))?;
+    for (name, enabled, message) in [
+        ("disable_sni", tls.disable_sni, "disable_sni is not supported on naive outbound"),
+        ("insecure", tls.insecure, "insecure is not supported on naive outbound"),
+        ("fragment", tls.fragment, "fragment is not supported on naive outbound"),
+        ("record_fragment", tls.record_fragment, "fragment is not supported on naive outbound"),
+        ("kernel_tx", tls.kernel_tx, "kernel TLS is not supported on naive outbound"),
+        ("kernel_rx", tls.kernel_rx, "kernel TLS is not supported on naive outbound"),
+    ] {
+        if enabled {
+            return Err(field(&format!("tls.{name}"), message.into()));
+        }
+    }
+    for (name, enabled) in [
+        ("alpn", !tls.alpn.is_empty()),
+        ("min_version", !tls.min_version.is_empty()),
+        ("max_version", !tls.max_version.is_empty()),
+        ("cipher_suites", !tls.cipher_suites.is_empty()),
+        ("curve_preferences", !tls.curve_preferences.is_empty()),
+        ("client_certificate", !tls.client_certificate.is_empty()),
+        ("client_certificate_path", !tls.client_certificate_path.is_empty()),
+        ("client_key", !tls.client_key.is_empty()),
+        ("client_key_path", !tls.client_key_path.is_empty()),
+        ("certificate_public_key_sha256", !tls.certificate_public_key_sha256.is_empty()),
+    ] {
+        if enabled {
+            return Err(field(&format!("tls.{name}"), format!("{name} is not supported on naive outbound")));
+        }
+    }
     Ok(())
 }
 
@@ -1224,6 +1294,42 @@ with_dial_fields! {
 }
 
 with_dial_fields! {
+    /// sing-box v1.14.4 `NaiveOutboundOptions`; runtime currently supports
+    /// TCP over HTTP/2 and explicitly rejects QUIC and UDP-over-TCP.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NaiveOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub username: String,
+        #[serde(default)]
+        pub password: String,
+        #[serde(default)]
+        pub insecure_concurrency: i64,
+        /// sing-box `badoption.HTTPHeader`; string or list of values.
+        #[serde(default)]
+        pub extra_headers: Option<std::collections::BTreeMap<String, Listable<String>>>,
+        #[serde(default)]
+        pub stream_receive_window: Option<MemoryBytes>,
+        #[serde(default)]
+        pub udp_over_tcp: Option<UdpOverTcpOptions>,
+        #[serde(default)]
+        pub quic: bool,
+        #[serde(default)]
+        pub quic_congestion_control: String,
+        #[serde(default)]
+        pub quic_session_receive_window: Option<MemoryBytes>,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+    }
+}
+
+with_dial_fields! {
     /// sing-box `DirectOutboundOptions`: the dial fields and the removed
     /// destination override fields (rejected when set).
     #[derive(Debug, Clone, Default, Deserialize)]
@@ -1542,6 +1648,10 @@ impl Options {
                         tls.validate(&format!("{path}.tls"))?;
                     }
                     self.check_dialer(&path, &http.dialer_options(), &server_known)?;
+                }
+                Outbound::Naive(naive) => {
+                    check_naive_outbound(&path, naive)?;
+                    self.check_dialer(&path, &naive.dialer_options(), &server_known)?;
                 }
                 Outbound::Shadowsocks(shadowsocks) => {
                     if !shadowsocks.plugin.is_empty() {
@@ -1898,6 +2008,55 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("outbounds[0].domain_resolver.client_subnet"), "{error}");
+    }
+
+    #[test]
+    fn naive_outbound_tcp_h2_schema_and_unsupported_options() {
+        let options = parse(
+            r#"{"outbounds":[{"type":"naive","tag":"n","server":"proxy.example","server_port":443,
+                "username":"user","password":"pass","insecure_concurrency":2,
+                "extra_headers":{"X-Trace":["one","two"]},"udp_over_tcp":false,
+                "tls":{"enabled":true}}]}"#,
+        )
+        .unwrap();
+        let Outbound::Naive(naive) = &options.outbounds[0] else { panic!() };
+        assert_eq!(naive.insecure_concurrency, 2);
+        assert_eq!(naive.extra_headers.as_ref().unwrap()["X-Trace"].0, ["one", "two"]);
+        assert_eq!(naive.stream_receive_window, None);
+
+        for (config, expected) in [
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"unknown":true}]}"#,
+                "unknown field",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"quic":true}]}"#,
+                "outbounds[0].quic: QUIC is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"udp_over_tcp":true}]}"#,
+                "outbounds[0].udp_over_tcp: UDP-over-TCP is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true,"alpn":"h2"}}]}"#,
+                "outbounds[0].tls.alpn: alpn is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true,"disable_sni":true}}]}"#,
+                "outbounds[0].tls.disable_sni: disable_sni is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"insecure_concurrency":-1}]}"#,
+                "outbounds[0].insecure_concurrency: must not be negative",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"stream_receive_window":1}]}"#,
+                "outbounds[0].stream_receive_window: must be between",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
     }
 
     #[test]
