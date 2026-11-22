@@ -314,11 +314,8 @@ impl TunInbound {
         if self.auto_redirect && !self.auto_route {
             return Err(field("`auto_route` is required by `auto_redirect`".into()));
         }
-        if !matches!(self.dns_mode.as_str(), "" | "disabled" | "native" | "hijack") {
-            // sing-box accepts any string here and treats an unknown mode
-            // like `native`; rust-box keeps the value but refuses to guess.
-            return Err(unsupported(path, "dns_mode"));
-        }
+        // `dns_mode` takes any string, as in sing-box: on Linux every mode
+        // but `disabled` behaves the same.
         // Not implemented yet.
         if !self.netns.is_empty() {
             return Err(unsupported(path, "netns"));
@@ -436,7 +433,6 @@ mod tests {
                 r#"{"loopback_address":"10.7.0.1"}"#,
                 "inbounds[0].loopback_address: `loopback_address` is not supported by rust-box yet",
             ),
-            (r#"{"dns_mode":"foo"}"#, "inbounds[0].dns_mode: `dns_mode` is not supported by rust-box yet"),
         ];
         for (json, expected) in cases {
             let error = tun(json).validate("inbounds[0]", &|tag| tag == "geoip").unwrap_err().to_string();

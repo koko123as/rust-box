@@ -103,6 +103,14 @@ async fn flows_are_judged_like_sing_box() {
     assert!(context.protocol.is_none());
 }
 
+#[tokio::test]
+async fn unknown_stack_fails_at_start() {
+    use rb_adapter::Inbound as _;
+    let options: TunOptions = serde_json::from_str(r#"{"stack":"lwip"}"#).unwrap();
+    let inbound = Arc::new(TunInbound::new(&options, "t".into(), handler("[]").router, Arc::new(NoDns)).unwrap());
+    assert_eq!(inbound.start().await.unwrap_err().to_string(), "unknown stack: lwip");
+}
+
 #[test]
 fn options_and_defaults() {
     let options: TunOptions = serde_json::from_str(
@@ -121,8 +129,8 @@ fn options_and_defaults() {
     assert!(platform.inet4_route_range.iter().all(|it| !it.contains("10.1.2.3".parse().unwrap())));
     assert_eq!(platform.inet6_route_range, vec![Prefix::new("::".parse().unwrap(), 0)]);
     let options: TunOptions = serde_json::from_str(r#"{"stack":"lwip"}"#).unwrap();
-    let error = TunInbound::new(&options, "t".into(), handler("[]").router, Arc::new(NoDns)).err().unwrap();
-    assert_eq!(error, "unknown stack: lwip");
+    let inbound = TunInbound::new(&options, "t".into(), handler("[]").router, Arc::new(NoDns)).unwrap();
+    assert_eq!(inbound.interface_name(), None);
     // Without auto_route there is no default table and DNS is not hijacked.
     let options: TunOptions = serde_json::from_str(r#"{"address":"172.19.0.1/30"}"#).unwrap();
     let inbound = TunInbound::new(&options, "t".into(), handler("[]").router, Arc::new(NoDns)).unwrap();

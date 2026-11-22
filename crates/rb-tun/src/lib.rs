@@ -278,9 +278,6 @@ impl TunInbound {
         if !cfg!(any(target_os = "linux", target_os = "android")) {
             return Err("`tun` is not supported by rust-box on this platform".into());
         }
-        if !matches!(options.stack.as_str(), "" | "system" | "gvisor" | "mixed") {
-            return Err(format!("unknown stack: {}", options.stack));
-        }
         options.uid_ranges()?;
         Ok(TunInbound { tag, options: options.clone(), router, dns, running: Mutex::new(None) })
     }
@@ -545,6 +542,10 @@ impl rb_adapter::Inbound for TunInbound {
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
         let options = &self.options;
+        // As in sing-box, an unknown stack fails at start, not at `check`.
+        if !matches!(options.stack.as_str(), "" | "system" | "gvisor" | "mixed") {
+            return Err(io::Error::other(format!("unknown stack: {}", options.stack)));
+        }
         let platform = rb_platform::platform();
         if cfg!(target_os = "android")
             && platform.is_none()
