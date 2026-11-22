@@ -728,9 +728,6 @@ fn check_tuic_outbound(path: &str, options: &TuicOutbound) -> Result<(), ConfigE
     if options.udp_over_stream {
         return Err(field("udp_over_stream", "`udp_over_stream` is not supported by rust-box yet".into()));
     }
-    if options.network.build().iter().any(|network| network == "udp") {
-        return Err(field("network", "UDP is not supported by rust-box yet".into()));
-    }
     Ok(())
 }
 
@@ -1854,20 +1851,27 @@ mod tests {
     }
 
     #[test]
-    fn tuic_outbound_tcp_and_unsupported_options() {
+    fn tuic_outbound_native_network_and_unsupported_options() {
         let base = r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,
             "uuid":"550e8400-e29b-41d4-a716-446655440000","tls":{"enabled":true},"network":"tcp"}]}"#;
         let options = parse(base).unwrap();
         assert!(matches!(options.outbounds[0], Outbound::Tuic(_)));
+        let options =
+            parse(r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true}}]}"#)
+                .unwrap();
+        let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
+        assert_eq!(tuic.network.build(), vec!["tcp", "udp"]);
+        let options = parse(
+            r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"udp"}]}"#,
+        )
+        .unwrap();
+        let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
+        assert_eq!(tuic.network.build(), vec!["udp"]);
 
         for (config, expected) in [
             (
                 r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"network":"tcp"}]}"#,
                 "outbounds[0].tls: TLS is required",
-            ),
-            (
-                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true}}]}"#,
-                "outbounds[0].network: UDP is not supported by rust-box yet",
             ),
             (
                 r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"tcp","zero_rtt_handshake":true}]}"#,
@@ -1876,6 +1880,14 @@ mod tests {
             (
                 r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"tcp","congestion_control":"bbr"}]}"#,
                 "outbounds[0].congestion_control: `congestion_control` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"udp_relay_mode":"quic"}]}"#,
+                "outbounds[0].udp_relay_mode: `udp_relay_mode` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"udp_over_stream":true}]}"#,
+                "outbounds[0].udp_over_stream: `udp_over_stream` is not supported by rust-box yet",
             ),
         ] {
             let error = parse(config).unwrap_err().to_string();
