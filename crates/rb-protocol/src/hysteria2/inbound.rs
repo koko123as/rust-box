@@ -514,11 +514,12 @@ async fn drive_h3<C>(
                 }
             }
         } else {
-            let response = if is_auth_request(&request) {
-                auth_response(auth.receive_bps, auth.receive_bps == 0 && auth.ignore_client_bandwidth, auth.udp_enabled)
-            } else {
-                Response::builder().status(StatusCode::NOT_FOUND).body(()).map_err(other)
-            };
+            let response = authenticated_request_response(
+                &request,
+                auth.receive_bps,
+                auth.receive_bps == 0 && auth.ignore_client_bandwidth,
+                auth.udp_enabled,
+            );
             if let Ok(response) = response {
                 let _ = stream.send_response(response).await;
                 let _ = stream.finish().await;
@@ -581,6 +582,21 @@ fn auth_response(receive_bps: u64, receive_auto: bool, udp_enabled: bool) -> io:
     response.headers_mut().insert("hysteria-cc-rx", HeaderValue::from_str(&rx).map_err(other)?);
     response.headers_mut().insert("hysteria-padding", padding);
     Ok(response)
+}
+
+fn authenticated_request_response(
+    request: &Request<()>,
+    receive_bps: u64,
+    receive_auto: bool,
+    udp_enabled: bool,
+) -> io::Result<Response<()>> {
+    if is_auth_request(request) {
+        // sing-quic accepts repeated auth requests on an already authenticated
+        // connection without checking the password again.
+        auth_response(receive_bps, receive_auto, udp_enabled)
+    } else {
+        Response::builder().status(StatusCode::NOT_FOUND).body(()).map_err(other)
+    }
 }
 
 async fn read_tcp_request(stream: &mut RecvStream) -> io::Result<Socksaddr> {
@@ -830,11 +846,16 @@ impl PacketConn for Hysteria2PacketConn {
             if attempt == DATAGRAM_MTU_RETRIES {
                 break;
             }
-            let next_mtu = next_datagram_mtu(max_datagram, self.connection.max_datagram_size(), overhead)
-                .ok_or_else(|| io::Error::other("Hysteria2 UDP datagram remains too large after MTU adjustment"))?;
             // A new packet ID prevents fragments already sent with the previous MTU from
             // being mixed with the retry's differently partitioned packet.
-            message.packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed) as u16;
+            let next_mtu = prepare_partial_datagram_retry(
+                &mut message,
+                max_datagram,
+                self.connection.max_datagram_size(),
+                overhead,
+                || self.packet_id.fetch_add(1, Ordering::Relaxed) as u16,
+            )
+            .ok_or_else(|| io::Error::other("Hysteria2 UDP datagram remains too large after MTU adjustment"))?;
             max_datagram = next_mtu;
         }
         Err(io::Error::other("Hysteria2 UDP datagram exceeds the path MTU retry limit"))
@@ -851,6 +872,18 @@ fn next_datagram_mtu(current: usize, live_limit: Option<usize>, header_len: usiz
     let live_limit = live_limit.unwrap_or(current).min(HYSTERIA2_UDP_MTU);
     let candidate = if live_limit < current { live_limit } else { current.saturating_sub(32) };
     (candidate > header_len).then_some(candidate)
+}
+
+fn prepare_partial_datagram_retry(
+    message: &mut UdpMessage,
+    current_mtu: usize,
+    live_limit: Option<usize>,
+    header_len: usize,
+    next_packet_id: impl FnOnce() -> u16,
+) -> Option<usize> {
+    let next_mtu = next_datagram_mtu(current_mtu, live_limit, header_len)?;
+    message.packet_id = next_packet_id();
+    Some(next_mtu)
 }
 
 struct Hysteria2TcpStream {
@@ -919,7 +952,7 @@ fn invalid_data(message: &'static str) -> io::Error {
 }
 
 #[cfg(test)]
-mod udp_mtu_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -936,6 +969,23 @@ mod udp_mtu_tests {
     #[test]
     fn retry_stops_when_no_room_remains_for_payload() {
         assert_eq!(next_datagram_mtu(100, Some(100), 68), None);
+    }
+
+    #[test]
+    fn partial_datagram_retry_downshifts_mtu_and_uses_a_fresh_packet_id() {
+        let mut message = UdpMessage {
+            session_id: 7,
+            packet_id: 11,
+            fragment_id: 0,
+            fragment_total: 1,
+            destination: "192.0.2.1:53".to_string(),
+            payload: vec![1; 1400],
+        };
+
+        let next_mtu = prepare_partial_datagram_retry(&mut message, 1197, None, 24, || 12);
+
+        assert_eq!(next_mtu, Some(1165));
+        assert_eq!(message.packet_id, 12);
     }
 
     fn auth_request(password: &str, client_rx: Option<&str>) -> Request<()> {
@@ -993,5 +1043,40 @@ mod udp_mtu_tests {
         let padding = response.headers()["hysteria-padding"].to_str().unwrap();
         assert!((256..2048).contains(&padding.len()));
         assert!(padding.bytes().all(|byte| PADDING_CHARS.contains(&byte)));
+    }
+
+    #[test]
+    fn authenticated_duplicate_auth_does_not_recheck_password() {
+        let request = auth_request("", None);
+
+        let response = authenticated_request_response(&request, 0, false, true).unwrap();
+
+        assert_eq!(response.status().as_u16(), AUTH_OK_STATUS);
+        assert_eq!(response.headers()["hysteria-udp"], "true");
+    }
+
+    #[test]
+    fn authenticated_non_auth_request_returns_not_found() {
+        let request = Request::builder().method(Method::GET).uri("https://example.com/other").body(()).unwrap();
+
+        let response = authenticated_request_response(&request, 0, false, true).unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn destination_parser_accepts_domain_ipv4_and_ipv6() {
+        for destination in ["example.test:443", "127.0.0.1:53", "[2001:db8::1]:8443"] {
+            assert_eq!(parse_destination(destination).unwrap().to_string(), destination);
+        }
+    }
+
+    #[test]
+    fn destination_parser_rejects_malformed_and_oversized_hosts() {
+        for destination in ["", "example.test", "example.test:not-a-port", "example.test:65536", "[not-ipv6]:443"] {
+            assert!(parse_destination(destination).is_err(), "accepted {destination:?}");
+        }
+        let oversized = format!("{}:443", "a".repeat(MAX_FQDN_LENGTH + 1));
+        assert!(parse_destination(&oversized).is_err());
     }
 }

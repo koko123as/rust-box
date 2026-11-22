@@ -561,9 +561,10 @@ fn build_errors() {
             "fallback for ALPN is not supported without TLS",
         ),
         (json!({"inbounds": [{"type": "tuic"}]}), "inbounds[0]: TLS is required"),
+        (json!({"inbounds": [{"type": "hysteria2"}]}), "inbounds[0]: TLS is required"),
         (
-            json!({"inbounds": [{"type": "hysteria2"}]}),
-            "inbounds[0].type: `hysteria2` is not supported by rust-box yet",
+            json!({"inbounds": [{"type": "hysteria2", "bbr_profile": "custom"}]}),
+            "inbounds[0].bbr_profile: `bbr_profile` is not supported by rust-box yet",
         ),
     ] {
         let error = build(config.clone());
@@ -580,23 +581,28 @@ fn build_errors() {
 async fn interop_to_sing_box(inbound: Value, port: u16, outbound: Value, udp: bool) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
     let Some(_sing_box) = sing_box(&server_config(inbound), port).await else { return };
-    let (_client, clients) = start(&client_config(0, outbound)).await;
+    let (client, clients) = start(&client_config(0, outbound)).await;
     assert_tcp_echo(clients[0], echo).await;
     if udp {
         assert_udp_echo(clients[0], udp_target).await;
     }
+    client.close().await;
 }
 
 /// sing-box client (`outbound` to the rust-box server) → rust-box server.
 async fn interop_from_sing_box(inbound: Value, outbound: impl FnOnce(SocketAddr) -> Value, udp: bool) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
-    let (_server, servers) = start(&server_config(inbound)).await;
+    let (server, servers) = start(&server_config(inbound)).await;
     let port = free_port();
-    let Some(_sing_box) = sing_box(&client_config(port, outbound(servers[0])), port).await else { return };
+    let Some(_sing_box) = sing_box(&client_config(port, outbound(servers[0])), port).await else {
+        server.close().await;
+        return;
+    };
     assert_tcp_echo(local(port), echo).await;
     if udp {
         assert_udp_echo(local(port), udp_target).await;
     }
+    server.close().await;
 }
 
 #[tokio::test]
@@ -725,9 +731,10 @@ async fn interop_vless_v2ray_transports_with_sing_box() {
 async fn interop_quic_to_sing_box(inbound: Value, port: u16, outbound: Value) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
     let Some(_sing_box) = sing_box_quic(&server_config(inbound), port).await else { return };
-    let (_client, clients) = start(&client_config(0, outbound)).await;
+    let (client, clients) = start(&client_config(0, outbound)).await;
     assert_tcp_echo(clients[0], echo).await;
     assert_udp_echo(clients[0], udp_target).await;
+    client.close().await;
 }
 
 fn tuic_inbound(port: u16, pki: &Pki) -> Value {
@@ -800,7 +807,8 @@ async fn interop_rust_box_hysteria2_to_sing_box() {
     let pki = pki();
     let port = free_port();
     // Both sides advertise bandwidth so sing-box selects Brutal; zero rates
-    // select BBR-meta2, which Quinn does not implement and rust-box rejects.
+    // select Meta2, which the rust-box outbound still rejects. Reverse-direction
+    // inbound coverage below verifies both Brutal and Meta2.
     let inbound = json!({
         "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
         "users": [{"name": "alice", "password": "hysteria2-password"}],
@@ -813,4 +821,49 @@ async fn interop_rust_box_hysteria2_to_sing_box() {
         "disable_chrome_parrot": true, "tls": client_tls(&pki)
     });
     interop_quic_to_sing_box(inbound, port, outbound).await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_hysteria2_brutal_to_rust_box() {
+    let pki = pki();
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": 0,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "up_mbps": 10, "down_mbps": 10,
+        "tls": server_tls(&pki)
+    });
+    interop_from_sing_box(
+        inbound,
+        |server| {
+            json!({
+                "type": "hysteria2", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+                "password": "hysteria2-password", "up_mbps": 10, "down_mbps": 10,
+                "disable_chrome_parrot": true, "tls": client_tls(&pki)
+            })
+        },
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_hysteria2_meta2_to_rust_box() {
+    let pki = pki();
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": 0,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "tls": server_tls(&pki)
+    });
+    interop_from_sing_box(
+        inbound,
+        |server| {
+            json!({
+                "type": "hysteria2", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+                "password": "hysteria2-password", "disable_chrome_parrot": true,
+                "tls": client_tls(&pki)
+            })
+        },
+        true,
+    )
+    .await;
 }
