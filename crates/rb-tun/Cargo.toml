@@ -1,0 +1,21 @@
+[package]
+name = "rb-tun"
+description = "rust-box tun inbound: Linux and Android TUN devices, auto_route, platform interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-config.workspace = true
+rb-adapter.workspace = true
+rb-route.workspace = true
+rb-netstack.workspace = true
+rb-platform.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

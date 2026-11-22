@@ -198,9 +198,10 @@ impl RustBox {
                     VmessInbound::new(vmess, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
-                InboundOptions::Tun(_) => {
-                    return Err(anyhow!("inbounds[{index}]: `tun` is not supported by rust-box yet"))
-                }
+                InboundOptions::Tun(tun) => Arc::new(
+                    rb_tun::TunInbound::new(tun, tag, router.clone(), dns_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
             };
             inbounds.push(built);
         }
