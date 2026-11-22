@@ -1375,6 +1375,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-clashapi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "flate2",
+ "hickory-proto",
+ "httparse",
+ "libc",
+ "rand 0.9.5",
+ "rb-adapter",
+ "rb-cachefile",
+ "rb-certificate",
+ "rb-config",
+ "rb-dialer",
+ "rb-dns",
+ "rb-group",
+ "rb-route",
+ "rb-rule",
+ "rb-rule-set",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rb-common"
 version = "0.1.0"
 
@@ -1554,6 +1583,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -1674,11 +1704,14 @@ dependencies = [
  "anyhow",
  "clap",
  "rb-adapter",
+ "rb-cachefile",
  "rb-certificate",
+ "rb-clashapi",
  "rb-common",
  "rb-config",
  "rb-dialer",
  "rb-dns",
+ "rb-group",
  "rb-mux",
  "rb-protocol",
  "rb-route",
