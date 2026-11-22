@@ -237,6 +237,11 @@ fn absolute(path: &str) -> PathBuf {
 impl Inner {
     /// sing-box `certificateUpdated`.
     fn certificate_updated(&self, path: &Path) -> Result<(), String> {
+        // The certificate's and the key's callbacks fire on threads of their
+        // own; one at a time, or the second would put back the file the
+        // first just read.
+        static RELOAD: Mutex<()> = Mutex::new(());
+        let _reload = RELOAD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let options = &self.options;
         let is = |configured: &str| !configured.is_empty() && absolute(configured) == path;
         let mut material = self.material.lock().unwrap().clone();
