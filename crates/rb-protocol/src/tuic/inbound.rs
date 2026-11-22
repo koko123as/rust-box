@@ -720,8 +720,7 @@ impl Inbound for TuicInbound {
         let socket = self.listener.listen_udp()?;
         let local = socket.local_addr()?;
         let _ = self.local_addr.set(local);
-        let mut tls = (*self.tls.rustls_config()).clone();
-        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let tls = (*self.tls.rustls_config()).clone();
         let endpoint = rb_dialer::quic::tuic_server_endpoint(socket, Arc::new(tls), &self.quic)?;
         *self.endpoint.lock().unwrap() = Some(endpoint.clone());
         let inbound = self.clone();

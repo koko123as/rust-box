@@ -46,7 +46,7 @@ impl TuicOutbound {
         certificates: &Arc<rb_certificate::Store>,
     ) -> Result<Arc<Self>, String> {
         let tls_options = options.tls.as_ref().filter(|tls| tls.enabled).ok_or("TLS is required")?;
-        let tls = rb_tls::TlsClient::new(tls_options, &options.server, certificates)?.with_alpn(&["h3"]);
+        let tls = rb_tls::TlsClient::new(tls_options, &options.server, certificates)?;
         let uuid = crate::vless::protocol::parse_uuid_strict(&options.uuid).ok_or("invalid uuid")?;
         if !matches!(options.congestion_control.as_str(), "" | "cubic") {
             return Err(format!("congestion control is not supported by rust-box yet: {}", options.congestion_control));
