@@ -16,7 +16,9 @@ use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-use super::auth::{AuthRequest, AUTH_HOST, AUTH_OK_STATUS, AUTH_PATH};
+use super::auth::{
+    hysteria_mbps_to_bps, AuthRequest, AuthResponse, CongestionControl, AUTH_HOST, AUTH_OK_STATUS, AUTH_PATH,
+};
 use super::tcp;
 
 const TCP_REQUEST_PADDING_MIN: usize = 64;
@@ -25,9 +27,8 @@ const TCP_RESPONSE_MESSAGE_LIMIT: usize = 2048;
 const TCP_RESPONSE_PADDING_LIMIT: usize = 4096;
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-/// A Hysteria2 outbound with TCP support. UDP, obfuscation and bandwidth
-/// controls remain rejected by the config validator until their runtime paths
-/// are implemented.
+/// A Hysteria2 outbound with TCP and negotiated Brutal support. UDP, obfuscation,
+/// Chrome mimic, and BBR-meta2 remain unavailable until their runtime paths land.
 pub struct Hysteria2Outbound {
     tag: String,
     dialer: Arc<dyn Dialer>,
@@ -36,6 +37,8 @@ pub struct Hysteria2Outbound {
     tls: Arc<rustls::ClientConfig>,
     auth_timeout: std::time::Duration,
     password: String,
+    send_bps: u64,
+    receive_bps: u64,
     quic: QuicOptions,
 }
 
@@ -66,8 +69,6 @@ impl Hysteria2Outbound {
             ("server_ports", "server_ports", !options.server_ports.is_empty()),
             ("hop_interval", "hop_interval", !options.hop_interval.0.is_zero()),
             ("hop_interval_max", "hop_interval_max", !options.hop_interval_max.0.is_zero()),
-            ("up_mbps", "up_mbps", options.up_mbps != 0),
-            ("down_mbps", "down_mbps", options.down_mbps != 0),
             ("bbr_profile", "bbr_profile", !options.bbr_profile.is_empty()),
             ("brutal_debug", "brutal_debug", options.brutal_debug),
         ] {
@@ -104,38 +105,59 @@ impl Hysteria2Outbound {
             tls,
             auth_timeout,
             password: options.password.clone(),
+            send_bps: hysteria_mbps_to_bps(options.up_mbps),
+            receive_bps: hysteria_mbps_to_bps(options.down_mbps),
             quic,
         }))
     }
 
     async fn connect_tcp(&self, destination: &rb_adapter::Socksaddr) -> io::Result<BoxStream> {
         let packet_conn = self.dialer.dial_udp(&self.server).await?;
-        // Hysteria2 with zero configured send bandwidth uses BBR. Quinn's BBR
-        // controller is used here; upstream's BBR-meta2 profile is tracked as
-        // a compatibility difference and must be replaced before M7 acceptance.
-        let controller = Arc::new(quinn::congestion::BbrConfig::default());
+        let controller = Arc::new(quinn::congestion::Hysteria2NegotiatedConfig::default());
         let (endpoint, connection) = rb_dialer::quic::connect_with_congestion_controller(
             packet_conn,
             self.server.clone(),
             self.tls.clone(),
             &self.server_name,
             &self.quic,
-            controller,
+            controller.clone(),
         )
         .await?;
-        let driver = match tokio::time::timeout(self.auth_timeout, authenticate(&connection, &self.password)).await {
-            Ok(Ok(driver)) => driver,
-            Ok(Err(error)) => {
-                connection.close(VarInt::from_u32(0), b"Hysteria2 authentication failed");
-                endpoint.wait_idle().await;
-                return Err(error);
+        let (driver, auth_response) =
+            match tokio::time::timeout(self.auth_timeout, authenticate(&connection, &self.password, self.receive_bps))
+                .await
+            {
+                Ok(Ok(authenticated)) => authenticated,
+                Ok(Err(error)) => {
+                    connection.close(VarInt::from_u32(0), b"Hysteria2 authentication failed");
+                    endpoint.wait_idle().await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    connection.close(VarInt::from_u32(0), b"Hysteria2 authentication timed out");
+                    endpoint.wait_idle().await;
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "Hysteria2 authentication timed out"));
+                }
+            };
+        match auth_response.congestion_control(self.send_bps) {
+            CongestionControl::Brutal { send_bps } => {
+                if let Err(error) = controller.select_brutal(send_bps) {
+                    driver.abort();
+                    connection.close(VarInt::from_u32(0), b"invalid Hysteria2 Brutal rate");
+                    endpoint.wait_idle().await;
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+                }
             }
-            Err(_) => {
-                connection.close(VarInt::from_u32(0), b"Hysteria2 authentication timed out");
+            CongestionControl::BbrMeta2 => {
+                driver.abort();
+                connection.close(VarInt::from_u32(0), b"Hysteria2 BBR-meta2 is unsupported");
                 endpoint.wait_idle().await;
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "Hysteria2 authentication timed out"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Hysteria2 BBR-meta2 congestion control is not supported by rust-box yet",
+                ));
             }
-        };
+        }
 
         let (mut send, mut recv) = match connection.open_bi().await {
             Ok(streams) => streams,
@@ -191,7 +213,11 @@ fn unsupported_config_field(config_path: &str, path: &str, name: &str) -> String
     format!("{config_path}.{path}: `{name}` is not supported by rust-box yet")
 }
 
-async fn authenticate(connection: &Connection, password: &str) -> io::Result<JoinHandle<()>> {
+async fn authenticate(
+    connection: &Connection,
+    password: &str,
+    receive_bps: u64,
+) -> io::Result<(JoinHandle<()>, AuthResponse)> {
     let h3_connection = h3_quinn::Connection::new(connection.clone());
     let (mut driver, mut sender) = h3::client::new(h3_connection)
         .await
@@ -210,7 +236,7 @@ async fn authenticate(connection: &Connection, password: &str) -> io::Result<Joi
         .uri(uri)
         .body(())
         .map_err(|error| io::Error::other(format!("Hysteria2 auth request: {error}")))?;
-    *request.headers_mut() = AuthRequest { password: password.to_string(), receive_bps: 0 }.headers()?;
+    *request.headers_mut() = AuthRequest { password: password.to_string(), receive_bps }.headers()?;
 
     let mut stream = match sender.send_request(request).await {
         Ok(stream) => stream,
@@ -238,8 +264,9 @@ async fn authenticate(connection: &Connection, password: &str) -> io::Result<Joi
             format!("Hysteria2 authentication failed: HTTP {status}"),
         ));
     }
+    let auth_response = AuthResponse::from_headers(response.headers());
     stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-    Ok(driver)
+    Ok((driver, auth_response))
 }
 
 fn hysteria2_quic_options(options: &OutboundOptions) -> QuicOptions {

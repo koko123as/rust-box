@@ -7,11 +7,13 @@ use std::sync::Arc;
 
 mod bbr;
 mod cubic;
+mod hysteria2;
 mod hysteria_brutal;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
 pub use cubic::{Cubic, CubicConfig};
+pub use hysteria2::Hysteria2NegotiatedConfig;
 pub use hysteria_brutal::BrutalConfig;
 pub use new_reno::{NewReno, NewRenoConfig};
 
