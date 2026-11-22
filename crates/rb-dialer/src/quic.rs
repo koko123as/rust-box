@@ -183,6 +183,18 @@ pub fn tuic_server_endpoint(
     server_endpoint_with_config(socket, config)
 }
 
+/// Creates a Hysteria2 endpoint; callers select a fresh negotiated controller
+/// on each `Incoming::accept_with` before the QUIC handshake.
+pub fn hysteria2_server_endpoint(
+    socket: UdpSocket,
+    tls: Arc<rustls::ServerConfig>,
+    options: &QuicOptions,
+) -> io::Result<Endpoint> {
+    let controller = Arc::new(quinn::congestion::Hysteria2NegotiatedConfig::default());
+    let config = hysteria2_server_config(tls, options, controller)?;
+    server_endpoint_with_config(socket, config)
+}
+
 fn server_endpoint_with_config(socket: UdpSocket, config: quinn::ServerConfig) -> io::Result<Endpoint> {
     Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),

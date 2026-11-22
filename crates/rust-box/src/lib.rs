@@ -18,9 +18,9 @@ use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions}
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_protocol::{
-    Block, Direct, HttpOutbound, Hysteria2Outbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound,
-    SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound, VlessInbound, VlessOutbound, VmessInbound,
-    VmessOutbound,
+    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, ProxyInbound, ProxyKind, ShadowsocksInbound,
+    ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound, VlessInbound,
+    VlessOutbound, VmessInbound, VmessOutbound,
 };
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
@@ -211,9 +211,10 @@ impl RustBox {
                     TuicInbound::new(tuic, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
-                InboundOptions::Hysteria2(_) => {
-                    return Err(anyhow!("inbounds[{index}].type: `hysteria2` is not supported by rust-box yet"))
-                }
+                InboundOptions::Hysteria2(hysteria2) => Arc::new(
+                    Hysteria2Inbound::new(hysteria2, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
             };
             inbounds.push(built);
         }

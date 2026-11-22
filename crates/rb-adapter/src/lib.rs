@@ -377,16 +377,39 @@ impl fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
+/// A protocol-specific reply around a routed TCP connection's outbound dial.
+#[async_trait]
+pub trait ConnectionHandshake: Send + Sync {
+    /// Replies after the outbound connection has been established.
+    async fn success(&self, client: &mut BoxStream) -> io::Result<()>;
+    /// Replies when routing fails before the success reply.
+    async fn failure(&self, client: &mut BoxStream, error: &RouteError) -> io::Result<()>;
+}
+
 /// The router as the inbounds see it (sing-box `adapter.ConnectionRouterEx`).
 ///
-/// As in sing-box, an inbound finishes its own handshake first (a SOCKS5
-/// success reply, `200 Connection established`) and then hands the
-/// connection over: the router matches rules (sniffing reads the client's
-/// first bytes), opens the outbound connection and copies both directions
-/// until both are done (sing-box `bufio.CopyConn`).
+/// Most inbounds finish their own handshake first (a SOCKS5 success reply,
+/// `200 Connection established`) and then hand the connection over. Protocols
+/// whose reply depends on routing use `route_connection_with_handshake`; the
+/// router matches rules, opens the outbound connection and copies both
+/// directions until both are done (sing-box `bufio.CopyConn`).
 #[async_trait]
 pub trait ConnectionRouter: Send + Sync {
     async fn route_connection(&self, context: InboundContext, client: BoxStream) -> Result<(), RouteError>;
+
+    /// Routes TCP while preserving a protocol-level success/failure reply.
+    /// Implementations that cannot preserve the handshake fail explicitly.
+    async fn route_connection_with_handshake(
+        &self,
+        _context: InboundContext,
+        mut client: BoxStream,
+        handshake: &dyn ConnectionHandshake,
+    ) -> Result<(), RouteError> {
+        let error =
+            RouteError::Io(io::Error::new(io::ErrorKind::Unsupported, "router does not support protocol handshakes"));
+        handshake.failure(&mut client, &error).await.map_err(RouteError::Io)?;
+        Err(error)
+    }
 
     /// Routes a UDP session (sing-box `RoutePacketConnectionEx`): the rules
     /// are matched once, with the destination of the first packet, and the

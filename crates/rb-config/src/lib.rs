@@ -801,14 +801,11 @@ fn check_hysteria2_inbound(path: &str, options: &Hysteria2Inbound) -> Result<(),
     if options.realm.is_some() {
         return Err(field("realm"));
     }
+    if !options.detour.is_empty() {
+        return Err(field("detour"));
+    }
     check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
-    for (name, enabled) in [
-        ("up_mbps", options.up_mbps != 0),
-        ("down_mbps", options.down_mbps != 0),
-        ("ignore_client_bandwidth", options.ignore_client_bandwidth),
-        ("bbr_profile", !options.bbr_profile.is_empty()),
-        ("brutal_debug", options.brutal_debug),
-    ] {
+    for (name, enabled) in [("bbr_profile", !options.bbr_profile.is_empty()), ("brutal_debug", options.brutal_debug)] {
         if enabled {
             return Err(field(name));
         }
@@ -2462,16 +2459,16 @@ mod tests {
                 "inbounds[0].realm: `realm` is not supported by rust-box yet",
             ),
             (
+                r#"{"inbounds":[{"type":"hysteria2","detour":"next"}]}"#,
+                "inbounds[0].detour: `detour` is not supported by rust-box yet",
+            ),
+            (
                 r#"{"inbounds":[{"type":"hysteria2","obfs":{"type":"salamander","password":"secret"}}]}"#,
                 "inbounds[0].obfs.type: `obfs.type` is not supported by rust-box yet",
             ),
             (
                 r#"{"inbounds":[{"type":"hysteria2","obfs":{"type":"gecko","password":"secret"}}]}"#,
                 "inbounds[0].obfs.type: `obfs.type` is not supported by rust-box yet",
-            ),
-            (
-                r#"{"inbounds":[{"type":"hysteria2","up_mbps":10}]}"#,
-                "inbounds[0].up_mbps: `up_mbps` is not supported by rust-box yet",
             ),
             (
                 r#"{"inbounds":[{"type":"hysteria2","bbr_profile":"aggressive"}]}"#,
@@ -2497,6 +2494,17 @@ mod tests {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(expected), "{config}: {error}");
         }
+    }
+
+    #[test]
+    fn hysteria2_inbound_accepts_bandwidth_options_for_negotiation() {
+        let options =
+            parse(r#"{"inbounds":[{"type":"hysteria2","up_mbps":10,"down_mbps":20,"ignore_client_bandwidth":true}]}"#)
+                .unwrap();
+        let Inbound::Hysteria2(hysteria2) = &options.inbounds[0] else { panic!() };
+        assert_eq!(hysteria2.up_mbps, 10);
+        assert_eq!(hysteria2.down_mbps, 20);
+        assert!(hysteria2.ignore_client_bandwidth);
     }
 
     #[test]
