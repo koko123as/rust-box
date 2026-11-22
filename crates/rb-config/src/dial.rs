@@ -45,7 +45,7 @@ impl<'de> Deserialize<'de> for FwMark {
 }
 
 /// Go `strconv.ParseUint(text, 0, 32)`.
-fn parse_uint_base0(text: &str) -> Option<u32> {
+pub(crate) fn parse_uint_base0(text: &str) -> Option<u32> {
     let text = text.replace('_', "");
     let lower = text.to_ascii_lowercase();
     let (digits, radix) = if let Some(rest) = lower.strip_prefix("0x") {
