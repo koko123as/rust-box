@@ -526,6 +526,11 @@ fn build_errors() {
             json!({"inbounds": [{"type": "trojan", "fallback_for_alpn": {"h2": {"server": "127.0.0.1"}}}]}),
             "fallback for ALPN is not supported without TLS",
         ),
+        (json!({"inbounds": [{"type": "tuic"}]}), "inbounds[0].type: `tuic` is not supported by rust-box yet"),
+        (
+            json!({"inbounds": [{"type": "hysteria2"}]}),
+            "inbounds[0].type: `hysteria2` is not supported by rust-box yet",
+        ),
     ] {
         let error = build(config.clone());
         assert!(error.contains(needle), "{config}: {error}");

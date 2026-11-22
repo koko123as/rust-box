@@ -2419,6 +2419,38 @@ mod tests {
     }
 
     #[test]
+    fn tuic_unimplemented_outbound_options_fail_with_config_paths() {
+        for (options, expected) in [
+            (
+                r#""congestion_control":"new_reno""#,
+                "outbounds[0].congestion_control: `congestion_control` is not supported by rust-box yet",
+            ),
+            (
+                r#""udp_relay_mode":"quic""#,
+                "outbounds[0].udp_relay_mode: `udp_relay_mode` is not supported by rust-box yet",
+            ),
+            (
+                r#""zero_rtt_handshake":true"#,
+                "outbounds[0].zero_rtt_handshake: `zero_rtt_handshake` is not supported by rust-box yet",
+            ),
+            (
+                r#""udp_over_stream":true"#,
+                "outbounds[0].udp_over_stream: `udp_over_stream` is not supported by rust-box yet",
+            ),
+            (r#""udp_relay_mode":"invalid""#, "outbounds[0].udp_relay_mode: unknown UDP relay mode: invalid"),
+            (
+                r#""udp_over_stream":true,"udp_relay_mode":"native""#,
+                "outbounds[0].udp_over_stream: udp_over_stream is conflict with udp_relay_mode",
+            ),
+        ] {
+            let config =
+                format!(r#"{{"outbounds":[{{"type":"tuic","tls":{{"enabled":true,"insecure":true}},{options}}}]}}"#);
+            let error = parse(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
+    }
+
+    #[test]
     fn hysteria2_unimplemented_options_fail_with_their_config_paths() {
         for (config, expected) in [
             (
