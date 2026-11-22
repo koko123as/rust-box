@@ -28,6 +28,7 @@ rb-common.workspace = true
 rb-cachefile.workspace = true
 rb-clashapi.workspace = true
 rb-group.workspace = true
+rb-tun.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

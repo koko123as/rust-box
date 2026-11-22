@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/quinn-proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +28,9 @@ rb-bbolt = { path = "crates/rb-bbolt" }
 rb-cachefile = { path = "crates/rb-cachefile" }
 rb-group = { path = "crates/rb-group" }
 rb-clashapi = { path = "crates/rb-clashapi" }
+rb-netstack = { path = "crates/rb-netstack" }
+rb-platform = { path = "crates/rb-platform" }
+rb-tun = { path = "crates/rb-tun" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -51,6 +55,8 @@ crc32fast = "1"
 h2 = "0.4"
 http = "1"
 bytes = "1"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 chacha20poly1305 = "0.10"
 chacha20 = "0.9"
 ctr = "0.9"
@@ -70,8 +76,14 @@ rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
+# 0.12: the last release for Rust 1.88 (0.13 needs 1.91).
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
+h3-quinn = { path = "vendor/h3-quinn" }

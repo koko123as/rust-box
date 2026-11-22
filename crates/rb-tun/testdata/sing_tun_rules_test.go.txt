@@ -1,0 +1,69 @@
+package tun
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os"
+	"testing"
+
+	"github.com/sagernet/sing/common/ranges"
+)
+
+type vecCase struct {
+	Name    string
+	Options Options
+}
+
+func p(s string) netip.Prefix { return netip.MustParsePrefix(s) }
+
+func TestDumpVectors(t *testing.T) {
+	cases := []vecCase{
+		{"v4_auto", Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}}},
+		{"dual_auto_strict", Options{Name: "tun0", AutoRoute: true, StrictRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, Inet6Address: []netip.Prefix{p("fdfe:dcba:9876::1/126")}}},
+		{"v4_strict", Options{Name: "tun0", AutoRoute: true, StrictRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}}},
+		{"uid", Options{Name: "tun1", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, Inet6Address: []netip.Prefix{p("fdfe:dcba:9876::1/126")}, IncludeUID: []ranges.Range[uint32]{ranges.New[uint32](1000, 1000), ranges.New[uint32](2000, 3000)}, ExcludeUID: []ranges.Range[uint32]{ranges.New[uint32](2500, 2500)}}},
+		{"exclude_uid", Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, ExcludeUID: []ranges.Range[uint32]{ranges.New[uint32](0, 0)}}},
+		{"include_if", Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, Inet6Address: []netip.Prefix{p("fdfe:dcba:9876::1/126")}, IncludeInterface: []string{"eth0", "wlan0"}}},
+		{"exclude_if", Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, ExcludeInterface: []string{"docker0"}}},
+		{"route_exclude", Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, Inet6Address: []netip.Prefix{p("fdfe:dcba:9876::1/126")}, Inet4RouteExcludeAddress: []netip.Prefix{p("192.168.0.0/16"), p("10.0.0.0/8")}, Inet6RouteExcludeAddress: []netip.Prefix{p("fc00::/7")}}},
+		{"route_address", Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, Inet4RouteAddress: []netip.Prefix{p("1.0.0.0/8"), p("8.8.0.0/16")}, Inet4RouteExcludeAddress: []netip.Prefix{p("8.8.8.8/32")}}},
+		{"route_address_no_auto", Options{Name: "tun0", Inet4Address: []netip.Prefix{p("172.19.0.1/30")}, Inet4RouteAddress: []netip.Prefix{p("198.18.0.0/15")}}},
+		{"v6_only", Options{Name: "tun0", AutoRoute: true, StrictRoute: true, Inet6Address: []netip.Prefix{p("fdfe:dcba:9876::1/126")}}},
+	}
+	for i := range cases {
+		c := &cases[i]
+		c.Options.IPRoute2TableIndex = DefaultIPRoute2TableIndex
+		c.Options.IPRoute2RuleIndex = DefaultIPRoute2RuleIndex
+		c.Options.IPRoute2AutoRedirectFallbackRuleIndex = DefaultIPRoute2AutoRedirectFallbackRuleIndex
+	}
+	out := map[string]any{}
+	for _, c := range cases {
+		nt := &NativeTun{options: c.Options}
+		var rules []map[string]any
+		for _, r := range nt.rules() {
+			m := map[string]any{"family": r.Family, "priority": r.Priority, "table": r.Table, "goto": r.Goto, "invert": r.Invert, "type": r.Type, "iif": r.IifName, "oif": r.OifName, "suppress_prefixlen": r.SuppressPrefixlen, "mark": r.Mark, "mark_set": r.MarkSet, "mask": r.Mask}
+			if r.Dst.IsValid() {
+				m["dst"] = r.Dst.String()
+			}
+			if r.Src.IsValid() {
+				m["src"] = r.Src.String()
+			}
+			if r.UIDRange != nil {
+				m["uid"] = fmt.Sprintf("%d-%d", r.UIDRange.Start, r.UIDRange.End)
+			}
+			if r.Dport != nil {
+				m["dport"] = fmt.Sprintf("%d-%d", r.Dport.Start, r.Dport.End)
+			}
+			rules = append(rules, m)
+		}
+		ranges, _ := c.Options.BuildAutoRouteRanges(false)
+		var rs []string
+		for _, r := range ranges {
+			rs = append(rs, r.String())
+		}
+		out[c.Name] = map[string]any{"rules": rules, "routes": rs}
+	}
+	data, _ := json.MarshalIndent(out, "", " ")
+	os.WriteFile(os.Getenv("VEC_OUT"), data, 0o644)
+}

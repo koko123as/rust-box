@@ -38,6 +38,16 @@ pub struct Direct {
 
 pub use rb_dialer::resolve_options;
 
+/// sing-box `direct` refuses destinations inside the range of one of this
+/// process's TUN interfaces (`isMyLoopbackAddress`), which would come
+/// straight back in.
+fn check_loopback(addresses: &[IpAddr]) -> io::Result<()> {
+    if addresses.iter().any(|address| rb_platform::is_my_loopback_address(*address)) {
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "loopback connection to TUN range"));
+    }
+    Ok(())
+}
+
 impl Direct {
     /// `default_resolver` is `route.default_domain_resolver`, used when the
     /// outbound has no `domain_resolver` of its own; `defaults` are the
@@ -81,6 +91,10 @@ impl Outbound for Direct {
         let port = destination.port;
         let server_first = rb_adapter::server_first_port(port);
         let connect = |address: IpAddr| self.dialer.dial_tcp_stream(SocketAddr::new(address, port), server_first);
+        check_loopback(&context.destination_addresses)?;
+        if let Host::Ip(ip) = &destination.host {
+            check_loopback(&[*ip])?;
+        }
         let stream = match &destination.host {
             // sing-box `DialParallelNetwork`: the route's fallback delay wins.
             Host::Ip(ip) => connect(*ip).await,
@@ -96,6 +110,7 @@ impl Outbound for Direct {
                 if addresses.is_empty() {
                     return Err(io::Error::new(io::ErrorKind::NotFound, format!("{destination}: no addresses")));
                 }
+                check_loopback(&addresses)?;
                 if self.dialer.tcp_fast_open() {
                     dial_serial(&addresses, &connect).await
                 } else {
@@ -115,6 +130,7 @@ impl Outbound for Direct {
     async fn listen_packet(&self, context: &InboundContext) -> io::Result<SharedPacketConn> {
         let destination = &context.destination;
         let addresses = self.addresses(context).await?;
+        check_loopback(&addresses)?;
         let address = *addresses
             .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{destination}: no addresses")))?;
@@ -349,5 +365,24 @@ mod tests {
         let block = Block::new("block".into());
         let error = block.listen_packet(&context(Socksaddr::from_host_port("1.1.1.1", 53))).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn direct_refuses_loopback_into_tun_range() {
+        rb_platform::register_my_interface(
+            "rbtest-direct",
+            vec![rb_platform::Prefix::new("172.30.255.1".parse().unwrap(), 30)],
+        );
+        let direct =
+            Direct::new(&Default::default(), "direct".into(), Arc::new(Loopback), None, &Default::default()).unwrap();
+        let inside = Socksaddr::from_host_port("172.30.255.2", 80);
+        let error = direct.dial_tcp(&context(inside.clone())).await.err().unwrap();
+        assert_eq!(error.to_string(), "loopback connection to TUN range");
+        let error = direct.listen_packet(&context(inside)).await.err().unwrap();
+        assert_eq!(error.to_string(), "loopback connection to TUN range");
+        let mut resolved = context(Socksaddr::from_host_port("tun.test", 80));
+        resolved.destination_addresses = vec!["172.30.255.3".parse().unwrap()];
+        assert!(direct.dial_tcp(&resolved).await.is_err());
+        rb_platform::unregister_my_interface("rbtest-direct");
     }
 }

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::mux::{self, MuxHandler};
-use super::outbound::VISION_WITHOUT_TLS;
+use super::outbound::{VISION_WITHOUT_TLS, VISION_WITH_WEBSOCKET};
 use super::packet::{PacketAddrConn, ServerPacketConn, PACKET_ADDR_MAGIC};
 use super::protocol::{self, VlessStream, COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, FLOW_VISION};
 use super::vision::{RecordGate, RecordStream, VisionStream};
@@ -213,6 +213,7 @@ enum ClientConn {
     /// With the gate of its record stream (Vision).
     Tls(Box<rb_tls::TlsServerStream>, RecordGate),
     Plain(BoxStream),
+    Transport(BoxStream),
 }
 
 impl ClientConn {
@@ -220,6 +221,7 @@ impl ClientConn {
         match self {
             ClientConn::Tls(stream, _) => stream,
             ClientConn::Plain(stream) => stream,
+            ClientConn::Transport(stream) => stream,
         }
     }
 }
@@ -232,6 +234,8 @@ pub struct VlessInbound {
     users: HashMap<[u8; 16], usize>,
     flows: Vec<String>,
     tls: Option<rb_tls::TlsServer>,
+    transport: Option<crate::v2ray::StreamTransport>,
+    this: OnceLock<Weak<Self>>,
     /// Whether TLS runs over a [`RecordStream`] (some user has Vision).
     record_stream: bool,
     detour: Option<String>,
@@ -242,6 +246,7 @@ pub struct VlessInbound {
 impl VlessInbound {
     /// sing-box `vless.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         // sing-vmess `UpdateUsers`: a later user with the same id wins.
         let mut users = HashMap::new();
@@ -249,12 +254,9 @@ impl VlessInbound {
             users.insert(protocol::parse_uuid(&user.uuid), index);
         }
         let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
-            Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
+            Some(tls) => Some(crate::v2ray::transport_tls_server(tls, transport.as_ref())?),
             None => None,
         };
-        if options.transport.is_some() {
-            return Err("`transport` is not supported by rust-box yet".into());
-        }
         let listen = options.listen_options();
         let record_stream = tls.is_some() && options.users.iter().any(|user| user.flow == FLOW_VISION);
         Ok(VlessInbound {
@@ -270,6 +272,8 @@ impl VlessInbound {
             users,
             flows: options.users.iter().map(|user| user.flow.clone()).collect(),
             tls,
+            transport,
+            this: OnceLock::new(),
             record_stream,
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             local_addr: OnceLock::new(),
@@ -284,7 +288,7 @@ impl VlessInbound {
     /// Serves one connection (sing-box `Inbound.NewConnection`).
     async fn handle(&self, stream: BoxStream, context: InboundContext) {
         let source = context.source;
-        let conn = match &self.tls {
+        let (conn, alpn) = match &self.tls {
             Some(tls) => {
                 let (stream, gate): (BoxStream, RecordGate) = if self.record_stream {
                     let stream = RecordStream::new(stream);
@@ -294,14 +298,135 @@ impl VlessInbound {
                     (stream, RecordGate::default())
                 };
                 match tls.handshake(stream).await {
-                    Ok(stream) => ClientConn::Tls(Box::new(stream), gate),
+                    Ok(stream) => {
+                        let alpn =
+                            stream.get_ref().1.alpn_protocol().map(|alpn| String::from_utf8_lossy(alpn).into_owned());
+                        (ClientConn::Tls(Box::new(stream), gate), alpn)
+                    }
                     Err(error) => {
                         error!("{}: process connection from {source}: TLS handshake: {error}", self.log_prefix());
                         return;
                     }
                 }
             }
-            None => ClientConn::Plain(stream),
+            None => (ClientConn::Plain(stream), None),
+        };
+        if let Some(crate::v2ray::StreamTransport::Http(options)) = &self.transport {
+            let session =
+                match crate::v2ray::http::server_session(conn.boxed(), options, self.tls.is_some(), alpn.as_deref())
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(error) => {
+                        error!("{}: process HTTP connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+            match session {
+                crate::v2ray::http::ServerSession::Http1(stream) => {
+                    if let Err(error) = self.serve(ClientConn::Transport(stream), context).await {
+                        error!("{}: process HTTP/1.1 stream from {source}: {error}", self.log_prefix());
+                    }
+                }
+                crate::v2ray::http::ServerSession::Http2(server) => {
+                    let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                        error!("{}: HTTP handler is not initialized", self.log_prefix());
+                        return;
+                    };
+                    loop {
+                        let stream = match server.accept().await {
+                            Ok(Some(stream)) => stream,
+                            Ok(None) => return,
+                            Err(error) => {
+                                error!("{}: process HTTP/2 connection from {source}: {error}", self.log_prefix());
+                                return;
+                            }
+                        };
+                        let inbound = inbound.clone();
+                        let context = context.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = inbound.serve(ClientConn::Transport(stream), context).await {
+                                error!("{}: process HTTP/2 stream from {source}: {error}", inbound.log_prefix());
+                            }
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
+            if self.record_stream {
+                error!(
+                    "{}: process connection from {source}: gRPC transport is not supported with VLESS Vision",
+                    self.log_prefix()
+                );
+                return;
+            }
+            let server = crate::v2ray::grpc_lite::GrpcLiteServer::new(conn.boxed(), options);
+            let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                error!("{}: gRPC handler is not initialized", self.log_prefix());
+                return;
+            };
+            loop {
+                let stream = match server.accept().await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        error!("{}: process gRPC connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                let inbound = inbound.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let log_prefix = inbound.log_prefix();
+                    if let Err(error) = inbound.serve(ClientConn::Transport(stream), context).await {
+                        error!("{log_prefix}: process gRPC stream from {source}: {error}");
+                    }
+                });
+            }
+        }
+        let conn = match (&self.transport, conn) {
+            (Some(crate::v2ray::StreamTransport::WebSocket(options)), conn) => {
+                let stream = match crate::v2ray::websocket::server(conn.boxed(), options).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        error!("{}: process connection from {source}: WebSocket handshake: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                ClientConn::Transport(stream)
+            }
+            (Some(crate::v2ray::StreamTransport::HttpUpgrade(options)), conn) => {
+                let (conn, result) = match conn {
+                    ClientConn::Tls(mut stream, gate) => {
+                        let result = crate::v2ray::httpupgrade::server_in_place(&mut *stream, options).await;
+                        (ClientConn::Tls(stream, gate), result)
+                    }
+                    ClientConn::Plain(mut stream) => {
+                        let result = crate::v2ray::httpupgrade::server_in_place(&mut *stream, options).await;
+                        (ClientConn::Plain(stream), result)
+                    }
+                    ClientConn::Transport(mut stream) => {
+                        let result = crate::v2ray::httpupgrade::server_in_place(&mut *stream, options).await;
+                        (ClientConn::Transport(stream), result)
+                    }
+                };
+                if let Err(error) = result {
+                    error!("{}: process connection from {source}: HTTPUpgrade handshake: {error}", self.log_prefix());
+                    return;
+                }
+                conn
+            }
+            (Some(crate::v2ray::StreamTransport::Grpc(_)), _) => {
+                error!(
+                    "{}: process connection from {source}: gRPC transport is not supported by rust-box yet",
+                    self.log_prefix()
+                );
+                return;
+            }
+            (Some(crate::v2ray::StreamTransport::Http(_)), conn) => conn,
+            (None, conn) => conn,
         };
         if let Err(error) = self.serve(conn, context).await {
             error!("{}: process connection from {source}: {error}", self.log_prefix());
@@ -311,8 +436,9 @@ impl VlessInbound {
     /// sing-vmess `Service.NewConnection`.
     async fn serve(&self, mut conn: ClientConn, context: InboundContext) -> io::Result<()> {
         let request = match &mut conn {
-            ClientConn::Tls(stream, _) => protocol::read_request(stream.as_mut()).await?,
+            ClientConn::Tls(stream, _) => protocol::read_request(stream).await?,
             ClientConn::Plain(stream) => protocol::read_request(stream).await?,
+            ClientConn::Transport(stream) => protocol::read_request(stream).await?,
         };
         let Some(&user) = self.users.get(&request.uuid) else {
             return Err(invalid(format!("unknown UUID: {}", protocol::uuid_string(&request.uuid))));
@@ -340,6 +466,7 @@ impl VlessInbound {
                     Box::new(VisionStream::new(VlessStream::server(*stream), request.uuid, gate))
                 }
                 ClientConn::Plain(_) => return Err(io::Error::other(VISION_WITHOUT_TLS)),
+                ClientConn::Transport(_) => return Err(io::Error::other(VISION_WITH_WEBSOCKET)),
             },
             "" => Box::new(VlessStream::server(conn.boxed())),
             flow => return Err(invalid(format!("unknown flow: {flow}"))),
@@ -378,6 +505,7 @@ impl Inbound for VlessInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let _ = self.this.set(Arc::downgrade(&self));
         if let Some(tls) = &self.tls {
             tls.start().map_err(io::Error::other)?;
         }

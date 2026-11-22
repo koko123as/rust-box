@@ -24,8 +24,9 @@ use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_group::{GroupContext, Selector, UrlTest};
 use rb_protocol::{
-    Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
-    TrojanInbound, TrojanOutbound, VlessInbound, VlessOutbound, VmessInbound, VmessOutbound,
+    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, ProxyInbound, ProxyKind, ShadowsocksInbound,
+    ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound, VlessInbound,
+    VlessOutbound, VmessInbound, VmessOutbound,
 };
 use rb_route::{Management, Router};
 use rb_rule::{RuleSet, RuleSets};
@@ -95,6 +96,7 @@ impl RustBox {
         let defaults = NetworkDefaults {
             default_interface: options.route.default_interface.clone(),
             default_mark: options.route.default_mark.0,
+            auto_detect_interface: options.route.auto_detect_interface,
         };
         defaults.check().map_err(|error| anyhow!("route: {error}"))?;
         // Parts built before the outbounds and inbounds get handles that
@@ -185,7 +187,7 @@ impl RustBox {
         let mut outbounds: Vec<Arc<dyn Outbound>> = Vec::new();
         for (index, outbound) in options.outbounds.iter().enumerate() {
             let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
-            outbounds.push(match outbound {
+            let built: Arc<dyn Outbound> = match outbound {
                 OutboundOptions::Direct(direct) => Arc::new(
                     Direct::new(direct, tag, dns.clone(), default_resolver, &defaults)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
@@ -231,7 +233,17 @@ impl RustBox {
                     groups.push(Group::UrlTest(built.clone()));
                     built
                 }
-            });
+                OutboundOptions::Tuic(tuic) => {
+                    let built: Arc<dyn Outbound> = TuicOutbound::new(tuic, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Hysteria2(hysteria2) => {
+                    Hysteria2Outbound::new(hysteria2, tag, &dialer_env, &certificates, &format!("outbounds[{index}]"))
+                        .map_err(anyhow::Error::msg)?
+                }
+            };
+            outbounds.push(built);
         }
         if outbounds.is_empty() {
             // sing-box adds a default direct outbound when none is configured.
@@ -313,6 +325,18 @@ impl RustBox {
                 ),
                 InboundOptions::Vmess(vmess) => Arc::new(
                     VmessInbound::new(vmess, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Tun(tun) => Arc::new(
+                    rb_tun::TunInbound::new(tun, tag, router.clone(), dns_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Tuic(tuic) => Arc::new(
+                    TuicInbound::new(tuic, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Hysteria2(hysteria2) => Arc::new(
+                    Hysteria2Inbound::new(hysteria2, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
             };
