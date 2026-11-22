@@ -607,6 +607,8 @@ impl rb_adapter::Inbound for TunInbound {
             udp_filtering: nat(options.udp_filtering),
             udp_nat_max: options.udp_nat_max as usize,
             interface_addresses: route.inet4_address.iter().chain(&route.inet6_address).map(|it| it.address).collect(),
+            source_addresses: Vec::new(),
+            strict_source_addresses: false,
         };
         let (output_tx, mut output) = mpsc::channel::<Vec<u8>>(rb_netstack::QUEUE_PACKETS);
         let stack = Stack::new(stack_options, handler, output_tx);

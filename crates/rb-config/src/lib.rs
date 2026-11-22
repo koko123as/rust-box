@@ -19,6 +19,7 @@ pub mod srs;
 pub mod tls;
 pub mod tun;
 pub mod types;
+pub mod wireguard;
 
 use std::net::IpAddr;
 
@@ -44,6 +45,7 @@ pub use rule_set::{
 };
 pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions};
 pub use types::{DomainResolveOptions, DomainStrategy, Duration, IpPrefix, Listable, QueryType, UdpTimeout, User};
+pub use wireguard::{Endpoint, WireGuardEndpointOptions, WireGuardPeer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -57,7 +59,7 @@ pub enum ConfigError {
 
 /// Top-level sections sing-box has and rust-box does not implement yet.
 const UNSUPPORTED_SECTIONS: &[&str] =
-    &["ntp", "certificate_providers", "endpoints", "services", "http_clients", "network_namespaces"];
+    &["ntp", "certificate_providers", "services", "http_clients", "network_namespaces"];
 
 /// sing-box `option.Options`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -73,6 +75,8 @@ pub struct Options {
     pub inbounds: Vec<Inbound>,
     #[serde(default)]
     pub outbounds: Vec<Outbound>,
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub route: RouteOptions,
     #[serde(default)]
@@ -1397,6 +1401,18 @@ impl Options {
             }
             outbound_tags.push(tag);
         }
+        let mut endpoint_tags = Vec::new();
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+            if outbound_tags.contains(&tag) {
+                return Err(field(format!("endpoints[{index}]"), format!("duplicate outbound tag: {tag}")));
+            }
+            if endpoint_tags.contains(&tag) {
+                return Err(field(format!("endpoints[{index}]"), format!("duplicate endpoint tag: {tag}")));
+            }
+            endpoint_tags.push(tag);
+        }
+        outbound_tags.extend(endpoint_tags.iter().cloned());
         let mut server_tags = Vec::new();
         for (index, server) in self.dns.servers.iter().enumerate() {
             let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
@@ -1493,6 +1509,15 @@ impl Options {
                 }
                 tls.validate(&format!("inbounds[{index}].tls"))?;
             }
+        }
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            let path = format!("endpoints[{index}]");
+            endpoint.validate(&path)?;
+            let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+            if endpoint.dialer_options().detour == tag {
+                return Err(field(format!("{path}.detour"), "circular endpoint detour".into()));
+            }
+            self.check_dialer(&path, &endpoint.dialer_options(), &server_known)?;
         }
         for (index, outbound) in self.outbounds.iter().enumerate() {
             let path = format!("outbounds[{index}]");
@@ -1707,8 +1732,12 @@ impl Options {
                 let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
                 tag == options.detour
             });
+            let endpoint_target = self.endpoints.iter().enumerate().find(|(index, endpoint)| {
+                let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+                tag == options.detour
+            });
             match target {
-                None => {
+                None if endpoint_target.is_none() => {
                     return Err(field(
                         format!("{path}.detour"),
                         format!("outbound detour not found: {}", options.detour),
@@ -1720,6 +1749,7 @@ impl Options {
                         "detour to an empty direct outbound makes no sense".into(),
                     ))
                 }
+                None => {}
                 Some(_) => {}
             }
         }
@@ -2760,6 +2790,117 @@ mod tests {
             let config = format!(r#"{{"type":"{transport}","unknown_option":true}}"#);
             let error = serde_json::from_str::<V2RayTransportOptions>(&config).unwrap_err().to_string();
             assert!(error.contains("unknown field `unknown_option`"), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn wireguard_endpoint_is_a_route_outbound() {
+        let options = parse(
+            r#"{"endpoints":[{"type":"wireguard","tag":"wg0","address":["10.0.0.1/24","fd00::1/64"],
+                "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "peers":[{"address":"vpn.example","port":51820,
+                    "public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                    "allowed_ips":["0.0.0.0/0","::/0"],"persistent_keepalive_interval":25,
+                    "reserved":[1,2,3]}]}],
+                "route":{"final":"wg0","rules":[{"action":"route","outbound":"wg0"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.endpoints[0].tag(), "wg0");
+        assert_eq!(options.endpoints[0].kind(), "wireguard");
+        let Endpoint::WireGuard(wireguard) = &options.endpoints[0];
+        assert_eq!(wireguard.address.0.len(), 2);
+        assert_eq!(wireguard.peers[0].address, "vpn.example");
+        assert_eq!(wireguard.peers[0].port, 51820);
+        assert_eq!(wireguard.peers[0].allowed_ips.0.len(), 2);
+        assert_eq!(wireguard.peers[0].reserved, [1, 2, 3]);
+    }
+
+    #[test]
+    fn wireguard_reserved_matches_go_byte_slice_json() {
+        for (reserved, expected) in [("\"AQID\"", vec![1, 2, 3]), ("[1,2,3]", vec![1, 2, 3]), ("null", vec![])] {
+            let config = format!(
+                r#"{{"endpoints":[{{"type":"wireguard","private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","peers":[{{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","reserved":{reserved}}}]}}]}}"#
+            );
+            let options = parse(&config).unwrap();
+            let Endpoint::WireGuard(endpoint) = &options.endpoints[0];
+            assert_eq!(endpoint.peers[0].reserved, expected);
+        }
+    }
+
+    #[test]
+    fn wireguard_endpoint_detour_may_reference_another_endpoint() {
+        let options = parse(
+            r#"{"endpoints":[{"type":"wireguard","tag":"wg0","detour":"wg1"},{"type":"wireguard","tag":"wg1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.endpoints[0].dialer_options().detour, "wg1");
+
+        let error = parse(r#"{"endpoints":[{"type":"wireguard","tag":"wg","detour":"wg"}]}"#).unwrap_err().to_string();
+        assert!(error.contains("endpoints[0].detour: circular endpoint detour"), "{error}");
+    }
+
+    #[test]
+    fn wireguard_endpoint_rejects_unsupported_fields_with_paths() {
+        for (config, expected) in [
+            (
+                r#"{"endpoints":[{"type":"wireguard","system":true}]}"#,
+                "endpoints[0].system: system WireGuard mode is not supported",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","name":"wg0"}]}"#,
+                "endpoints[0].name: a named system interface is not supported",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","workers":2}]}"#,
+                "endpoints[0].workers: explicit WireGuard workers are not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"wireguard","listen_port":51820,"detour":"d"}]}"#,
+                "endpoints[0]: `listen_port` is conflict with `detour`",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","peers":[{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","reserved":[1,2]}]}]}"#,
+                "endpoints[0].peers[0].reserved: reserved must contain exactly 3 bytes",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","peers":[{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}]}]}"#,
+                "endpoints[0].peers[0].allowed_ips: missing peer AllowedIPs",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
+
+        let unknown_endpoint = parse(r#"{"endpoints":[{"type":"wireguard","future":true}]}"#).unwrap_err().to_string();
+        assert!(unknown_endpoint.contains("endpoints[0]") && unknown_endpoint.contains("unknown field `future`"));
+        let unknown_peer = parse(
+            r#"{"endpoints":[{"type":"wireguard","peers":[{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","future":true}]}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown_peer.contains("endpoints[0]") && unknown_peer.contains("unknown field `future`"),
+            "{unknown_peer}"
+        );
+        let post_v114_field =
+            parse(r#"{"endpoints":[{"type":"wireguard","on_demand":true}]}"#).unwrap_err().to_string();
+        assert!(post_v114_field.contains("unknown field `on_demand`"), "{post_v114_field}");
+    }
+
+    #[test]
+    fn wireguard_endpoint_tags_are_unique_within_endpoint_and_outbound_managers() {
+        for (config, expected) in [
+            (
+                r#"{"endpoints":[{"type":"wireguard","tag":"wg"},{"type":"wireguard","tag":"wg"}]}"#,
+                "endpoints[1]: duplicate endpoint tag: wg",
+            ),
+            (
+                r#"{"outbounds":[{"type":"direct","tag":"wg"}],"endpoints":[{"type":"wireguard","tag":"wg"}]}"#,
+                "endpoints[0]: duplicate outbound tag: wg",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
         }
     }
 

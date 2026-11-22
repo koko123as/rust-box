@@ -94,6 +94,10 @@ pub struct StackOptions {
     /// The TUN interface's own addresses, which the stack's internal
     /// addresses must differ from.
     pub interface_addresses: Vec<IpAddr>,
+    /// Local addresses from the tunnel configuration, with their CIDR prefixes.
+    pub source_addresses: Vec<(IpAddr, u8)>,
+    /// Require a configured local address for the destination's address family.
+    pub strict_source_addresses: bool,
 }
 
 impl Default for StackOptions {
@@ -104,6 +108,8 @@ impl Default for StackOptions {
             udp_filtering: NatBehavior::default(),
             udp_nat_max: 0,
             interface_addresses: Vec::new(),
+            source_addresses: Vec::new(),
+            strict_source_addresses: false,
         }
     }
 }
@@ -292,6 +298,11 @@ fn internal_address<T: Copy + Into<IpAddr>>(candidates: &[T], taken: &[IpAddr]) 
     *candidates.iter().find(|candidate| !taken.contains(&(**candidate).into())).unwrap_or(&candidates[0])
 }
 
+fn missing_source_address(destination: IpAddr) -> io::Error {
+    let family = if destination.is_ipv4() { "IPv4" } else { "IPv6" };
+    io::Error::new(io::ErrorKind::AddrNotAvailable, format!("missing {family} local address"))
+}
+
 fn now() -> smoltcp::time::Instant {
     smoltcp::time::Instant::now()
 }
@@ -323,6 +334,9 @@ impl Worker {
         iface.update_ip_addrs(|addresses| {
             let _ = addresses.push(IpCidr::new(v4.into(), 32));
             let _ = addresses.push(IpCidr::new(v6.into(), 128));
+            for (address, prefix) in &options.source_addresses {
+                let _ = addresses.push(IpCidr::new((*address).into(), *prefix));
+            }
         });
         let _ = iface.routes_mut().add_default_ipv4_route(v4);
         let _ = iface.routes_mut().add_default_ipv6_route(v6);
@@ -438,6 +452,10 @@ impl Worker {
             let _ = reply.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "TCP destination port is zero")));
             return;
         }
+        let Some(source_ip) = self.source_ip(destination.ip()) else {
+            let _ = reply.send(Err(missing_source_address(destination.ip())));
+            return;
+        };
         let Some(port) = self.allocate_port() else {
             let _ = reply.send(Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no source ports available")));
             return;
@@ -453,7 +471,7 @@ impl Worker {
             let _ = reply.send(Err(io::Error::other(format!("{destination}: {error}"))));
             return;
         }
-        let source = SocketAddr::new(if destination.is_ipv4() { self.v4.into() } else { self.v6.into() }, port);
+        let source = SocketAddr::new(source_ip, port);
         let key = (source, destination);
         let handle = self.sockets.add(socket);
         self.conns.insert(handle, Conn { key, shared: None, closing: false, connect_reply: Some(reply) });
@@ -464,15 +482,34 @@ impl Worker {
             let _ = reply.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP destination port is zero")));
             return;
         }
+        let Some(source_ip) = self.source_ip(destination.ip()) else {
+            let _ = reply.send(Err(missing_source_address(destination.ip())));
+            return;
+        };
         let Some(port) = self.allocate_port() else {
             let _ = reply.send(Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no source ports available")));
             return;
         };
-        let source = SocketAddr::new(if destination.is_ipv4() { self.v4.into() } else { self.v6.into() }, port);
+        let source = SocketAddr::new(source_ip, port);
         let (incoming, packets) = mpsc::channel(256);
         self.udp_clients.insert(source, UdpClient { incoming });
         let conn = ClientUdpConn::new(source, self.commands_tx.clone(), packets);
         let _ = reply.send(Ok(conn));
+    }
+
+    fn source_ip(&self, destination: IpAddr) -> Option<IpAddr> {
+        self.options
+            .source_addresses
+            .iter()
+            .find(|(address, _)| address.is_ipv4() == destination.is_ipv4())
+            .map(|(address, _)| *address)
+            .or_else(|| {
+                (!self.options.strict_source_addresses).then_some(if destination.is_ipv4() {
+                    self.v4.into()
+                } else {
+                    self.v6.into()
+                })
+            })
     }
 
     fn allocate_port(&mut self) -> Option<u16> {

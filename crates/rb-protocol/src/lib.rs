@@ -20,6 +20,7 @@ pub mod uot;
 pub mod v2ray;
 pub mod vless;
 pub mod vmess;
+pub mod wireguard;
 
 pub use hysteria2::inbound::Hysteria2Inbound;
 pub use hysteria2::outbound::Hysteria2Outbound;
@@ -31,3 +32,4 @@ pub use trojan::{TrojanInbound, TrojanOutbound};
 pub use tuic::{TuicInbound, TuicOutbound};
 pub use vless::{VlessInbound, VlessOutbound};
 pub use vmess::{VmessInbound, VmessOutbound};
+pub use wireguard::WireGuardOutbound;

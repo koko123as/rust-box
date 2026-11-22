@@ -29,6 +29,7 @@ rb-cachefile = { path = "crates/rb-cachefile" }
 rb-group = { path = "crates/rb-group" }
 rb-clashapi = { path = "crates/rb-clashapi" }
 rb-netstack = { path = "crates/rb-netstack" }
+boringtun = "=0.7.1"
 rb-platform = { path = "crates/rb-platform" }
 rb-tun = { path = "crates/rb-tun" }
 tokio = { version = "1", features = ["full"] }

@@ -355,6 +355,34 @@ async fn icmp_echo_is_answered_unless_refused() {
     assert_eq!(judged[0].2, "8.8.4.4:4660".parse().unwrap());
 }
 
+#[tokio::test]
+async fn configured_ipv4_source_is_used_for_client_udp_packet() {
+    let handler = TestHandler::new();
+    let options = StackOptions { source_addresses: vec![("192.0.2.15".parse().unwrap(), 24)], ..Default::default() };
+    let mut harness = harness(handler, options);
+    let conn = harness.stack.open_udp("198.51.100.7:53".parse().unwrap()).await.unwrap();
+    conn.send_to(b"first", "198.51.100.7:53".parse().unwrap()).await.unwrap();
+    let packet = harness.next().await.unwrap();
+    assert_eq!(parse(&packet).unwrap().src, "192.0.2.15".parse::<IpAddr>().unwrap());
+}
+
+#[tokio::test]
+async fn strict_source_addresses_reject_missing_ipv6_immediately() {
+    let handler = TestHandler::new();
+    let options = StackOptions {
+        source_addresses: vec![("192.0.2.15".parse().unwrap(), 24)],
+        strict_source_addresses: true,
+        ..Default::default()
+    };
+    let harness = harness(handler, options);
+    let error = match harness.stack.open_udp("[2001:db8::1]:53".parse().unwrap()).await {
+        Ok(_) => panic!("missing IPv6 source address should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+    assert!(error.to_string().contains("IPv6 local address"));
+}
+
 fn stack_pair(handler: Arc<TestHandler>) -> (Stack, Stack, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     let (left_output, left_packets) = mpsc::channel(QUEUE_PACKETS);
     let (right_output, right_packets) = mpsc::channel(QUEUE_PACKETS);
