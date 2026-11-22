@@ -1444,16 +1444,6 @@ impl Options {
                 Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
-            if let Inbound::Vless(options) = inbound {
-                if options.users.iter().any(|user| user.flow == "xtls-rprx-vision")
-                    && options.transport.as_ref().is_some_and(|t| matches!(&t.config, V2RayTransportConfig::Grpc(_)))
-                {
-                    return Err(field(
-                        format!("inbounds[{index}].transport"),
-                        "`transport` is not supported by rust-box yet with flow `xtls-rprx-vision`".into(),
-                    ));
-                }
-            }
             check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
             if let Inbound::Hysteria2(options) = inbound {
                 check_hysteria2_inbound(&format!("inbounds[{index}]"), options)?;
@@ -1528,14 +1518,6 @@ impl Options {
                 }
                 Outbound::Vless(vless) => {
                     check_proxy_outbound(&path, vless.tls.as_ref(), vless.multiplex.as_ref(), &vless.transport)?;
-                    if vless.flow == "xtls-rprx-vision"
-                        && vless.transport.as_ref().is_some_and(|t| matches!(&t.config, V2RayTransportConfig::Grpc(_)))
-                    {
-                        return Err(field(
-                            format!("{path}.transport"),
-                            "`transport` is not supported by rust-box yet with flow `xtls-rprx-vision`".into(),
-                        ));
-                    }
                     self.check_dialer(&path, &vless.dialer_options(), &server_known)?;
                 }
                 Outbound::Vmess(vmess) => {
@@ -2650,25 +2632,12 @@ mod tests {
             error.contains("inbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet"),
             "{error}"
         );
-        let error = parse(
-            r#"{"inbounds":[{"type":"vless","users":[{"uuid":"bf000d23-0752-40b4-affe-68f7707a9661","flow":"xtls-rprx-vision"}],"transport":{"type":"grpc"}}]}"#,
+        assert!(parse(
+            r#"{"inbounds":[{"type":"vless","users":[{"uuid":"bf000d23-0752-40b4-affe-68f7707a9661","flow":"xtls-rprx-vision"}],"transport":{"type":"grpc"}}]}"#
         )
-        .unwrap_err()
-        .to_string();
+        .is_ok());
         assert!(
-            error.contains(
-                "inbounds[0].transport: `transport` is not supported by rust-box yet with flow `xtls-rprx-vision`"
-            ),
-            "{error}"
-        );
-        let error = parse(r#"{"outbounds":[{"type":"vless","flow":"xtls-rprx-vision","transport":{"type":"grpc"}}]}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(
-                "outbounds[0].transport: `transport` is not supported by rust-box yet with flow `xtls-rprx-vision`"
-            ),
-            "{error}"
+            parse(r#"{"outbounds":[{"type":"vless","flow":"xtls-rprx-vision","transport":{"type":"grpc"}}]}"#).is_ok()
         );
     }
     #[test]
