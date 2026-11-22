@@ -116,12 +116,18 @@ impl ClientHelloExtensionProfile {
                 }
                 ClientHelloExtensionProfileEntry::Grease { payload } => {
                     let seed = *seed_iter.next().expect("GREASE seed count was checked before resolving the profile");
-                    let start = (seed & 0x000f) as u8;
-                    let codepoint = (0u8..16)
-                        .map(|offset| (start + offset) % 16)
-                        .map(|index| 0x0a0a_u16 + u16::from(index) * 0x1010)
-                        .find(|codepoint| !reserved.contains(&ExtensionType::Unknown(*codepoint)))
-                        .ok_or(ClientHelloExtensionOrderError::NoGreaseCodepointAvailable)?;
+                    let mut codepoint = utls_grease_codepoint(seed);
+                    if reserved.contains(&ExtensionType::Unknown(codepoint)) {
+                        // Match uTLS v1.8.7's collision handling for its two GREASE extensions.
+                        codepoint = utls_grease_codepoint(seed ^ 0x1010);
+                    }
+                    if reserved.contains(&ExtensionType::Unknown(codepoint)) {
+                        // Additional profile GREASE entries still need a unique codepoint.
+                        codepoint = (0u8..16)
+                            .map(|index| 0x0a0a_u16 + u16::from(index) * 0x1010)
+                            .find(|codepoint| !reserved.contains(&ExtensionType::Unknown(*codepoint)))
+                            .ok_or(ClientHelloExtensionOrderError::NoGreaseCodepointAvailable)?;
+                    }
                     let extension_type = ExtensionType::Unknown(codepoint);
                     reserved.push(extension_type);
                     resolved.push(ClientHelloExtensionOrderEntry::Opaque { extension_type, payload: payload.clone() });
@@ -156,6 +162,12 @@ fn is_grease_codepoint(codepoint: u16) -> bool {
     high == low && high & 0x0f == 0x0a
 }
 
+/// Maps a uTLS GREASE seed to its repeated-byte `0x?a?a` codepoint.
+fn utls_grease_codepoint(seed: u16) -> u16 {
+    let octet = (seed & 0x00f0) | 0x000a;
+    octet | (octet << 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,14 +187,51 @@ mod tests {
         assert_eq!(order.len(), 4);
         assert_eq!(
             order[0],
-            ClientHelloExtensionOrderEntry::Opaque { extension_type: ExtensionType::Unknown(0x2a2a), payload: vec![0] }
+            ClientHelloExtensionOrderEntry::Opaque { extension_type: ExtensionType::Unknown(0x0a0a), payload: vec![0] }
         );
         assert_eq!(order[1], ClientHelloExtensionOrderEntry::Typed(ExtensionType::ServerName));
         assert_eq!(
             order[2],
-            ClientHelloExtensionOrderEntry::Opaque { extension_type: ExtensionType::Unknown(0x3a3a), payload: vec![] }
+            ClientHelloExtensionOrderEntry::Opaque { extension_type: ExtensionType::Unknown(0x1a1a), payload: vec![] }
         );
         assert_eq!(order[3], ClientHelloExtensionOrderEntry::Typed(ExtensionType::KeyShare));
+    }
+
+    #[test]
+    fn utls_grease_seed_mapping_matches_pinned_formula_and_collision_rule() {
+        for (seed, expected) in [
+            (0x0000, 0x0a0a),
+            (0x0010, 0x1a1a),
+            (0x0050, 0x5a5a),
+            (0x00a5, 0xaaaa),
+            (0x00f0, 0xfafa),
+            (0x0100, 0x0a0a),
+            (0xffff, 0xfafa),
+        ] {
+            let codepoint = utls_grease_codepoint(seed);
+            assert_eq!(codepoint, expected);
+            assert!(is_grease_codepoint(codepoint));
+        }
+
+        let profile = ClientHelloExtensionProfile::new(vec![
+            ClientHelloExtensionProfileEntry::Grease { payload: vec![] },
+            ClientHelloExtensionProfileEntry::Grease { payload: vec![0] },
+        ])
+        .unwrap();
+        let resolved = profile.instantiate(&[0x0000, 0x0100]).unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                ClientHelloExtensionOrderEntry::Opaque {
+                    extension_type: ExtensionType::Unknown(0x0a0a),
+                    payload: vec![],
+                },
+                ClientHelloExtensionOrderEntry::Opaque {
+                    extension_type: ExtensionType::Unknown(0x1a1a),
+                    payload: vec![0],
+                },
+            ]
+        );
     }
 
     #[test]
