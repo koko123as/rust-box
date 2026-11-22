@@ -819,6 +819,12 @@ fn check_hysteria2_outbound(path: &str, options: &Hysteria2Outbound) -> Result<(
         return Err(field("realm"));
     }
     check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
+    if options.network.build().iter().any(|network| network == "udp") {
+        return Err(field("network"));
+    }
+    if !options.disable_chrome_parrot {
+        return Err(field("disable_chrome_parrot"));
+    }
     for (name, enabled) in [
         ("server_ports", !options.server_ports.is_empty()),
         ("hop_interval", !options.hop_interval.0.is_zero()),
@@ -2385,7 +2391,7 @@ mod tests {
                    "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p",
                    "udp_relay_mode":"native","tls":{"enabled":true}},
                   {"type":"hysteria2","tag":"hy2-out","server":"example.com","server_port":8443,
-                   "password":"q","tls":{"enabled":true}}]}"#,
+                   "password":"q","network":"tcp","disable_chrome_parrot":true,"tls":{"enabled":true}}]}"#,
         )
         .unwrap();
         assert_eq!(options.inbounds[0].kind(), "tuic");
@@ -2441,11 +2447,23 @@ mod tests {
                 "inbounds[0].bbr_profile: `bbr_profile` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"hysteria2","server_ports":["443-444"]}]}"#,
+                r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":true,"server_ports":["443-444"]}]}"#,
                 "outbounds[0].server_ports: `server_ports` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"hysteria2","hop_interval":"30s"}]}"#,
+                r#"{"outbounds":[{"type":"hysteria2"}]}"#,
+                "outbounds[0].network: `network` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","network":"udp","disable_chrome_parrot":true}]}"#,
+                "outbounds[0].network: `network` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":false}]}"#,
+                "outbounds[0].disable_chrome_parrot: `disable_chrome_parrot` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":true,"hop_interval":"30s"}]}"#,
                 "outbounds[0].hop_interval: `hop_interval` is not supported by rust-box yet",
             ),
             (
