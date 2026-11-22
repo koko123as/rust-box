@@ -37,6 +37,12 @@ fn init_test_logging() {
     });
 }
 
+fn test_progress(message: &str) {
+    if std::env::var_os("RUST_BOX_TEST_LOG").is_some() {
+        eprintln!("interop test: {message}");
+    }
+}
+
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -192,9 +198,11 @@ async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
 
 /// 200 KB both ways through `proxy` to the TCP echo server.
 async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
+    test_progress("TCP echo: starting SOCKS CONNECT");
     let stream = tokio::time::timeout(Duration::from_secs(30), socks5_connect(proxy, echo))
         .await
         .expect("SOCKS5 TCP CONNECT handshake timed out");
+    test_progress("TCP echo: SOCKS CONNECT completed");
     let payload: Vec<u8> = (0..200_000u32).map(|index| (index % 253) as u8).collect();
     let (mut reader, mut writer) = stream.into_split();
     let data = payload.clone();
@@ -208,13 +216,16 @@ async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
     tokio::time::timeout(Duration::from_secs(20), reader.read_exact(&mut echoed)).await.unwrap().unwrap();
     let _writer = writing.await.unwrap();
     assert!(echoed == payload, "TCP echo through {proxy}");
+    test_progress("TCP echo: payload verified");
 }
 
 /// A SOCKS5 UDP ASSOCIATE through `proxy`, datagrams to `echo` and back.
 async fn assert_udp_echo(proxy: SocketAddr, echo: SocketAddr) {
+    test_progress("UDP echo: starting SOCKS UDP ASSOCIATE");
     tokio::time::timeout(Duration::from_secs(30), assert_udp_echo_inner(proxy, echo))
         .await
         .expect("SOCKS5 UDP ASSOCIATE timed out");
+    test_progress("UDP echo: datagrams verified");
 }
 
 async fn assert_udp_echo_inner(proxy: SocketAddr, echo: SocketAddr) {
@@ -602,29 +613,39 @@ fn build_errors() {
 /// rust-box client → sing-box server (`inbound` on `port`).
 async fn interop_to_sing_box(inbound: Value, port: u16, outbound: Value, udp: bool) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
+    test_progress("RustBox client -> sing-box: starting QUIC server");
     let Some(_sing_box) = sing_box(&server_config(inbound), port).await else { return };
+    test_progress("RustBox client -> sing-box: QUIC server ready");
     let (client, clients) = start(&client_config(0, outbound)).await;
     assert_tcp_echo(clients[0], echo).await;
     if udp {
         assert_udp_echo(clients[0], udp_target).await;
     }
-    client.close().await;
+    test_progress("RustBox client -> sing-box: closing client");
+    tokio::time::timeout(Duration::from_secs(30), client.close()).await.expect("RustBox client close timed out");
+    test_progress("RustBox client -> sing-box: client closed");
 }
 
 /// sing-box client (`outbound` to the rust-box server) → rust-box server.
 async fn interop_from_sing_box(inbound: Value, outbound: impl FnOnce(SocketAddr) -> Value, udp: bool) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
+    test_progress("sing-box client -> RustBox: starting inbound");
     let (server, servers) = start(&server_config(inbound)).await;
+    test_progress("sing-box client -> RustBox: inbound ready");
     let port = free_port();
+    test_progress("sing-box client -> RustBox: starting sing-box client");
     let Some(_sing_box) = sing_box(&client_config(port, outbound(servers[0])), port).await else {
-        server.close().await;
+        tokio::time::timeout(Duration::from_secs(30), server.close()).await.expect("RustBox server close timed out");
         return;
     };
+    test_progress("sing-box client -> RustBox: sing-box client ready");
     assert_tcp_echo(local(port), echo).await;
     if udp {
         assert_udp_echo(local(port), udp_target).await;
     }
-    server.close().await;
+    test_progress("sing-box client -> RustBox: closing inbound");
+    tokio::time::timeout(Duration::from_secs(30), server.close()).await.expect("RustBox server close timed out");
+    test_progress("sing-box client -> RustBox: inbound closed");
 }
 
 #[tokio::test]
