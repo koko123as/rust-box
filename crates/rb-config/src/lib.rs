@@ -11,6 +11,7 @@ pub mod dial;
 pub mod adguard;
 pub mod deprecated;
 pub mod query_types;
+pub mod quic;
 pub mod rule;
 pub mod rule_set;
 pub mod srs;
@@ -24,6 +25,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrategy};
+pub use quic::{
+    Hysteria2Inbound, Hysteria2Obfs, Hysteria2Outbound, Hysteria2User, MemoryBytes, QuicOptions, TuicInbound,
+    TuicOutbound, TuicUser,
+};
 pub use rule::{
     DnsMatchResponse, DnsRecordOptions, DnsResponseCode, DnsRouteActionOptions, DnsRule, DnsRuleAction, DnsRuleMatch,
     LogicalMode, RejectMethod, RejectOptions, RouteActionOptions, RouteRule, Rule, RuleAction, RuleMatch, SNIFFERS,
@@ -321,6 +326,10 @@ pub enum Inbound {
     Vmess(VmessInbound),
     #[serde(rename = "tun")]
     Tun(tun::TunInbound),
+    #[serde(rename = "tuic")]
+    Tuic(TuicInbound),
+    #[serde(rename = "hysteria2")]
+    Hysteria2(Hysteria2Inbound),
 }
 
 impl Inbound {
@@ -332,6 +341,8 @@ impl Inbound {
             Inbound::Vless(options) => &options.tag,
             Inbound::Vmess(options) => &options.tag,
             Inbound::Tun(options) => &options.tag,
+            Inbound::Tuic(options) => &options.tag,
+            Inbound::Hysteria2(options) => &options.tag,
         }
     }
     pub fn kind(&self) -> &'static str {
@@ -344,6 +355,8 @@ impl Inbound {
             Inbound::Vless(_) => "vless",
             Inbound::Vmess(_) => "vmess",
             Inbound::Tun(_) => "tun",
+            Inbound::Tuic(_) => "tuic",
+            Inbound::Hysteria2(_) => "hysteria2",
         }
     }
 
@@ -356,6 +369,8 @@ impl Inbound {
             Inbound::Vless(options) => options.listen_options(),
             Inbound::Vmess(options) => options.listen_options(),
             Inbound::Tun(_) => ListenOptions::default(),
+            Inbound::Tuic(options) => options.listen_options(),
+            Inbound::Hysteria2(options) => options.listen_options(),
         }
     }
 
@@ -368,6 +383,8 @@ impl Inbound {
             Inbound::Vless(options) => options.removed_field_error(),
             Inbound::Vmess(options) => options.removed_field_error(),
             Inbound::Tun(options) => options.removed_field_error(),
+            Inbound::Tuic(options) => options.removed_field_error(),
+            Inbound::Hysteria2(options) => options.removed_field_error(),
         }
     }
 }
@@ -507,6 +524,10 @@ pub enum Outbound {
     Vless(VlessOutbound),
     #[serde(rename = "vmess")]
     Vmess(VmessOutbound),
+    #[serde(rename = "tuic")]
+    Tuic(TuicOutbound),
+    #[serde(rename = "hysteria2")]
+    Hysteria2(Hysteria2Outbound),
 }
 
 impl Outbound {
@@ -520,6 +541,8 @@ impl Outbound {
             Outbound::Trojan(options) => &options.tag,
             Outbound::Vless(options) => &options.tag,
             Outbound::Vmess(options) => &options.tag,
+            Outbound::Tuic(options) => &options.tag,
+            Outbound::Hysteria2(options) => &options.tag,
         }
     }
 
@@ -535,6 +558,8 @@ impl Outbound {
             Outbound::Trojan(options) => Some(options.dialer_options()),
             Outbound::Vless(options) => Some(options.dialer_options()),
             Outbound::Vmess(options) => Some(options.dialer_options()),
+            Outbound::Tuic(options) => Some(options.dialer_options()),
+            Outbound::Hysteria2(options) => Some(options.dialer_options()),
         }
     }
 }
@@ -655,7 +680,7 @@ with_dial_fields! {
 }
 
 /// The `tls`, `multiplex` and `transport` checks of the trojan, vless and
-/// vmess outbounds: multiplex and V2Ray transports are not implemented yet.
+/// vmess outbounds.
 fn check_proxy_outbound(
     path: &str,
     tls: Option<&OutboundTlsOptions>,
@@ -671,37 +696,254 @@ fn check_proxy_outbound(
     {
         return Err(field(format!("{path}.multiplex.brutal"), "`brutal` is not supported by rust-box yet".into()));
     }
-    if transport.is_some() {
-        return Err(field(format!("{path}.transport"), "`transport` is not supported by rust-box yet".into()));
+    check_v2ray_transport(&format!("{path}.transport"), transport.as_ref(), true)?;
+    Ok(())
+}
+
+fn check_tuic_outbound(path: &str, options: &TuicOutbound) -> Result<(), ConfigError> {
+    let field = |name: &str, message: String| ConfigError::Field { path: format!("{path}.{name}"), message };
+    let Some(tls) = options.tls.as_ref() else {
+        return Err(field("tls", "TLS is required".into()));
+    };
+    if !tls.enabled {
+        return Err(field("tls.enabled", "TLS is required".into()));
+    }
+    tls.validate(&format!("{path}.tls"))?;
+
+    match options.congestion_control.as_str() {
+        "" | "cubic" => {}
+        "new_reno" | "bbr" => {
+            return Err(field("congestion_control", "`congestion_control` is not supported by rust-box yet".into()));
+        }
+        other => {
+            return Err(field("congestion_control", format!("unknown congestion control algorithm: {other}")));
+        }
+    }
+    if options.udp_over_stream && !options.udp_relay_mode.is_empty() {
+        return Err(field("udp_over_stream", "udp_over_stream is conflict with udp_relay_mode".into()));
+    }
+    match options.udp_relay_mode.as_str() {
+        "" | "native" => {}
+        "quic" => {
+            return Err(field("udp_relay_mode", "`udp_relay_mode` is not supported by rust-box yet".into()));
+        }
+        other => return Err(field("udp_relay_mode", format!("unknown UDP relay mode: {other}"))),
+    }
+    if options.zero_rtt_handshake {
+        return Err(field("zero_rtt_handshake", "`zero_rtt_handshake` is not supported by rust-box yet".into()));
+    }
+    if options.udp_over_stream {
+        return Err(field("udp_over_stream", "`udp_over_stream` is not supported by rust-box yet".into()));
     }
     Ok(())
 }
 
-/// sing-box `V2RayTransportOptions`: parsed as far as its `type` (one of
-/// `http`, `ws`, `quic`, `grpc`, `httpupgrade`, else "unknown transport
-/// type: X" as sing-box); V2Ray transports are not implemented yet, so a
-/// transport that parses is refused with its path.
+fn check_v2ray_transport(
+    path: &str,
+    transport: Option<&V2RayTransportOptions>,
+    allow_grpc: bool,
+) -> Result<(), ConfigError> {
+    let field = |path: String, message: String| ConfigError::Field { path, message };
+    let Some(transport) = transport else { return Ok(()) };
+    match &transport.config {
+        V2RayTransportConfig::WebSocket(options)
+            if options.max_early_data == 0 && options.early_data_header_name.is_empty() =>
+        {
+            Ok(())
+        }
+        V2RayTransportConfig::WebSocket(options) if options.max_early_data > 0 => {
+            Err(field(format!("{path}.max_early_data"), "`max_early_data` is not supported by rust-box yet".into()))
+        }
+        V2RayTransportConfig::WebSocket(_) => Err(field(
+            format!("{path}.early_data_header_name"),
+            "`early_data_header_name` is not supported by rust-box yet".into(),
+        )),
+        V2RayTransportConfig::HttpUpgrade(_) => Ok(()),
+        V2RayTransportConfig::Http(options) => {
+            for (name, duration) in [("idle_timeout", options.idle_timeout.0), ("ping_timeout", options.ping_timeout.0)]
+            {
+                if !duration.is_zero() {
+                    return Err(field(format!("{path}.{name}"), format!("`{name}` is not supported by rust-box yet")));
+                }
+            }
+            Ok(())
+        }
+        V2RayTransportConfig::Grpc(options) if allow_grpc => {
+            for (name, duration) in [("idle_timeout", options.idle_timeout.0), ("ping_timeout", options.ping_timeout.0)]
+            {
+                if !duration.is_zero() {
+                    return Err(field(format!("{path}.{name}"), format!("`{name}` is not supported by rust-box yet")));
+                }
+            }
+            if options.permit_without_stream {
+                return Err(field(
+                    format!("{path}.permit_without_stream"),
+                    "`permit_without_stream` is not supported by rust-box yet".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(field(path.to_string(), "`transport` is not supported by rust-box yet".into())),
+    }
+}
+
+fn check_hysteria2_obfs(path: &str, obfs: Option<&Hysteria2Obfs>) -> Result<(), ConfigError> {
+    let Some(obfs) = obfs else { return Ok(()) };
+    let field_path = format!("{path}.type");
+    let message = match obfs.r#type.as_str() {
+        "salamander" | "gecko" => "`obfs.type` is not supported by rust-box yet".to_string(),
+        other => format!("unknown Hysteria2 obfs type: {other}"),
+    };
+    Err(ConfigError::Field { path: field_path, message })
+}
+
+fn check_hysteria2_inbound(path: &str, options: &Hysteria2Inbound) -> Result<(), ConfigError> {
+    let field = |name: &str| ConfigError::Field {
+        path: format!("{path}.{name}"),
+        message: format!("`{name}` is not supported by rust-box yet"),
+    };
+    if options.masquerade.is_some() {
+        return Err(field("masquerade"));
+    }
+    if options.realm.is_some() {
+        return Err(field("realm"));
+    }
+    if !options.detour.is_empty() {
+        return Err(field("detour"));
+    }
+    check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
+    for (name, enabled) in [("bbr_profile", !options.bbr_profile.is_empty()), ("brutal_debug", options.brutal_debug)] {
+        if enabled {
+            return Err(field(name));
+        }
+    }
+    Ok(())
+}
+
+fn check_hysteria2_outbound(path: &str, options: &Hysteria2Outbound) -> Result<(), ConfigError> {
+    let field = |name: &str| ConfigError::Field {
+        path: format!("{path}.{name}"),
+        message: format!("`{name}` is not supported by rust-box yet"),
+    };
+    if options.realm.is_some() {
+        return Err(field("realm"));
+    }
+    check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
+    if !options.disable_chrome_parrot {
+        return Err(field("disable_chrome_parrot"));
+    }
+    for (name, enabled) in [
+        ("server_ports", !options.server_ports.is_empty()),
+        ("hop_interval", !options.hop_interval.0.is_zero()),
+        ("hop_interval_max", !options.hop_interval_max.0.is_zero()),
+        ("bbr_profile", !options.bbr_profile.is_empty()),
+        ("brutal_debug", options.brutal_debug),
+    ] {
+        if enabled {
+            return Err(field(name));
+        }
+    }
+    Ok(())
+}
+
+/// A V2Ray transport configuration. Unsupported transport features are
+/// rejected with their configuration path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct V2RayTransportOptions {
     pub r#type: String,
-    pub options: serde_json::Value,
+    pub config: V2RayTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum V2RayTransportConfig {
+    Http(V2RayHttpOptions),
+    WebSocket(V2RayWebSocketOptions),
+    Grpc(V2RayGrpcOptions),
+    HttpUpgrade(V2RayHttpUpgradeOptions),
+    /// The upstream `quic` transport is recognized but is outside this
+    /// milestone's supported transport set.
+    Quic(serde_json::Value),
+}
+
+pub type V2RayHeaders = std::collections::HashMap<String, Listable<String>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayWebSocketOptions {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub headers: V2RayHeaders,
+    #[serde(default)]
+    pub max_early_data: u32,
+    #[serde(default)]
+    pub early_data_header_name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayHttpOptions {
+    #[serde(default)]
+    pub host: Listable<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub headers: V2RayHeaders,
+    #[serde(default)]
+    pub idle_timeout: Duration,
+    #[serde(default)]
+    pub ping_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayGrpcOptions {
+    #[serde(default)]
+    pub service_name: String,
+    #[serde(default)]
+    pub idle_timeout: Duration,
+    #[serde(default)]
+    pub ping_timeout: Duration,
+    #[serde(default)]
+    pub permit_without_stream: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2RayHttpUpgradeOptions {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub headers: V2RayHeaders,
 }
 
 impl<'de> Deserialize<'de> for V2RayTransportOptions {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let options = serde_json::Value::deserialize(deserializer)?;
-        let serde_json::Value::Object(object) = &options else {
+        let serde_json::Value::Object(mut object) = options else {
             return Err(serde::de::Error::custom("invalid type: expected an object"));
         };
-        let r#type = match object.get("type") {
+        let r#type = match object.remove("type") {
             None | Some(serde_json::Value::Null) => String::new(),
-            Some(serde_json::Value::String(value)) => value.clone(),
+            Some(serde_json::Value::String(value)) => value,
             Some(_) => return Err(serde::de::Error::custom("invalid type: expected a string for `type`")),
         };
-        if !matches!(r#type.as_str(), "http" | "ws" | "quic" | "grpc" | "httpupgrade") {
-            return Err(serde::de::Error::custom(format!("unknown transport type: {}", r#type)));
-        }
-        Ok(V2RayTransportOptions { r#type, options })
+        let fields = serde_json::Value::Object(object);
+        let config = match r#type.as_str() {
+            "http" => V2RayTransportConfig::Http(serde_json::from_value(fields).map_err(serde::de::Error::custom)?),
+            "ws" => V2RayTransportConfig::WebSocket(serde_json::from_value(fields).map_err(serde::de::Error::custom)?),
+            "grpc" => V2RayTransportConfig::Grpc(serde_json::from_value(fields).map_err(serde::de::Error::custom)?),
+            "httpupgrade" => {
+                V2RayTransportConfig::HttpUpgrade(serde_json::from_value(fields).map_err(serde::de::Error::custom)?)
+            }
+            "quic" => V2RayTransportConfig::Quic(fields),
+            other => return Err(serde::de::Error::custom(format!("unknown transport type: {other}"))),
+        };
+        Ok(V2RayTransportOptions { r#type, config })
     }
 }
 
@@ -736,7 +978,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -787,7 +1029,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -825,7 +1067,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -853,7 +1095,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
         /// `xudp` (the default when absent), `packetaddr`, or empty for
@@ -878,7 +1120,7 @@ with_listen_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<InboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -932,7 +1174,7 @@ with_dial_fields! {
         /// Not supported yet: rejected when enabled.
         #[serde(default)]
         pub multiplex: Option<OutboundMultiplexOptions>,
-        /// V2Ray transports are not supported yet: rejected when set.
+        /// WebSocket and HTTPUpgrade are supported; other V2Ray transport types are rejected.
         #[serde(default)]
         pub transport: Option<V2RayTransportOptions>,
     }
@@ -1206,11 +1448,9 @@ impl Options {
                 Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
-            if transport.is_some() {
-                return Err(field(
-                    format!("inbounds[{index}].transport"),
-                    "`transport` is not supported by rust-box yet".into(),
-                ));
+            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
+            if let Inbound::Hysteria2(options) = inbound {
+                check_hysteria2_inbound(&format!("inbounds[{index}]"), options)?;
             }
             if let Inbound::Trojan(trojan) = inbound {
                 trojan.validate_fallback(&format!("inbounds[{index}]"))?;
@@ -1226,6 +1466,8 @@ impl Options {
                 Inbound::Trojan(options) => options.tls.as_ref(),
                 Inbound::Vless(options) => options.tls.as_ref(),
                 Inbound::Vmess(options) => options.tls.as_ref(),
+                Inbound::Tuic(options) => options.tls.as_ref(),
+                Inbound::Hysteria2(options) => options.tls.as_ref(),
             };
             if let Some(tls) = tls {
                 // sing-box's socks inbound has no `tls` field.
@@ -1291,6 +1533,11 @@ impl Options {
                     check_proxy_outbound(&path, vmess.tls.as_ref(), vmess.multiplex.as_ref(), &vmess.transport)?;
                     self.check_dialer(&path, &vmess.dialer_options(), &server_known)?;
                 }
+                Outbound::Tuic(tuic) => {
+                    check_tuic_outbound(&path, tuic)?;
+                    self.check_dialer(&path, &tuic.dialer_options(), &server_known)?;
+                }
+                Outbound::Hysteria2(hysteria2) => check_hysteria2_outbound(&path, hysteria2)?,
                 _ => {}
             }
             let Outbound::Direct(direct) = outbound else { continue };
@@ -1599,6 +1846,51 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("outbounds[0].domain_resolver.client_subnet"), "{error}");
+    }
+
+    #[test]
+    fn tuic_outbound_native_network_and_unsupported_options() {
+        let base = r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,
+            "uuid":"550e8400-e29b-41d4-a716-446655440000","tls":{"enabled":true},"network":"tcp"}]}"#;
+        let options = parse(base).unwrap();
+        assert!(matches!(options.outbounds[0], Outbound::Tuic(_)));
+        let options =
+            parse(r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true}}]}"#)
+                .unwrap();
+        let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
+        assert_eq!(tuic.network.build(), vec!["tcp", "udp"]);
+        let options = parse(
+            r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"udp"}]}"#,
+        )
+        .unwrap();
+        let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
+        assert_eq!(tuic.network.build(), vec!["udp"]);
+
+        for (config, expected) in [
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"network":"tcp"}]}"#,
+                "outbounds[0].tls: TLS is required",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"tcp","zero_rtt_handshake":true}]}"#,
+                "outbounds[0].zero_rtt_handshake: `zero_rtt_handshake` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"tcp","congestion_control":"bbr"}]}"#,
+                "outbounds[0].congestion_control: `congestion_control` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"udp_relay_mode":"quic"}]}"#,
+                "outbounds[0].udp_relay_mode: `udp_relay_mode` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"udp_over_stream":true}]}"#,
+                "outbounds[0].udp_over_stream: `udp_over_stream` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
     }
 
     /// sing-box v1.14.4 without a platform interface: the platform network
@@ -2016,22 +2308,26 @@ mod tests {
             r#"{"inbounds":[
                   {"type":"vmess","tag":"m","listen_port":10086,
                    "users":[{"name":"a","uuid":"bf000d23-0752-40b4-affe-68f7707a9661","alterId":4},{"uuid":"x"}],
-                   "tls":{"enabled":false},"multiplex":{"enabled":false}}],
+                   "tls":{"enabled":false},"multiplex":{"enabled":false},
+                   "transport":{"type":"ws","path":"/proxy"}}],
                 "outbounds":[
                   {"type":"vmess","tag":"mo","server":"127.0.0.1","server_port":10086,
                    "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","security":"chacha20-poly1305","alter_id":1,
                    "global_padding":true,"authenticated_length":true,"network":"udp","packet_encoding":"xudp",
-                   "tls":{"enabled":true,"server_name":"example.com"}},
+                   "tls":{"enabled":true,"server_name":"example.com"},
+                   "transport":{"type":"ws","path":"/proxy"}},
                   {"type":"vmess","tag":"mn"}]}"#,
         )
         .unwrap();
         let Inbound::Vmess(vmess) = &options.inbounds[0] else { panic!() };
+        assert!(vmess.transport.is_some());
         assert_eq!(
             vmess.users[0],
             VmessUser { name: "a".into(), uuid: "bf000d23-0752-40b4-affe-68f7707a9661".into(), alter_id: 4 }
         );
         assert_eq!(vmess.users[1].alter_id, 0);
         let Outbound::Vmess(outbound) = &options.outbounds[0] else { panic!() };
+        assert!(outbound.transport.is_some());
         assert_eq!(outbound.security, "chacha20-poly1305");
         assert_eq!(outbound.alter_id, 1);
         assert!(outbound.global_padding && outbound.authenticated_length);
@@ -2042,20 +2338,36 @@ mod tests {
 
         for (config, needle) in [
             (
-                r#"{"inbounds":[{"type":"vmess","transport":{"type":"ws","path":"/"}}]}"#,
-                "inbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
-            (
                 r#"{"inbounds":[{"type":"vmess","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
                 "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
+                r#"{"outbounds":[{"type":"vmess","multiplex":{"enabled":true,"protocol":"smux","brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
                 "outbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
-                "outbounds[0].transport: `transport` is not supported by rust-box yet",
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"ws","max_early_data":1}}]}"#,
+                "outbounds[0].transport.max_early_data: `max_early_data` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"ws","early_data_header_name":"Sec-WebSocket-Protocol"}}]}"#,
+                "outbounds[0].transport.early_data_header_name: `early_data_header_name` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#,
+                "outbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","ping_timeout":"1s"}}]}"#,
+                "outbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","permit_without_stream":true}}]}"#,
+                "outbounds[0].transport.permit_without_stream: `permit_without_stream` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#,
+                "inbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
             ),
             (r#"{"outbounds":[{"type":"vmess","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
             (r#"{"inbounds":[{"type":"vmess","users":[{"alter_id":1}]}]}"#, "unknown field `alter_id`"),
@@ -2071,6 +2383,159 @@ mod tests {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(needle), "{config}: {error}");
         }
+    }
+
+    #[test]
+    fn tuic_and_hysteria2_options_are_typed_and_strict() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"tuic","tag":"tuic-in","listen":"127.0.0.1","listen_port":443,
+                   "users":[{"name":"alice","uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p"}],
+                   "congestion_control":"new_reno","tls":{"enabled":true}},
+                  {"type":"hysteria2","tag":"hy2-in","listen_port":8443,
+                   "users":[{"name":"bob","password":"q"}],"tls":{"enabled":true}}],
+                "outbounds":[
+                  {"type":"tuic","tag":"tuic-out","server":"example.com","server_port":443,
+                   "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","password":"p",
+                   "udp_relay_mode":"native","tls":{"enabled":true}},
+                  {"type":"hysteria2","tag":"hy2-out","server":"example.com","server_port":8443,
+                   "password":"q","network":"tcp","disable_chrome_parrot":true,"tls":{"enabled":true}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.inbounds[0].kind(), "tuic");
+        assert_eq!(options.inbounds[0].listen_options().listen_port, 443);
+        let Inbound::Tuic(tuic) = &options.inbounds[0] else { panic!() };
+        assert_eq!(tuic.users[0].name, "alice");
+        assert_eq!(tuic.congestion_control, "new_reno");
+        let Inbound::Hysteria2(hysteria2) = &options.inbounds[1] else { panic!() };
+        assert_eq!(hysteria2.users[0].password, "q");
+        let Outbound::Tuic(tuic) = &options.outbounds[0] else { panic!() };
+        assert_eq!(tuic.udp_relay_mode, "native");
+        assert_eq!(tuic.dialer_options().detour, "");
+        let Outbound::Hysteria2(hysteria2) = &options.outbounds[1] else { panic!() };
+        assert_eq!(hysteria2.up_mbps, 0);
+
+        let unknown_top_level = parse(r#"{"inbounds":[{"type":"tuic","unknown":true}]}"#).unwrap_err().to_string();
+        assert!(
+            unknown_top_level.contains("inbounds[0]") && unknown_top_level.contains("unknown field"),
+            "{unknown_top_level}"
+        );
+        let unknown_nested =
+            parse(r#"{"outbounds":[{"type":"hysteria2","obfs":{"type":"salamander","unknown":true}}]}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(unknown_nested.contains("unknown field `unknown`"), "{unknown_nested}");
+    }
+
+    #[test]
+    fn tuic_unimplemented_outbound_options_fail_with_config_paths() {
+        for (options, expected) in [
+            (
+                r#""congestion_control":"new_reno""#,
+                "outbounds[0].congestion_control: `congestion_control` is not supported by rust-box yet",
+            ),
+            (
+                r#""udp_relay_mode":"quic""#,
+                "outbounds[0].udp_relay_mode: `udp_relay_mode` is not supported by rust-box yet",
+            ),
+            (
+                r#""zero_rtt_handshake":true"#,
+                "outbounds[0].zero_rtt_handshake: `zero_rtt_handshake` is not supported by rust-box yet",
+            ),
+            (
+                r#""udp_over_stream":true"#,
+                "outbounds[0].udp_over_stream: `udp_over_stream` is not supported by rust-box yet",
+            ),
+            (r#""udp_relay_mode":"invalid""#, "outbounds[0].udp_relay_mode: unknown UDP relay mode: invalid"),
+            (
+                r#""udp_over_stream":true,"udp_relay_mode":"native""#,
+                "outbounds[0].udp_over_stream: udp_over_stream is conflict with udp_relay_mode",
+            ),
+        ] {
+            let config =
+                format!(r#"{{"outbounds":[{{"type":"tuic","tls":{{"enabled":true,"insecure":true}},{options}}}]}}"#);
+            let error = parse(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn hysteria2_unimplemented_options_fail_with_their_config_paths() {
+        for (config, expected) in [
+            (
+                r#"{"inbounds":[{"type":"hysteria2","masquerade":{"type":"string","content":"hello"}}]}"#,
+                "inbounds[0].masquerade: `masquerade` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","realm":{"server_url":"https://realm.test","realm_id":"x"}}]}"#,
+                "inbounds[0].realm: `realm` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","detour":"next"},{"type":"socks","tag":"next"}]}"#,
+                "inbounds[0].detour: `detour` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","obfs":{"type":"salamander","password":"secret"}}]}"#,
+                "inbounds[0].obfs.type: `obfs.type` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","obfs":{"type":"gecko","password":"secret"}}]}"#,
+                "inbounds[0].obfs.type: `obfs.type` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"hysteria2","bbr_profile":"aggressive"}]}"#,
+                "inbounds[0].bbr_profile: `bbr_profile` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":true,"server_ports":["443-444"]}]}"#,
+                "outbounds[0].server_ports: `server_ports` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":false}]}"#,
+                "outbounds[0].disable_chrome_parrot: `disable_chrome_parrot` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":true,"hop_interval":"30s"}]}"#,
+                "outbounds[0].hop_interval: `hop_interval` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"hysteria2","realm":{"server_url":"https://realm.test","realm_id":"x"}}]}"#,
+                "outbounds[0].realm: `realm` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn hysteria2_inbound_accepts_bandwidth_options_for_negotiation() {
+        let options =
+            parse(r#"{"inbounds":[{"type":"hysteria2","up_mbps":10,"down_mbps":20,"ignore_client_bandwidth":true}]}"#)
+                .unwrap();
+        let Inbound::Hysteria2(hysteria2) = &options.inbounds[0] else { panic!() };
+        assert_eq!(hysteria2.up_mbps, 10);
+        assert_eq!(hysteria2.down_mbps, 20);
+        assert!(hysteria2.ignore_client_bandwidth);
+    }
+
+    #[test]
+    fn hysteria2_outbound_accepts_bandwidth_options_for_negotiation() {
+        let options = parse(
+            r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":true,"up_mbps":10,"down_mbps":20}]}"#,
+        )
+        .unwrap();
+        let Outbound::Hysteria2(hysteria2) = &options.outbounds[0] else { panic!() };
+        assert_eq!(hysteria2.up_mbps, 10);
+        assert_eq!(hysteria2.down_mbps, 20);
+    }
+
+    #[test]
+    fn hysteria2_outbound_accepts_udp_network() {
+        let options =
+            parse(r#"{"outbounds":[{"type":"hysteria2","network":"udp","disable_chrome_parrot":true}]}"#).unwrap();
+        let Outbound::Hysteria2(hysteria2) = &options.outbounds[0] else { panic!() };
+        assert_eq!(hysteria2.network.build(), vec!["udp".to_string()]);
     }
 
     #[test]
@@ -2106,16 +2571,8 @@ mod tests {
         assert_eq!(outbound.packet_encoding.as_deref(), Some(""));
 
         for (config, needle) in [
-            (
-                r#"{"inbounds":[{"type":"trojan","transport":{"type":"ws","path":"/"}}]}"#,
-                "inbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
             (r#"{"inbounds":[{"type":"trojan","transport":{}}]}"#, "unknown transport type: "),
             (r#"{"outbounds":[{"type":"vless","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
-            (
-                r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#,
-                "outbounds[0].transport: `transport` is not supported by rust-box yet",
-            ),
             (
                 r#"{"inbounds":[{"type":"vless","multiplex":{"enabled":true,"brutal":{"enabled":true,"up_mbps":10,"down_mbps":10}}}]}"#,
                 "inbounds[0].multiplex.brutal: `brutal` is not supported by rust-box yet",
@@ -2143,6 +2600,144 @@ mod tests {
         ] {
             let error = parse(config).unwrap_err().to_string();
             assert!(error.contains(needle), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn httpupgrade_transport_is_accepted_for_proxy_protocols() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"trojan","transport":{"type":"httpupgrade","host":"t.test"}},
+                  {"type":"vless","transport":{"type":"httpupgrade","path":"/v"}},
+                  {"type":"vmess","transport":{"type":"httpupgrade"}}],
+                "outbounds":[
+                  {"type":"trojan","transport":{"type":"httpupgrade"}},
+                  {"type":"vless","transport":{"type":"httpupgrade"}},
+                  {"type":"vmess","transport":{"type":"httpupgrade"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.inbounds.len(), 3);
+        assert_eq!(options.outbounds.len(), 3);
+    }
+
+    #[test]
+    fn http_transport_is_accepted_and_rejects_unimplemented_timeouts() {
+        let options = parse(
+            r#"{"inbounds":[
+                  {"type":"trojan","transport":{"type":"http","host":["a.test","b.test"],"path":"/edge","method":"POST","headers":{"X-Test":"inbound"}}},
+                  {"type":"vless","transport":{"type":"http"}},
+                  {"type":"vmess","transport":{"type":"http"}}],
+                "outbounds":[
+                  {"type":"trojan","transport":{"type":"http"}},
+                  {"type":"vless","transport":{"type":"http"}},
+                  {"type":"vmess","transport":{"type":"http"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.inbounds.len(), 3);
+        assert_eq!(options.outbounds.len(), 3);
+
+        for (config, expected) in [
+            (
+                r#"{"outbounds":[{"type":"vless","transport":{"type":"http","idle_timeout":"1s"}}]}"#,
+                "outbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"trojan","transport":{"type":"http","ping_timeout":"1s"}}]}"#,
+                "inbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn grpc_transport_is_supported_and_rejects_unsupported_keepalive() {
+        assert!(parse(r#"{"outbounds":[{"type":"trojan","transport":{"type":"grpc","service_name":"edge"}}]}"#).is_ok());
+        assert!(parse(r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).is_ok());
+        assert!(parse(r#"{"inbounds":[{"type":"vless","transport":{"type":"grpc"}}]}"#).is_ok());
+        let error = parse(r#"{"outbounds":[{"type":"vless","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","ping_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(r#"{"inbounds":[{"type":"trojan","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        let error = parse(r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc","ping_timeout":"1s"}}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet"),
+            "{error}"
+        );
+        assert!(parse(
+            r#"{"inbounds":[{"type":"vless","users":[{"uuid":"bf000d23-0752-40b4-affe-68f7707a9661","flow":"xtls-rprx-vision"}],"transport":{"type":"grpc"}}]}"#
+        )
+        .is_ok());
+        assert!(
+            parse(r#"{"outbounds":[{"type":"vless","flow":"xtls-rprx-vision","transport":{"type":"grpc"}}]}"#).is_ok()
+        );
+    }
+    #[test]
+    fn v2ray_transport_options_are_typed_and_strict() {
+        let websocket: V2RayTransportOptions = serde_json::from_str(
+            r#"{"type":"ws","path":"/socket","headers":{"X-Test":["one","two"]},"max_early_data":2048,"early_data_header_name":"Sec-WebSocket-Protocol"}"#,
+        )
+        .unwrap();
+        assert_eq!(websocket.r#type, "ws");
+        let V2RayTransportConfig::WebSocket(websocket) = websocket.config else { panic!() };
+        assert_eq!(websocket.path, "/socket");
+        assert_eq!(websocket.headers["X-Test"].0, ["one", "two"]);
+        assert_eq!(websocket.max_early_data, 2048);
+        assert_eq!(websocket.early_data_header_name, "Sec-WebSocket-Protocol");
+
+        let http: V2RayTransportOptions =
+            serde_json::from_str(r#"{"type":"http","host":"one.test","path":"/proxy","idle_timeout":"15s"}"#).unwrap();
+        let V2RayTransportConfig::Http(http) = http.config else { panic!() };
+        assert_eq!(http.host.0, ["one.test"]);
+        assert_eq!(http.path, "/proxy");
+        assert_eq!(http.idle_timeout.0, std::time::Duration::from_secs(15));
+        assert!(http.ping_timeout.0.is_zero());
+
+        let grpc: V2RayTransportOptions = serde_json::from_str(
+            r#"{"type":"grpc","service_name":"edge","idle_timeout":"5s","ping_timeout":"2s","permit_without_stream":true}"#,
+        )
+        .unwrap();
+        let V2RayTransportConfig::Grpc(grpc) = grpc.config else { panic!() };
+        assert_eq!(grpc.service_name, "edge");
+        assert_eq!(grpc.idle_timeout.0, std::time::Duration::from_secs(5));
+        assert_eq!(grpc.ping_timeout.0, std::time::Duration::from_secs(2));
+        assert!(grpc.permit_without_stream);
+
+        let httpupgrade: V2RayTransportOptions =
+            serde_json::from_str(r#"{"type":"httpupgrade","host":"edge.test","path":"/upgrade"}"#).unwrap();
+        let V2RayTransportConfig::HttpUpgrade(httpupgrade) = httpupgrade.config else { panic!() };
+        assert_eq!((httpupgrade.host.as_str(), httpupgrade.path.as_str()), ("edge.test", "/upgrade"));
+        assert!(httpupgrade.headers.is_empty());
+
+        parse(r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc"}}]}"#).unwrap();
+
+        let quic: V2RayTransportOptions = serde_json::from_str(r#"{"type":"quic","key":"legacy"}"#).unwrap();
+        assert!(matches!(quic.config, V2RayTransportConfig::Quic(_)));
+
+        for transport in ["ws", "http", "grpc", "httpupgrade"] {
+            let config = format!(r#"{{"type":"{transport}","unknown_option":true}}"#);
+            let error = serde_json::from_str::<V2RayTransportOptions>(&config).unwrap_err().to_string();
+            assert!(error.contains("unknown field `unknown_option`"), "{config}: {error}");
         }
     }
 

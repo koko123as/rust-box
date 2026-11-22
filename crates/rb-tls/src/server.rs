@@ -33,6 +33,9 @@ struct Inner {
     crypto: Crypto,
     handshake_timeout: Duration,
     material: Mutex<Material>,
+    /// File watchers debounce each path independently, so certificate and
+    /// key reload callbacks must not publish stale copies concurrently.
+    reload_lock: Mutex<()>,
     config: RwLock<Arc<ServerConfig>>,
     watcher: Mutex<Option<rb_fswatch::Watcher>>,
 }
@@ -156,15 +159,32 @@ impl TlsServer {
                 },
                 crypto,
                 material: Mutex::new(material),
+                reload_lock: Mutex::new(()),
                 config: RwLock::new(Arc::new(config)),
                 watcher: Mutex::new(None),
             }),
         })
     }
 
+    /// Supplies transport ALPN protocols only when none were configured.
+    pub fn new_with_default_alpn(options: &InboundTlsOptions, default_alpn: &[&str]) -> Result<Self, String> {
+        let mut options = options.clone();
+        if options.alpn.0.is_empty() {
+            options.alpn.0 = default_alpn.iter().map(|protocol| (*protocol).to_owned()).collect();
+        }
+        Self::new(&options)
+    }
+
     /// The ALPN protocols offered (sing-box `NextProtos`).
     pub fn alpn(&self) -> Vec<String> {
         self.inner.options.alpn.0.clone()
+    }
+
+    /// Shares the current Rustls server configuration with QUIC transports.
+    /// The returned value is a snapshot; callers that need to observe later
+    /// certificate reloads should request it again for new connections.
+    pub fn rustls_config(&self) -> Arc<ServerConfig> {
+        self.inner.config.read().unwrap().clone()
     }
 
     pub fn handshake_timeout(&self) -> Duration {
@@ -237,11 +257,8 @@ fn absolute(path: &str) -> PathBuf {
 impl Inner {
     /// sing-box `certificateUpdated`.
     fn certificate_updated(&self, path: &Path) -> Result<(), String> {
-        // The certificate's and the key's callbacks fire on threads of their
-        // own; one at a time, or the second would put back the file the
-        // first just read.
-        static RELOAD: Mutex<()> = Mutex::new(());
-        let _reload = RELOAD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The per-server lock serializes callbacks for its certificate and key.
+        let _reload = self.reload_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let options = &self.options;
         let is = |configured: &str| !configured.is_empty() && absolute(configured) == path;
         let mut material = self.material.lock().unwrap().clone();

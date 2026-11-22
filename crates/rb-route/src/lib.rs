@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{
-    BoxStream, CachedPacketConn, ConnectionRouter, DnsResolver, Host, InboundContext, InboundRegistry, LookupOptions,
-    Network, Outbound, PacketConn, PrefixedStream, RouteError, SharedPacketConn, Socksaddr, MAX_PACKET_SIZE,
+    BoxStream, CachedPacketConn, ConnectionHandshake, ConnectionRouter, DnsResolver, Host, InboundContext,
+    InboundRegistry, LookupOptions, Network, Outbound, PacketConn, PrefixedStream, RouteError, SharedPacketConn,
+    Socksaddr, MAX_PACKET_SIZE,
 };
 use rb_config::{RejectMethod, RouteActionOptions, RouteOptions, RuleAction};
 use rb_dialer::tls_fragment::TlsFragmentStream;
@@ -337,6 +338,82 @@ impl Router {
         Ok(outbound)
     }
 
+    async fn route_connection_inner(
+        &self,
+        mut context: InboundContext,
+        client: &mut Option<BoxStream>,
+        handshake: Option<&dyn ConnectionHandshake>,
+        handshake_replied: &mut bool,
+    ) -> Result<(), RouteError> {
+        if let Some(detour) = context.inbound_detour.take() {
+            if handshake.is_some() {
+                return Err(RouteError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "inbound detour cannot preserve protocol handshakes",
+                )));
+            }
+            let inbound = self.detour_inbound(&context, &detour)?;
+            context.last_inbound = Some(std::mem::replace(&mut context.inbound, detour));
+            let client = client.take().expect("client stream is always given back");
+            return inbound.new_connection(context, client).await.map_err(RouteError::Io);
+        }
+        let decision = self.decide(&mut context, client).await?;
+        let tag = match decision {
+            Decision::Route(tag) => tag,
+            Decision::Reject(_) => {
+                info!(inbound = %context.inbound, destination = %context.destination, "rejected");
+                return Err(RouteError::Rejected);
+            }
+            Decision::HijackDns => {
+                if let Some(handshake) = handshake {
+                    *handshake_replied = true;
+                    handshake
+                        .success(client.as_mut().expect("client stream is always given back"))
+                        .await
+                        .map_err(RouteError::Io)?;
+                }
+                let client = client.take().expect("client stream is always given back");
+                if let Err(error) = self.hijack_dns_stream(&context, client).await {
+                    debug!(%error, "hijacked DNS connection closed");
+                }
+                return Ok(());
+            }
+        };
+        let outbound = self.outbound(&tag, Network::Tcp)?;
+        info!(
+            "outbound/{}[{}]: outbound connection to {}",
+            outbound.kind(),
+            tag,
+            context
+                .sniff_host
+                .as_ref()
+                .map(|host| format!("{host}:{}", context.destination.port))
+                .unwrap_or_else(|| context.destination.to_string())
+        );
+        let mut remote = outbound.dial_tcp(&context).await.map_err(RouteError::Dial)?;
+        if let Some(handshake) = handshake {
+            *handshake_replied = true;
+            handshake
+                .success(client.as_mut().expect("client stream is always given back"))
+                .await
+                .map_err(RouteError::Io)?;
+        }
+        let mut client = client.take().expect("client stream is always given back");
+        if context.tls_fragment || context.tls_record_fragment {
+            remote = Box::new(TlsFragmentStream::new(
+                remote,
+                context.tls_fragment,
+                context.tls_record_fragment,
+                context.tls_fragment_fallback_delay,
+            ));
+        }
+        match tokio::io::copy_bidirectional(&mut client, &mut remote).await {
+            Ok((up, down)) => debug!(destination = %context.destination, up, down, "connection closed"),
+            Err(error) => debug!(destination = %context.destination, %error, "connection closed"),
+        }
+        Ok(())
+    }
+
     /// Restores a FakeIP destination to its DNS name before route matching.
     fn reverse_fakeip(&self, context: &mut InboundContext) -> Result<(), RouteError> {
         let Some(address) = context.destination.ip() else { return Ok(()) };
@@ -585,53 +662,28 @@ async fn sniff_packets(
 
 #[async_trait]
 impl ConnectionRouter for Router {
-    async fn route_connection(&self, mut context: InboundContext, client: BoxStream) -> Result<(), RouteError> {
-        if let Some(detour) = context.inbound_detour.take() {
-            let inbound = self.detour_inbound(&context, &detour)?;
-            context.last_inbound = Some(std::mem::replace(&mut context.inbound, detour));
-            return inbound.new_connection(context, client).await.map_err(RouteError::Io);
-        }
+    async fn route_connection(&self, context: InboundContext, client: BoxStream) -> Result<(), RouteError> {
         let mut client = Some(client);
-        let decision = self.decide(&mut context, &mut client).await?;
-        let mut client = client.expect("client stream is always given back");
-        let tag = match decision {
-            Decision::Route(tag) => tag,
-            Decision::Reject(_) => {
-                info!(inbound = %context.inbound, destination = %context.destination, "rejected");
-                return Err(RouteError::Rejected);
-            }
-            Decision::HijackDns => {
-                if let Err(error) = self.hijack_dns_stream(&context, client).await {
-                    debug!(%error, "hijacked DNS connection closed");
+        self.route_connection_inner(context, &mut client, None, &mut false).await
+    }
+
+    async fn route_connection_with_handshake(
+        &self,
+        context: InboundContext,
+        client: BoxStream,
+        handshake: &dyn ConnectionHandshake,
+    ) -> Result<(), RouteError> {
+        let mut client = Some(client);
+        let mut handshake_replied = false;
+        let result = self.route_connection_inner(context, &mut client, Some(handshake), &mut handshake_replied).await;
+        if !handshake_replied {
+            if let Err(error) = &result {
+                if let Some(client) = client.as_mut() {
+                    handshake.failure(client, error).await.map_err(RouteError::Io)?;
                 }
-                return Ok(());
             }
-        };
-        let outbound = self.outbound(&tag, Network::Tcp)?;
-        info!(
-            "outbound/{}[{}]: outbound connection to {}",
-            outbound.kind(),
-            tag,
-            context
-                .sniff_host
-                .as_ref()
-                .map(|host| format!("{host}:{}", context.destination.port))
-                .unwrap_or_else(|| context.destination.to_string())
-        );
-        let mut remote = outbound.dial_tcp(&context).await.map_err(RouteError::Dial)?;
-        if context.tls_fragment || context.tls_record_fragment {
-            remote = Box::new(TlsFragmentStream::new(
-                remote,
-                context.tls_fragment,
-                context.tls_record_fragment,
-                context.tls_fragment_fallback_delay,
-            ));
         }
-        match tokio::io::copy_bidirectional(&mut client, &mut remote).await {
-            Ok((up, down)) => debug!(destination = %context.destination, up, down, "connection closed"),
-            Err(error) => debug!(destination = %context.destination, %error, "connection closed"),
-        }
-        Ok(())
+        result
     }
 
     async fn route_packet_connection(

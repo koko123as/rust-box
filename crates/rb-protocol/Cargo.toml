@@ -18,6 +18,13 @@ rb-mux.workspace = true
 rb-platform.workspace = true
 httparse.workspace = true
 tokio.workspace = true
+h2.workspace = true
+bytes.workspace = true
+http.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 base64.workspace = true
@@ -33,6 +40,7 @@ cfb-mode.workspace = true
 hmac.workspace = true
 sha3.workspace = true
 crc32fast.workspace = true
+quinn.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
