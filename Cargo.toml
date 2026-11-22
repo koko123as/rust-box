@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/quinn-proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -73,3 +74,6 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
