@@ -12,6 +12,12 @@ const MAX_MESSAGE_LEN: usize = 2048;
 const MAX_PADDING_LEN: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpRequestPrefix {
+    pub destination: String,
+    pub consumed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpResponsePrefix {
     pub status: u8,
     pub message: Vec<u8>,
@@ -67,6 +73,52 @@ pub fn encode_tcp_request(destination: &str, padding: &[u8]) -> io::Result<Vec<u
     Ok(output)
 }
 
+/// Decodes a Hysteria2 TCP request prefix, including its frame type and padding.
+pub fn decode_tcp_request_prefix(input: &[u8]) -> io::Result<TcpRequestPrefix> {
+    let mut position = 0;
+    if take_varint(input, &mut position)? != TCP_REQUEST_FRAME {
+        return Err(invalid("invalid Hysteria2 TCP request frame type"));
+    }
+    let address_length = usize::try_from(take_varint(input, &mut position)?)
+        .map_err(|_| invalid("Hysteria2 TCP destination length overflow"))?;
+    if address_length == 0 || address_length > MAX_DESTINATION_LEN {
+        return Err(invalid("invalid Hysteria2 TCP destination length"));
+    }
+    let address_end = position.checked_add(address_length).ok_or_else(|| invalid("length overflow"))?;
+    let destination =
+        std::str::from_utf8(input.get(position..address_end).ok_or_else(|| invalid("truncated TCP destination"))?)
+            .map_err(|_| invalid("Hysteria2 TCP destination is not UTF-8"))?
+            .to_owned();
+    position = address_end;
+    let padding_length = usize::try_from(take_varint(input, &mut position)?)
+        .map_err(|_| invalid("Hysteria2 TCP padding length overflow"))?;
+    if padding_length > MAX_PADDING_LEN {
+        return Err(invalid("Hysteria2 TCP padding exceeds the limit"));
+    }
+    let consumed = position.checked_add(padding_length).ok_or_else(|| invalid("length overflow"))?;
+    if input.get(position..consumed).is_none() {
+        return Err(invalid("truncated Hysteria2 TCP padding"));
+    }
+    Ok(TcpRequestPrefix { destination, consumed })
+}
+
+/// Encodes the server reply prefix before proxied TCP payload bytes.
+pub fn encode_tcp_response_prefix(status: u8, message: &[u8], padding: &[u8]) -> io::Result<Vec<u8>> {
+    if message.len() > MAX_MESSAGE_LEN {
+        return Err(invalid("Hysteria2 TCP response message exceeds the limit"));
+    }
+    if padding.len() > MAX_PADDING_LEN {
+        return Err(invalid("Hysteria2 TCP response padding exceeds the limit"));
+    }
+    let mut output = Vec::with_capacity(1 + 16 + message.len() + padding.len());
+    output.push(status);
+    put_varint(&mut output, message.len() as u64)?;
+    output.extend_from_slice(message);
+    put_varint(&mut output, padding.len() as u64)?;
+    output.extend_from_slice(padding);
+    Ok(output)
+}
+
 /// Decodes the server's TCP response prefix, preserving its message bytes.
 /// `consumed` identifies the first byte of proxied TCP payload, if any.
 pub fn decode_tcp_response_prefix(input: &[u8]) -> io::Result<TcpResponsePrefix> {
@@ -110,6 +162,25 @@ mod tests {
     }
 
     #[test]
+    fn tcp_request_prefix_decodes_destination_and_padding() {
+        let encoded = encode_tcp_request("[2001:db8::1]:443", b"random pad").unwrap();
+        let decoded = decode_tcp_request_prefix(&encoded).unwrap();
+        assert_eq!(decoded.destination, "[2001:db8::1]:443");
+        assert_eq!(decoded.consumed, encoded.len());
+    }
+
+    #[test]
+    fn tcp_response_encoder_matches_decoder_and_rejects_oversized_fields() {
+        let encoded = encode_tcp_response_prefix(0, b"", b"server padding").unwrap();
+        let decoded = decode_tcp_response_prefix(&encoded).unwrap();
+        assert_eq!(decoded.status, 0);
+        assert!(decoded.message.is_empty());
+        assert_eq!(decoded.consumed, encoded.len());
+        assert!(encode_tcp_response_prefix(1, &vec![0; MAX_MESSAGE_LEN + 1], b"").is_err());
+        assert!(encode_tcp_response_prefix(1, b"", &vec![0; MAX_PADDING_LEN + 1]).is_err());
+    }
+
+    #[test]
     fn tcp_response_prefix_preserves_status_message_padding_and_payload_boundary() {
         let mut encoded = vec![0];
         put_varint(&mut encoded, 3).unwrap();
@@ -138,5 +209,6 @@ mod tests {
         assert!(encode_tcp_request("", b"").is_err());
         assert!(encode_tcp_request(&"x".repeat(MAX_DESTINATION_LEN + 1), b"").is_err());
         assert!(encode_tcp_request("example.com:443", &vec![0; MAX_PADDING_LEN + 1]).is_err());
+        assert!(decode_tcp_request_prefix(&[0]).is_err());
     }
 }
