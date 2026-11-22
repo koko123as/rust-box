@@ -1442,6 +1442,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-group"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "httparse",
+ "rb-adapter",
+ "rb-cachefile",
+ "rb-certificate",
+ "rb-config",
+ "rb-tls",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rb-mux"
 version = "0.1.0"
 dependencies = [
