@@ -246,6 +246,7 @@ fn emit_client_hello_for_retry(
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
         protocols: extra_exts.protocols.clone(),
+        application_settings: extra_exts.application_settings.clone(),
         ..Default::default()
     });
 

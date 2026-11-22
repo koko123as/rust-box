@@ -777,6 +777,9 @@ pub(crate) struct ClientExtensionsInput<'a> {
 
     /// ALPN protocols
     pub(crate) protocols: Option<Vec<ProtocolName>>,
+
+    /// ALPS protocols
+    pub(crate) application_settings: Option<Vec<ProtocolName>>,
 }
 
 impl ClientExtensionsInput<'_> {
@@ -794,17 +797,33 @@ impl ClientExtensionsInput<'_> {
         ClientExtensionsInput {
             transport_parameters: None,
             protocols,
+            application_settings: None,
         }
+    }
+
+    pub(crate) fn with_application_settings(
+        mut self,
+        supported_protocols: Vec<Vec<u8>>,
+    ) -> Self {
+        self.application_settings = Some(
+            supported_protocols
+                .into_iter()
+                .map(ProtocolName::from)
+                .collect(),
+        );
+        self
     }
 
     pub(crate) fn into_owned(self) -> ClientExtensionsInput<'static> {
         let Self {
             transport_parameters,
             protocols,
+            application_settings,
         } = self;
         ClientExtensionsInput {
             transport_parameters: transport_parameters.map(|x| x.into_owned()),
             protocols,
+            application_settings,
         }
     }
 }

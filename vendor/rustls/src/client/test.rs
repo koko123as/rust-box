@@ -58,6 +58,10 @@ mod tests {
         let baseline = client_hello_sent_for_config(config.clone()).unwrap();
         let typed_extensions = baseline.extensions.collect_used();
         assert!(typed_extensions.contains(&ExtensionType::KeyShare));
+        assert!(!typed_extensions.contains(&ExtensionType::ApplicationSettings));
+        config.application_settings_protocols = Some(vec![b"h2".to_vec()]);
+        let mut typed_extensions = typed_extensions;
+        typed_extensions.push(ExtensionType::ApplicationSettings);
 
         let mut profile_entries = vec![
             ClientHelloExtensionProfileEntry::Grease { payload: vec![0x41] },
@@ -86,6 +90,12 @@ mod tests {
             first_extensions[1],
             (ExtensionType::Unknown(0x1234), vec![0xaa, 0xbb])
         );
+        let application_settings = first_extensions
+            .iter()
+            .find(|(extension_type, _)| *extension_type == ExtensionType::ApplicationSettings)
+            .unwrap();
+        assert_eq!(u16::from(application_settings.0), 0x44cd);
+        assert_eq!(application_settings.1.as_slice(), b"\x00\x03\x02h2");
         let first_extension_types = first_extensions
             .iter()
             .map(|(extension_type, _)| *extension_type)
@@ -119,6 +129,14 @@ mod tests {
         let mut retry_bytes = Vec::new();
         conn.write_tls(&mut retry_bytes).unwrap();
         let retry_extensions = client_hello_extensions_from_wire(&retry_bytes);
+        assert_eq!(
+            retry_extensions
+                .iter()
+                .find(|(extension_type, _)| *extension_type == ExtensionType::ApplicationSettings),
+            first_extensions
+                .iter()
+                .find(|(extension_type, _)| *extension_type == ExtensionType::ApplicationSettings)
+        );
         assert_eq!(retry_extensions[0].0, grease_extension);
         assert_eq!(
             retry_extensions[1],

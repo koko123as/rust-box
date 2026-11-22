@@ -292,6 +292,9 @@ pub struct ClientConfig {
     /// Optional internal ClientHello extension profile; absent by default.
     pub(super) client_hello_extension_profile: Option<ClientHelloExtensionProfile>,
 
+    /// Optional ALPS protocol list; absent by default.
+    pub(super) application_settings_protocols: Option<Vec<Vec<u8>>>,
+
     /// Request a specific number of TLS 1.3 session tickets via [RFC 9149].
     ///
     /// Set to `None` to disable sending the extension (the default).
@@ -878,6 +881,15 @@ impl ConnectionCore<ClientConnectionData> {
         extra_exts: ClientExtensionsInput<'static>,
         proto: Protocol,
     ) -> Result<Self, Error> {
+        let extra_exts = if proto == Protocol::Tcp {
+            match &config.application_settings_protocols {
+                Some(protocols) => extra_exts.with_application_settings(protocols.clone()),
+                None => extra_exts,
+            }
+        } else {
+            extra_exts
+        };
+
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
         common_state.protocol = proto;

@@ -186,6 +186,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
             ech_mode: self.state.client_ech_mode,
             client_hello_extension_profile: None,
+            application_settings_protocols: None,
             send_ticket_request: None,
         }
     }
