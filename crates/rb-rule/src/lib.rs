@@ -11,6 +11,7 @@
 //! rule's groups, and destination IP items can be deferred until the DNS
 //! response is known (the legacy DNS address filter).
 
+mod clash_mode;
 mod items;
 mod rule_set;
 
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use hickory_proto::rr::Record;
 use rb_config::{DefaultHeadlessRule, DnsRuleMatch, HeadlessRule, LogicalMode, Rule, RuleMatch};
 
+pub use clash_mode::ClashMode;
 use items::Item;
 pub use items::{is_private, parse_port_ranges};
 pub use rule_set::{
@@ -421,11 +423,14 @@ pub struct Context<'a> {
     /// items of headless rules when it does (it does in a box, not in the
     /// `rule-set match` command).
     pub network_manager: bool,
+    /// The Clash mode `clash_mode` items read; without one (no Clash API)
+    /// they never match.
+    pub clash_mode: Option<Arc<ClashMode>>,
 }
 
 impl<'a> Context<'a> {
     pub fn new(rule_sets: &'a RuleSets) -> Self {
-        Context { rule_sets, legacy_dns_mode: false, network_manager: true }
+        Context { rule_sets, legacy_dns_mode: false, network_manager: true, clash_mode: None }
     }
 }
 
@@ -599,6 +604,17 @@ fn dns_response_code_name(rcode: i32) -> &'static str {
     }
 }
 
+/// `ClashModeItem`.
+fn add_clash_mode(matcher: &mut DefaultMatcher, mode: &str, context: &Context) {
+    if !mode.is_empty() {
+        matcher.push(
+            |m| &mut m.items,
+            Item::ClashMode { mode: mode.to_string(), current: context.clash_mode.clone() },
+            format!("clash_mode={mode}"),
+        );
+    }
+}
+
 /// Compiles a route rule's match fields (sing-box `NewDefaultRule`).
 pub fn compile_route_match(options: &RuleMatch, context: &Context) -> Result<DefaultMatcher, RuleError> {
     let mut matcher = DefaultMatcher { invert: options.invert, ..Default::default() };
@@ -633,6 +649,7 @@ pub fn compile_route_match(options: &RuleMatch, context: &Context) -> Result<Def
         &options.port.0,
         &options.port_range.0,
     )?;
+    add_clash_mode(&mut matcher, &options.clash_mode, context);
     if !options.rule_set.is_empty() {
         if options.rule_set_ipcidr_match_source {
             return Err(error(
@@ -711,6 +728,7 @@ pub fn compile_dns_match(options: &DnsRuleMatch, context: &Context) -> Result<De
         &options.port.0,
         &options.port_range.0,
     )?;
+    add_clash_mode(&mut matcher, &options.clash_mode, context);
     if options.rule_set_ip_cidr_accept_empty && !context.legacy_dns_mode {
         return Err(error(rb_config::deprecated::RULE_SET_IP_CIDR_ACCEPT_EMPTY.message_with_link()));
     }

@@ -5,6 +5,7 @@
 //! where a rule's address limit is checked against the response and the
 //! walk goes on when it fails) and the default mode.
 
+mod storage;
 mod transport;
 
 mod mode;
@@ -26,6 +27,7 @@ use rb_rule::{
     RuleSets,
 };
 
+pub use storage::{DnsCacheStore, DnsStorage, FakeIpMetadata, FakeIpStorage, RdrcStore};
 pub use transport::{
     Answer, DohTransport, DoqTransport, DotTransport, FakeIpTransport, H3Transport, HostsTransport, Transport, QTYPE_A,
     QTYPE_AAAA,
@@ -347,6 +349,8 @@ pub struct DnsRouter {
     strategy: DomainStrategy,
     timeout: Duration,
     cache: Option<Mutex<Cache>>,
+    /// What `clash_mode` rule items read (set by the Clash API).
+    clash_mode: RwLock<Option<Arc<rb_rule::ClashMode>>>,
 }
 
 #[derive(Default)]
@@ -658,6 +662,7 @@ impl DnsRouter {
             strategy: options.strategy,
             timeout,
             cache,
+            clash_mode: RwLock::new(None),
         });
         *dns_resolver.router.write().unwrap() = Some(Arc::downgrade(&router));
         let (rules, _) = router.build_rules(rule_sets)?;
@@ -673,7 +678,8 @@ impl DnsRouter {
         if !legacy {
             mode::validate_disabled_rules(&self.raw_rules, &lookup).map_err(DnsError)?;
         }
-        let context = RuleContext { rule_sets, legacy_dns_mode: legacy, network_manager: true };
+        let clash_mode = self.clash_mode.read().unwrap().clone();
+        let context = RuleContext { rule_sets, legacy_dns_mode: legacy, network_manager: true, clash_mode };
         let rules = self
             .raw_rules
             .iter()
@@ -684,6 +690,19 @@ impl DnsRouter {
             })
             .collect::<Result<_, _>>()?;
         Ok((DnsRules { rules, legacy }, flags))
+    }
+
+    /// The Clash mode `clash_mode` rule items read; set before
+    /// [`DnsRouter::start`] builds the rules.
+    pub fn set_clash_mode(&self, clash_mode: Arc<rb_rule::ClashMode>) {
+        *self.clash_mode.write().unwrap() = Some(clash_mode);
+    }
+
+    /// `Router.ClearCache`: drops the cached answers.
+    pub fn clear_cache(&self) {
+        if let Some(cache) = &self.cache {
+            cache.lock().unwrap().entries.clear();
+        }
     }
 
     /// Builds the rules with the loaded rule-sets (sing-box `Router.Start`).

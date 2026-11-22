@@ -54,6 +54,8 @@ pub struct RuleMatch {
     #[serde(default)]
     pub port_range: Listable<String>,
     #[serde(default)]
+    pub clash_mode: String,
+    #[serde(default)]
     pub rule_set: Listable<String>,
     #[serde(default)]
     pub rule_set_ip_cidr_match_source: bool,
@@ -101,6 +103,8 @@ pub struct DnsRuleMatch {
     pub port: Listable<u16>,
     #[serde(default)]
     pub port_range: Listable<String>,
+    #[serde(default)]
+    pub clash_mode: String,
     #[serde(default)]
     pub rule_set: Listable<String>,
     #[serde(default)]

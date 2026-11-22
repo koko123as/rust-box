@@ -20,6 +20,12 @@ use async_trait::async_trait;
 use rb_config::DomainStrategy;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+mod track;
+pub use track::{
+    real_tag, Attachment, ConnectionTracker, HistoryStorage, Interrupt, InterruptPacketConn, InterruptStream,
+    OutboundGroup, RoutedConnection, UrlTestHistory,
+};
+
 /// A host: a domain name or an IP address (sing-box `M.Socksaddr`'s `Fqdn`/`Addr`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Host {
@@ -348,6 +354,11 @@ pub trait Outbound: Send + Sync {
             io::ErrorKind::Unsupported,
             format!("outbound/{}[{}]: UDP is not supported", self.kind(), self.tag()),
         ))
+    }
+    /// The group behind this outbound, when it is one (sing-box
+    /// `adapter.OutboundGroup`).
+    fn group(&self) -> Option<&dyn OutboundGroup> {
+        None
     }
 }
 

@@ -150,6 +150,14 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
                     built
                 }
+                // The group outbounds are parsed and checked; running them is
+                // not wired up yet.
+                OutboundOptions::Selector(_) => {
+                    return Err(anyhow!("outbounds[{index}]: `selector` is not supported by rust-box yet"))
+                }
+                OutboundOptions::UrlTest(_) => {
+                    return Err(anyhow!("outbounds[{index}]: `urltest` is not supported by rust-box yet"))
+                }
             });
         }
         if outbounds.is_empty() {
