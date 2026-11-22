@@ -10,16 +10,16 @@ licensed GPL-3.0-or-later, like sing-box (see `LICENSE` and `COPYING`).
 
 ## Status
 
-Milestones 1 (the core path), 2 (UDP), 3 (dial options and outbound
-plumbing), 4 (rule-sets), 5 (TLS and the first encrypted protocols) and
-6 (DNS) are in place:
+Milestones 1–7 are in place: the core path, UDP, dial and outbound plumbing,
+rule-sets, TLS and encrypted protocols, DNS, V2Ray transports (WebSocket,
+HTTP/2, gRPC and HTTPUpgrade), and the Hysteria2/TUIC QUIC protocols:
 
 | Area | Implemented | sing-box reference |
 |---|---|---|
 | Configuration | sing-box JSON for the sections below; unknown fields and sections rust-box lacks are rejected with their path | `option/` |
-| Inbounds | `mixed`, `socks` (4, 4a, 5 CONNECT and UDP ASSOCIATE, users, `udp_timeout`), `http` (CONNECT and plain requests, Basic auth), `shadowsocks` (none, AEAD, 2022; users, 2022 relay `destinations`, UDP over TCP), `trojan` (TCP, UDP, `fallback`, `fallback_for_alpn`, TLS), `vless` (TCP, UDP, packetaddr, XUDP / mux sessions, `xtls-rprx-vision`, UDP over TCP, TLS), `vmess` (AEAD and legacy `alterId` headers, every `security`, anti-replay, TCP, UDP, packetaddr, XUDP, TLS); TLS on `http` and `mixed`; `multiplex` on `shadowsocks`, `trojan`, `vless`, `vmess` | `protocol/{mixed,socks,http,shadowsocks,trojan,vless,vmess}` |
+| Inbounds | `mixed`, `socks` (4, 4a, 5 CONNECT and UDP ASSOCIATE, users, `udp_timeout`), `http` (CONNECT and plain requests, Basic auth), `shadowsocks` (none, AEAD, 2022; users, 2022 relay `destinations`, UDP over TCP), `trojan` (TCP, UDP, `fallback`, `fallback_for_alpn`, TLS), `vless` (TCP, UDP, packetaddr, XUDP / mux sessions, `xtls-rprx-vision`, UDP over TCP, TLS), `vmess` (AEAD and legacy `alterId` headers, every `security`, anti-replay, TCP, UDP, packetaddr, XUDP, TLS), `hysteria2` (TCP/UDP, TLS, password users), `tuic` (v5 TCP/UDP, TLS, UUID/password users); TLS on `http` and `mixed`; `multiplex` on `shadowsocks`, `trojan`, `vless`, `vmess` | `protocol/{mixed,socks,http,shadowsocks,trojan,vless,vmess,hysteria2,tuic}` |
 | Inbounds: listen fields | `listen` (default `127.0.0.1`), `listen_port`, `bind_interface`, `routing_mark`, `reuse_addr`, `netns`, `tcp_fast_open`, `tcp_multi_path`, `tcp_keep_alive*`, `udp_timeout`, `udp_fragment`, `detour` (hand-over to another inbound); legacy fields rejected as in v1.14.4 | `option/inbound.go`, `common/listener` |
-| Outbounds | `direct` (TCP and UDP, happy-eyeballs with `fallback_delay`), `block`, `shadowsocks` (none, AEAD, 2022 with identity headers, legacy stream ciphers, `udp_over_tcp`), `trojan` (TCP, UDP, TLS), `vless` (TCP, UDP with `packet_encoding` `xudp` / `packetaddr` / none, `xtls-rprx-vision` with direct copy, TLS), `vmess` (`security` auto, none, zero, aes-128-gcm, chacha20-poly1305, aes-128-cfb with `alter_id`; `global_padding`, `authenticated_length`, `packet_encoding`, TLS), `socks` (4, 4a, 5 with UDP; `udp_over_tcp` not supported yet), `http` (CONNECT, TLS); `multiplex` on `shadowsocks`, `trojan`, `vless`, `vmess` | `protocol/{direct,block,shadowsocks,trojan,vless,vmess,socks,http}` |
+| Outbounds | `direct` (TCP and UDP, happy-eyeballs with `fallback_delay`), `block`, `shadowsocks` (none, AEAD, 2022 with identity headers, legacy stream ciphers, `udp_over_tcp`), `trojan` (TCP, UDP, TLS), `vless` (TCP, UDP with `packet_encoding` `xudp` / `packetaddr` / none, `xtls-rprx-vision` with direct copy, TLS), `vmess` (`security` auto, none, zero, aes-128-gcm, chacha20-poly1305, aes-128-cfb with `alter_id`; `global_padding`, `authenticated_length`, `packet_encoding`, TLS), `hysteria2` (TCP/UDP, TLS, Brutal), `tuic` (v5 TCP, native UDP, TLS), `socks` (4, 4a, 5 with UDP; `udp_over_tcp` not supported yet), `http` (CONNECT, TLS); `multiplex` on `shadowsocks`, `trojan`, `vless`, `vmess` | `protocol/{direct,block,shadowsocks,trojan,vless,vmess,hysteria2,tuic,socks,http}` |
 | TLS | `tls` on inbounds and outbounds on rustls: `server_name`, `insecure`, `alpn`, `min_version`/`max_version` (1.2, 1.3), `cipher_suites`, `curve_preferences`, `certificate*`, `key*` (reloaded when the files change), client certificates (`client_authentication`, `client_certificate*`, `client_key*`), `handshake_timeout`, `fragment`, `record_fragment` | `common/tls` |
 | Multiplex | sing-mux client and server (`rb-mux`): `smux`, `yamux`, `h2mux`, `padding`, `max_connections`, `min_streams`, `max_streams`, UDP over packetaddr; trojan-go multiplex on `trojan` | `sing-mux`, `common/mux` |
 | Dial fields | all of `shared/dial`: `detour`, `bind_interface`, `inet4/6_bind_address`, `bind_address_no_port`, `protect_path`, `routing_mark`, `reuse_addr`, `netns`, `connect_timeout`, `tcp_fast_open`, `tcp_multi_path`, keep-alive, `udp_fragment`, `domain_resolver`, `fallback_delay`, deprecated `domain_strategy`, `network_strategy`/`network_type`/`fallback_network_type` (no effect, as in sing-box's command line); on `direct` and on `udp`/`tcp` DNS servers; `route.default_interface`, `route.default_mark` | `option/outbound.go`, `common/dialer` |
@@ -32,8 +32,8 @@ plumbing), 4 (rule-sets), 5 (TLS and the first encrypted protocols) and
 | DNS | `local`, `udp`, `tcp`, `tls` (DoT), `https` (DoH), `quic` (DoQ), `h3` servers; `hosts` with predefined mappings, in-memory `fakeip`; rules with `evaluate`/`respond` and `match_response`; `final`, `strategy`, cache | `dns/` |
 | CLI | `run`, `check`, `version`; `rule-set compile`, `decompile`, `format`, `upgrade`, `merge`, `match`, `convert` (AdGuard) | `cmd/sing-box` |
 
-Not yet: TUN, Hysteria2, TUIC, TCP Brutal (`multiplex.brutal`), V2Ray
-transports (`transport`), uTLS / REALITY, ECH, Clash API and `tls_spoof`.
+Not yet: TUN, TCP Brutal (`multiplex.brutal`), uTLS / REALITY, ECH, Clash API
+and `tls_spoof`.
 The `network_strategy` family of fields (dial fields,
 route option, `route.default_network_*`) only works with a platform
 interface in sing-box's graphical clients; rust-box handles them as
@@ -58,6 +58,22 @@ M9). Windows' default hosts path is built from `%SystemRoot%\System32`, unlike
 sing-box's `GetSystemDirectory` lookup. The full workspace suite passed, but
 DNS transports were not directly interoperability-tested against sing-box;
 their transport tests use local fixtures. See `docs/roadmap.md` for details.
+
+### Known differences in milestone 7
+
+Hysteria2/TUIC TCP and UDP paths, authentication and session cleanup are
+implemented. The workspace suite passed 400 tests with 0 failures and 1
+ignored doc test, including interoperability with the pinned sing-box v1.14.4
+binary. Remaining differences and unverified scenarios are listed in
+`docs/roadmap.md`.
+
+Hysteria2 outbound supports Brutal negotiation but not BBR-meta2; Hysteria2
+inbound accepts Brutal and Meta2. Hysteria2 obfuscation, masquerade, realm,
+port hopping, `bbr_profile`, and `brutal_debug` are not implemented. TUIC
+supports cubic/default congestion control and native UDP relay, but not 0-RTT,
+UDP-over-stream, QUIC-stream relay mode, BBR, or New Reno. High-loss/high-latency
+networks, extreme MTUs, long-duration runs, and high-concurrency load have not
+been verified.
 
 ## Build and run
 
