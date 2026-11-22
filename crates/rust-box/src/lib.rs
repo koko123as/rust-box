@@ -18,8 +18,9 @@ use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions}
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_protocol::{
-    Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
-    TrojanInbound, TrojanOutbound, VlessInbound, VlessOutbound, VmessInbound, VmessOutbound,
+    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, ProxyInbound, ProxyKind, ShadowsocksInbound,
+    ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound, VlessInbound,
+    VlessOutbound, VmessInbound, VmessOutbound,
 };
 use rb_route::Router;
 use rb_rule::{RuleSet, RuleSets};
@@ -150,6 +151,15 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
                     built
                 }
+                OutboundOptions::Tuic(tuic) => {
+                    let built: Arc<dyn Outbound> = TuicOutbound::new(tuic, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
+                    built
+                }
+                OutboundOptions::Hysteria2(hysteria2) => {
+                    Hysteria2Outbound::new(hysteria2, tag, &dialer_env, &certificates, &format!("outbounds[{index}]"))
+                        .map_err(anyhow::Error::msg)?
+                }
             });
         }
         if outbounds.is_empty() {
@@ -195,6 +205,14 @@ impl RustBox {
                 ),
                 InboundOptions::Vmess(vmess) => Arc::new(
                     VmessInbound::new(vmess, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Tuic(tuic) => Arc::new(
+                    TuicInbound::new(tuic, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Hysteria2(hysteria2) => Arc::new(
+                    Hysteria2Inbound::new(hysteria2, tag, connection_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
             };

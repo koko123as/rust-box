@@ -44,7 +44,7 @@ silently ignored.
    multiplex (`sing-mux`).
 6. **DNS**: DoT, DoH, DoQ/DoH3, `hosts`, `fakeip`, `predefined`, `evaluate`,
    `match_response`.
-7. **V2Ray transports and QUIC protocols**: WebSocket, HTTP/2, gRPC,
+7. **V2Ray transports and QUIC protocols** (done): WebSocket, HTTP/2, gRPC,
    HTTPUpgrade; `hysteria2`, `tuic`.
 8. **TUN**: Linux and Android TUN, a user-space TCP/IP stack, auto_route, the
    platform interface for Android VpnService.
@@ -277,3 +277,25 @@ sing-box v1.14.4 binary in both directions (`SING_BOX_BIN`).
   interoperability test against sing-box v1.14.4. DoT/DoH/DoQ/DoH3 transport
   tests use local fixtures; live public resolvers and non-Linux platforms have
   not been verified.
+
+## Known differences in milestone 7
+
+Milestone 7 is complete. The final workspace run with the pinned sing-box
+v1.14.4 binary passed 400 tests, with 0 failures and 1 ignored doc test; the
+Hysteria2, TUIC and V2Ray-transport interoperability cases passed. The four PR
+CI jobs (fmt/clippy/test, MSRV 1.88, x86_64 Linux release and aarch64 Android
+release) also passed. Unsupported configuration is rejected with its field
+path rather than silently ignored.
+
+- Hysteria2 outbound supports Brutal negotiation but rejects BBR-meta2;
+  Hysteria2 inbound accepts both Brutal and Meta2. Hysteria2 obfuscation
+  (`obfs`), `masquerade`, `realm`, inbound `detour`, outbound port hopping
+  (`server_ports`, `hop_interval`, `hop_interval_max`), `bbr_profile` and
+  `brutal_debug` are not implemented. The outbound also requires
+  `disable_chrome_parrot: true`; Chrome-parrot behavior is not implemented.
+- TUIC supports default/cubic congestion control and native UDP DATAGRAM
+  relay on the outbound, but not `zero_rtt_handshake`, `udp_over_stream`,
+  `udp_relay_mode: quic`, `bbr` or `new_reno` congestion control.
+- High-packet-loss or high-latency networks, extreme MTUs, long-duration
+  runs and high-concurrency load were not part of this milestone's
+  verification.

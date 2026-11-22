@@ -28,6 +28,7 @@ pub struct VmessOutbound {
     tag: String,
     dialer: Arc<dyn Dialer>,
     tls: Option<rb_tls::TlsClient>,
+    transport: Option<crate::v2ray::StreamTransport>,
     server: Socksaddr,
     client: ClientConfig,
     packet_encoding: VmessPacketEncoding,
@@ -45,6 +46,7 @@ impl VmessOutbound {
         certificates: &Arc<rb_certificate::Store>,
     ) -> Result<Arc<Self>, String> {
         let server = Socksaddr::from_host_port(&options.server, options.server_port);
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let dialer = new_outbound_dialer(
             &options.dialer_options(),
             server.domain().is_some(),
@@ -55,9 +57,11 @@ impl VmessOutbound {
             Some(tls) => Some(rb_tls::TlsClient::new(tls, &options.server, certificates)?),
             None => None,
         };
-        if options.transport.is_some() {
-            return Err("`transport` is not supported by rust-box yet".into());
-        }
+        let tls = if transport.is_some() {
+            tls.map(|tls| crate::v2ray::transport_tls_client(tls, transport.as_ref()))
+        } else {
+            tls
+        };
         let multiplex = crate::multiplex::client_options(options.multiplex.as_ref())?;
         let packet_encoding = match options.packet_encoding.as_str() {
             "" => VmessPacketEncoding::None,
@@ -87,6 +91,7 @@ impl VmessOutbound {
             tag,
             dialer,
             tls,
+            transport,
             server,
             client,
             packet_encoding,
@@ -97,10 +102,17 @@ impl VmessOutbound {
 
     async fn dial_server(&self) -> io::Result<BoxStream> {
         let stream = self.dialer.dial_tcp(&self.server).await?;
-        match &self.tls {
-            Some(tls) => Ok(Box::new(tls.handshake(stream).await?)),
-            None => Ok(stream),
+        let mut stream: BoxStream = match &self.tls {
+            Some(tls) => Box::new(tls.handshake(stream).await?),
+            None => stream,
+        };
+        if let Some(transport) = &self.transport {
+            let tls_server_name = self.tls.as_ref().map(|tls| tls.server_name());
+            stream =
+                crate::v2ray::transport_client(stream, &self.server, transport, tls_server_name, self.tls.is_some())
+                    .await?;
         }
+        Ok(stream)
     }
 
     /// A VMess TCP connection to `destination` with its request sent

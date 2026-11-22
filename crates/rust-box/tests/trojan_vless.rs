@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use rust_box::RustBox;
@@ -23,6 +23,25 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const UUID: &str = "bf000d23-0752-40b4-affe-68f7707a9661";
 const VISION: &str = "xtls-rprx-vision";
+
+fn init_test_logging() {
+    if std::env::var_os("RUST_BOX_TEST_LOG").is_none() {
+        return;
+    }
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+            .with_test_writer()
+            .try_init();
+    });
+}
+
+fn test_progress(message: &str) {
+    if std::env::var_os("RUST_BOX_TEST_LOG").is_some() {
+        eprintln!("interop test: {message}");
+    }
+}
 
 async fn tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36,6 +55,31 @@ async fn tcp_echo() -> SocketAddr {
         }
     });
     address
+}
+
+struct TcpAcceptObserver {
+    address: SocketAddr,
+    accepted: tokio::sync::mpsc::UnboundedReceiver<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TcpAcceptObserver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn tcp_accept_observer() -> TcpAcceptObserver {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = accepted_tx.send(());
+            drop(stream);
+        }
+    });
+    TcpAcceptObserver { address, accepted, task }
 }
 
 /// A TCP server that writes `banner` first, then echoes.
@@ -76,6 +120,7 @@ fn local(port: u16) -> SocketAddr {
 
 /// Starts a rust-box with `config`; returns it and its inbounds' addresses.
 async fn start(config: &Value) -> (RustBox, Vec<SocketAddr>) {
+    init_test_logging();
     let options = rb_config::parse(&config.to_string()).unwrap();
     let instance = RustBox::new(&options).unwrap();
     instance.start().await.unwrap();
@@ -123,6 +168,40 @@ async fn sing_box(config: &Value, port: u16) -> Option<SingBox> {
     panic!("sing-box did not start listening on {port}");
 }
 
+/// Runs sing-box with a QUIC-only inbound and waits until its UDP port is bound.
+async fn sing_box_quic(config: &Value, port: u16) -> Option<SingBox> {
+    let binary = match std::env::var("SING_BOX_BIN") {
+        Ok(binary) if !binary.is_empty() => binary,
+        _ => {
+            eprintln!("SING_BOX_BIN not set: skipping the sing-box QUIC interop case");
+            return None;
+        }
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(config).unwrap()).unwrap();
+    let child = Command::new(binary)
+        .args(["run", "-c"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn sing-box");
+    let mut process = SingBox(child, directory);
+    for _ in 0..100 {
+        if let Some(status) = process.0.try_wait().expect("check sing-box process") {
+            panic!("sing-box exited before binding QUIC port {port}: {status}");
+        }
+        match UdpSocket::bind(("127.0.0.1", port)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Some(process),
+            Ok(socket) => drop(socket),
+            Err(error) => panic!("check sing-box UDP port {port}: {error}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("sing-box did not bind QUIC UDP port {port}");
+}
+
 /// A SOCKS5 CONNECT through `proxy`.
 async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
     let mut stream = TcpStream::connect(proxy).await.unwrap();
@@ -142,9 +221,55 @@ async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
     stream
 }
 
+/// A SOCKS5 CONNECT with invalid credentials must not reach the target listener.
+async fn assert_socks5_connect_rejected(
+    proxy: SocketAddr,
+    target: SocketAddr,
+    target_accepts: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(proxy))
+        .await
+        .expect("SOCKS5 proxy connection timed out")
+        .unwrap();
+    stream.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut method))
+        .await
+        .expect("SOCKS5 method negotiation timed out")
+        .unwrap();
+    assert_eq!(method, [5, 0]);
+
+    let SocketAddr::V4(target) = target else { panic!("expected an IPv4 test target") };
+    let mut request = vec![5, 1, 0, 1];
+    request.extend_from_slice(&target.ip().octets());
+    request.extend_from_slice(&target.port().to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+    let mut response = [0u8; 2];
+    match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut response)).await {
+        Ok(Ok(_)) if response[1] == 0 => {
+            test_progress("wrong-credential SOCKS5 CONNECT returned success; sending a target probe");
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(b"rust-box-wrong-credential-probe"))
+                .await;
+        }
+        Ok(Ok(_)) => test_progress("wrong credentials received a SOCKS5 failure reply"),
+        Ok(Err(error)) => test_progress(&format!("wrong credentials closed SOCKS5 before a reply: {error}")),
+        Err(_) => panic!("SOCKS5 CONNECT rejection timed out"),
+    }
+    match tokio::time::timeout(Duration::from_secs(2), target_accepts.recv()).await {
+        Ok(Some(())) => panic!("wrong credentials reached the target TCP listener"),
+        Ok(None) => panic!("target TCP listener observer stopped unexpectedly"),
+        Err(_) => test_progress("wrong credentials did not reach the target TCP listener"),
+    }
+    drop(stream);
+}
+
 /// 200 KB both ways through `proxy` to the TCP echo server.
 async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
-    let stream = socks5_connect(proxy, echo).await;
+    test_progress("TCP echo: starting SOCKS CONNECT");
+    let stream = tokio::time::timeout(Duration::from_secs(30), socks5_connect(proxy, echo))
+        .await
+        .expect("SOCKS5 TCP CONNECT handshake timed out");
+    test_progress("TCP echo: SOCKS CONNECT completed");
     let payload: Vec<u8> = (0..200_000u32).map(|index| (index % 253) as u8).collect();
     let (mut reader, mut writer) = stream.into_split();
     let data = payload.clone();
@@ -158,10 +283,19 @@ async fn assert_tcp_echo(proxy: SocketAddr, echo: SocketAddr) {
     tokio::time::timeout(Duration::from_secs(20), reader.read_exact(&mut echoed)).await.unwrap().unwrap();
     let _writer = writing.await.unwrap();
     assert!(echoed == payload, "TCP echo through {proxy}");
+    test_progress("TCP echo: payload verified");
 }
 
 /// A SOCKS5 UDP ASSOCIATE through `proxy`, datagrams to `echo` and back.
 async fn assert_udp_echo(proxy: SocketAddr, echo: SocketAddr) {
+    test_progress("UDP echo: starting SOCKS UDP ASSOCIATE");
+    tokio::time::timeout(Duration::from_secs(30), assert_udp_echo_inner(proxy, echo))
+        .await
+        .expect("SOCKS5 UDP ASSOCIATE timed out");
+    test_progress("UDP echo: datagrams verified");
+}
+
+async fn assert_udp_echo_inner(proxy: SocketAddr, echo: SocketAddr) {
     let mut control = TcpStream::connect(proxy).await.unwrap();
     control.write_all(&[5, 1, 0]).await.unwrap();
     let mut reply = [0u8; 2];
@@ -526,14 +660,19 @@ fn build_errors() {
             json!({"inbounds": [{"type": "trojan", "fallback_for_alpn": {"h2": {"server": "127.0.0.1"}}}]}),
             "fallback for ALPN is not supported without TLS",
         ),
+        (json!({"inbounds": [{"type": "tuic"}]}), "inbounds[0]: TLS is required"),
+        (json!({"inbounds": [{"type": "hysteria2"}]}), "inbounds[0]: TLS is required"),
         (
-            json!({"inbounds": [{"type": "vless", "transport": {"type": "ws"}}]}),
-            "`transport` is not supported by rust-box yet",
+            json!({"inbounds": [{"type": "hysteria2", "bbr_profile": "custom"}]}),
+            "inbounds[0].bbr_profile: `bbr_profile` is not supported by rust-box yet",
         ),
     ] {
         let error = build(config.clone());
         assert!(error.contains(needle), "{config}: {error}");
     }
+    let http_config = json!({"inbounds": [{"type": "vless", "transport": {"type": "http"}}]});
+    let error = build(http_config.clone());
+    assert!(error.is_empty(), "{http_config}: {error}");
 }
 
 // ---- interop with the real sing-box ----
@@ -541,24 +680,58 @@ fn build_errors() {
 /// rust-box client → sing-box server (`inbound` on `port`).
 async fn interop_to_sing_box(inbound: Value, port: u16, outbound: Value, udp: bool) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
+    test_progress("RustBox client -> sing-box: starting QUIC server");
     let Some(_sing_box) = sing_box(&server_config(inbound), port).await else { return };
-    let (_client, clients) = start(&client_config(0, outbound)).await;
+    test_progress("RustBox client -> sing-box: QUIC server ready");
+    let (client, clients) = start(&client_config(0, outbound)).await;
     assert_tcp_echo(clients[0], echo).await;
     if udp {
         assert_udp_echo(clients[0], udp_target).await;
     }
+    test_progress("RustBox client -> sing-box: closing client");
+    tokio::time::timeout(Duration::from_secs(30), client.close()).await.expect("RustBox client close timed out");
+    test_progress("RustBox client -> sing-box: client closed");
 }
 
 /// sing-box client (`outbound` to the rust-box server) → rust-box server.
 async fn interop_from_sing_box(inbound: Value, outbound: impl FnOnce(SocketAddr) -> Value, udp: bool) {
     let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
-    let (_server, servers) = start(&server_config(inbound)).await;
+    test_progress("sing-box client -> RustBox: starting inbound");
+    let (server, servers) = start(&server_config(inbound)).await;
+    test_progress("sing-box client -> RustBox: inbound ready");
     let port = free_port();
-    let Some(_sing_box) = sing_box(&client_config(port, outbound(servers[0])), port).await else { return };
+    test_progress("sing-box client -> RustBox: starting sing-box client");
+    let Some(_sing_box) = sing_box(&client_config(port, outbound(servers[0])), port).await else {
+        tokio::time::timeout(Duration::from_secs(30), server.close()).await.expect("RustBox server close timed out");
+        return;
+    };
+    test_progress("sing-box client -> RustBox: sing-box client ready");
     assert_tcp_echo(local(port), echo).await;
     if udp {
         assert_udp_echo(local(port), udp_target).await;
     }
+    test_progress("sing-box client -> RustBox: closing inbound");
+    tokio::time::timeout(Duration::from_secs(30), server.close()).await.expect("RustBox server close timed out");
+    test_progress("sing-box client -> RustBox: inbound closed");
+}
+
+/// A sing-box client with invalid credentials must not reach a RustBox inbound.
+async fn interop_reject_wrong_credentials(inbound: Value, outbound: impl FnOnce(SocketAddr) -> Value) {
+    let mut target = tcp_accept_observer().await;
+    test_progress("wrong-credential interop: starting RustBox inbound");
+    let (server, servers) = start(&server_config(inbound)).await;
+    let port = free_port();
+    let Some(client) = sing_box(&client_config(port, outbound(servers[0])), port).await else {
+        tokio::time::timeout(Duration::from_secs(30), server.close()).await.expect("RustBox inbound close timed out");
+        return;
+    };
+    test_progress("wrong-credential interop: sing-box client ready");
+    assert_socks5_connect_rejected(local(port), target.address, &mut target.accepted).await;
+    drop(client);
+    test_progress("wrong-credential interop: closing RustBox inbound");
+    tokio::time::timeout(Duration::from_secs(30), server.close())
+        .await
+        .expect("RustBox inbound close timed out after auth rejection");
 }
 
 #[tokio::test]
@@ -645,4 +818,218 @@ async fn interop_sing_box_vless_vision_to_rust_box() {
     assert_tls_echo(local(port), tls_target, &pki).await;
     assert_tcp_echo(local(port), tcp_echo().await).await;
     assert_udp_echo(local(port), udp).await;
+}
+
+/// Exercises each V2Ray stream transport in both directions against the
+/// pinned sing-box CLI. TCP is sufficient here: the transport wraps the
+/// already-routed VLESS stream, independently of UDP packet encodings.
+#[tokio::test]
+async fn interop_vless_v2ray_transports_with_sing_box() {
+    let pki = pki();
+    for (name, transport) in [
+        ("websocket", json!({"type": "ws", "path": "/ws"})),
+        ("http2", json!({"type": "http", "host": ["example.test"], "path": "/"})),
+        ("grpc", json!({"type": "grpc", "service_name": "vless-test"})),
+        ("httpupgrade", json!({"type": "httpupgrade", "host": "example.test", "path": "/upgrade"})),
+    ] {
+        eprintln!("VLESS transport interop: {name}");
+
+        let port = free_port();
+        let mut inbound = vless_inbound(port, "", Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        let mut outbound = vless_outbound(local(port), "", None, Some(client_tls(&pki)));
+        outbound["transport"] = transport.clone();
+        interop_to_sing_box(inbound, port, outbound, false).await;
+
+        let mut inbound = vless_inbound(0, "", Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        interop_from_sing_box(
+            inbound,
+            |server| {
+                let mut outbound = vless_outbound(server, "", None, Some(client_tls(&pki)));
+                outbound["transport"] = transport;
+                outbound
+            },
+            false,
+        )
+        .await;
+    }
+}
+
+/// rust-box TUIC/Hysteria2 client → sing-box QUIC server, TCP streams and UDP.
+async fn interop_quic_to_sing_box(inbound: Value, port: u16, outbound: Value) {
+    let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
+    test_progress("RustBox client -> sing-box: starting QUIC server");
+    let Some(_sing_box) = sing_box_quic(&server_config(inbound), port).await else { return };
+    test_progress("RustBox client -> sing-box: QUIC server ready");
+    let (client, clients) = start(&client_config(0, outbound)).await;
+    test_progress("RustBox client -> sing-box: checking TCP session");
+    assert_tcp_echo(clients[0], echo).await;
+    test_progress("RustBox client -> sing-box: checking UDP session");
+    assert_udp_echo(clients[0], udp_target).await;
+    test_progress("RustBox client -> sing-box: closing client and sessions");
+    tokio::time::timeout(Duration::from_secs(30), client.close()).await.expect("RustBox QUIC client close timed out");
+    test_progress("RustBox client -> sing-box: client closed");
+}
+
+fn tuic_inbound(port: u16, pki: &Pki) -> Value {
+    json!({
+        "type": "tuic", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
+        "users": [{"name": "alice", "uuid": UUID, "password": "tuic-password"}],
+        "congestion_control": "cubic",
+        "tls": server_tls(pki)
+    })
+}
+
+fn tuic_outbound(server: SocketAddr, pki: &Pki) -> Value {
+    json!({
+        "type": "tuic", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+        "uuid": UUID, "password": "tuic-password", "congestion_control": "cubic",
+        "tls": client_tls(pki)
+    })
+}
+
+#[tokio::test]
+async fn interop_trojan_v2ray_transports_with_sing_box() {
+    let pki = pki();
+    for (name, transport) in [
+        ("websocket", json!({"type": "ws", "path": "/ws"})),
+        ("http2", json!({"type": "http", "host": ["example.test"], "path": "/"})),
+        ("grpc", json!({"type": "grpc", "service_name": "trojan-test"})),
+        ("httpupgrade", json!({"type": "httpupgrade", "host": "example.test", "path": "/upgrade"})),
+    ] {
+        eprintln!("Trojan transport interop: {name}");
+
+        let port = free_port();
+        let mut inbound = trojan_inbound(port, Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        let mut outbound = trojan_outbound(local(port), Some(client_tls(&pki)));
+        outbound["transport"] = transport.clone();
+        interop_to_sing_box(inbound, port, outbound, false).await;
+
+        let mut inbound = trojan_inbound(0, Some(server_tls(&pki)));
+        inbound["transport"] = transport.clone();
+        interop_from_sing_box(
+            inbound,
+            |server| {
+                let mut outbound = trojan_outbound(server, Some(client_tls(&pki)));
+                outbound["transport"] = transport;
+                outbound
+            },
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn interop_rust_box_tuic_to_sing_box() {
+    let pki = pki();
+    let port = free_port();
+    let inbound = tuic_inbound(port, &pki);
+    let outbound = tuic_outbound(local(port), &pki);
+    interop_quic_to_sing_box(inbound, port, outbound).await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_tuic_to_rust_box() {
+    let pki = pki();
+    interop_from_sing_box(tuic_inbound(0, &pki), |server| tuic_outbound(server, &pki), true).await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_rejects_wrong_tuic_password() {
+    let pki = pki();
+    interop_reject_wrong_credentials(tuic_inbound(0, &pki), |server| {
+        json!({
+            "type": "tuic", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+            "uuid": UUID, "password": "wrong-tuic-password", "congestion_control": "cubic",
+            "tls": client_tls(&pki)
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn interop_rust_box_hysteria2_to_sing_box() {
+    let pki = pki();
+    let port = free_port();
+    // Both sides advertise bandwidth so sing-box selects Brutal; zero rates
+    // select Meta2, which the rust-box outbound still rejects. Reverse-direction
+    // inbound coverage below verifies both Brutal and Meta2.
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "up_mbps": 10, "down_mbps": 10,
+        "tls": server_tls(&pki)
+    });
+    let outbound = json!({
+        "type": "hysteria2", "tag": "proxy", "server": "127.0.0.1", "server_port": port,
+        "password": "hysteria2-password", "up_mbps": 10, "down_mbps": 10,
+        "disable_chrome_parrot": true, "tls": client_tls(&pki)
+    });
+    interop_quic_to_sing_box(inbound, port, outbound).await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_hysteria2_brutal_to_rust_box() {
+    let pki = pki();
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": 0,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "up_mbps": 10, "down_mbps": 10,
+        "tls": server_tls(&pki)
+    });
+    interop_from_sing_box(
+        inbound,
+        |server| {
+            json!({
+                "type": "hysteria2", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+                "password": "hysteria2-password", "up_mbps": 10, "down_mbps": 10,
+                "disable_chrome_parrot": true, "tls": client_tls(&pki)
+            })
+        },
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_hysteria2_meta2_to_rust_box() {
+    let pki = pki();
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": 0,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "tls": server_tls(&pki)
+    });
+    interop_from_sing_box(
+        inbound,
+        |server| {
+            json!({
+                "type": "hysteria2", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+                "password": "hysteria2-password", "disable_chrome_parrot": true,
+                "tls": client_tls(&pki)
+            })
+        },
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_rejects_wrong_hysteria2_password() {
+    let pki = pki();
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": 0,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "tls": server_tls(&pki)
+    });
+    interop_reject_wrong_credentials(inbound, |server| {
+        json!({
+            "type": "hysteria2", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+            "password": "wrong-hysteria2-password", "disable_chrome_parrot": true,
+            "tls": client_tls(&pki)
+        })
+    })
+    .await;
 }

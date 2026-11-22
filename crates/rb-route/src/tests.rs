@@ -1,8 +1,55 @@
 use super::*;
-use rb_adapter::{Host, Network, Socksaddr};
+use rb_adapter::{ConnectionHandshake, Host, Network, Socksaddr};
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+struct HandshakeOutbound {
+    succeeds: bool,
+    outcome: Arc<AtomicU8>,
+}
+
+#[async_trait]
+impl Outbound for HandshakeOutbound {
+    fn tag(&self) -> &str {
+        "handshake"
+    }
+    fn kind(&self) -> &'static str {
+        "handshake"
+    }
+    async fn dial_tcp(&self, _context: &InboundContext) -> io::Result<BoxStream> {
+        self.outcome.store(if self.succeeds { 1 } else { 2 }, Ordering::SeqCst);
+        if !self.succeeds {
+            return Err(io::Error::other("outbound dial failed"));
+        }
+        let (stream, peer) = tokio::io::duplex(1024);
+        drop(peer);
+        Ok(Box::new(stream))
+    }
+}
+
+struct HandshakeRecorder(Arc<AtomicU8>);
+
+#[async_trait]
+impl ConnectionHandshake for HandshakeRecorder {
+    async fn success(&self, client: &mut BoxStream) -> io::Result<()> {
+        assert_eq!(self.0.load(Ordering::SeqCst), 1);
+        client.write_all(b"success").await
+    }
+    async fn failure(&self, client: &mut BoxStream, _error: &RouteError) -> io::Result<()> {
+        assert_eq!(self.0.load(Ordering::SeqCst), 2);
+        client.write_all(b"failure").await
+    }
+}
+
+fn handshake_router(succeeds: bool, outcome: Arc<AtomicU8>) -> Router {
+    let options: RouteOptions = serde_json::from_str(r#"{"final":"handshake"}"#).unwrap();
+    let outbounds: Vec<Arc<dyn Outbound>> = vec![Arc::new(HandshakeOutbound { succeeds, outcome })];
+    let dns: Arc<dyn DnsResolver> = Arc::new(FakeDns::default());
+    Router::new(&options, outbounds, dns, rb_adapter::InboundRegistry::new(), &rb_rule::RuleSets::new()).unwrap()
+}
 
 struct FakeOutbound(&'static str);
 
@@ -256,7 +303,6 @@ async fn sniff_then_route_by_sniffed_domain() {
     let router =
         router(r#"[{"action":"sniff"},{"protocol":"tls","domain_suffix":"example.com","outbound":"direct"}]"#, dns);
     let (mut client_side, server_side) = tokio::io::duplex(65536);
-    use tokio::io::AsyncWriteExt;
     client_side.write_all(&sniff::tests::client_hello("www.example.com")).await.unwrap();
     let mut stream: Option<BoxStream> = Some(Box::new(server_side));
     let mut ctx = context("93.184.216.34", 443);
@@ -367,4 +413,47 @@ async fn inbound_detour_errors() {
     let (client, _server) = tokio::io::duplex(64);
     let error = router.route_connection(context, Box::new(client)).await.unwrap_err();
     assert!(error.to_string().contains("inbound detour not found: missing"), "{error}");
+}
+
+#[tokio::test]
+async fn routed_handshake_success_is_sent_after_outbound_dial() {
+    let outcome = Arc::new(AtomicU8::new(0));
+    let router = Arc::new(handshake_router(true, outcome.clone()));
+    let handshake = Arc::new(HandshakeRecorder(outcome));
+    let (mut client, server) = tokio::io::duplex(1024);
+    let route = {
+        let router = router.clone();
+        let handshake = handshake.clone();
+        tokio::spawn(async move {
+            router
+                .route_connection_with_handshake(context("example.com", 443), Box::new(server), handshake.as_ref())
+                .await
+        })
+    };
+    let mut response = [0; 7];
+    client.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"success");
+    drop(client);
+    route.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn routed_handshake_failure_is_sent_after_outbound_dial_fails() {
+    let outcome = Arc::new(AtomicU8::new(0));
+    let router = Arc::new(handshake_router(false, outcome.clone()));
+    let handshake = Arc::new(HandshakeRecorder(outcome));
+    let (mut client, server) = tokio::io::duplex(1024);
+    let route = {
+        let router = router.clone();
+        let handshake = handshake.clone();
+        tokio::spawn(async move {
+            router
+                .route_connection_with_handshake(context("example.com", 443), Box::new(server), handshake.as_ref())
+                .await
+        })
+    };
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"failure");
+    assert!(matches!(route.await.unwrap(), Err(RouteError::Dial(_))));
 }

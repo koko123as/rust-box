@@ -15,7 +15,10 @@ tracing.workspace = true
 socket2.workspace = true
 libc.workspace = true
 rand.workspace = true
+quinn.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
+rcgen.workspace = true

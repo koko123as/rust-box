@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/quinn-proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,6 +48,8 @@ crc32fast = "1"
 h2 = "0.4"
 http = "1"
 bytes = "1"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 chacha20poly1305 = "0.10"
 chacha20 = "0.9"
 ctr = "0.9"
@@ -71,3 +74,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
+h3-quinn = { path = "vendor/h3-quinn" }

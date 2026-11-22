@@ -22,6 +22,7 @@
 
 pub mod listener;
 pub mod parallel;
+pub mod quic;
 pub mod resolve;
 pub mod sys;
 pub mod tfo;

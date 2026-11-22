@@ -4,7 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,6 +27,8 @@ pub struct VmessInbound {
     routing: Arc<Routing>,
     users: Arc<ServerUsers>,
     tls: Option<rb_tls::TlsServer>,
+    transport: Option<crate::v2ray::StreamTransport>,
+    this: OnceLock<Weak<Self>>,
     detour: Option<String>,
     local_addr: OnceLock<SocketAddr>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -35,16 +37,14 @@ pub struct VmessInbound {
 impl VmessInbound {
     /// sing-box `vmess.NewInbound`.
     pub fn new(options: &InboundOptions, tag: String, router: Arc<dyn ConnectionRouter>) -> Result<Self, String> {
+        let transport = crate::v2ray::transport_options(options.transport.as_ref())?;
         let multiplex = crate::multiplex::server_options(options.multiplex.as_ref())?;
         let users: Vec<([u8; 16], i64)> =
             options.users.iter().map(|user| (parse_uuid(&user.uuid), user.alter_id)).collect();
         let tls = match options.tls.as_ref().filter(|tls| tls.enabled) {
-            Some(tls) => Some(rb_tls::TlsServer::new(tls)?),
+            Some(tls) => Some(crate::v2ray::transport_tls_server(tls, transport.as_ref())?),
             None => None,
         };
-        if options.transport.is_some() {
-            return Err("`transport` is not supported by rust-box yet".into());
-        }
         let listen = options.listen_options();
         Ok(VmessInbound {
             routing: Arc::new(Routing {
@@ -58,6 +58,8 @@ impl VmessInbound {
             listener: Listener::new(&listen)?,
             users: Arc::new(ServerUsers::new(&users)),
             tls,
+            transport,
+            this: OnceLock::new(),
             detour: (!listen.detour.is_empty()).then(|| listen.detour.clone()),
             local_addr: OnceLock::new(),
             tasks: Mutex::new(Vec::new()),
@@ -71,16 +73,99 @@ impl VmessInbound {
     /// Serves one connection (sing-box `Inbound.NewConnection`).
     async fn handle(&self, stream: BoxStream, context: InboundContext) {
         let source = context.source;
-        let stream = match &self.tls {
+        let (mut stream, alpn) = match &self.tls {
             Some(tls) => match tls.handshake(stream).await {
-                Ok(stream) => Box::new(stream) as BoxStream,
+                Ok(stream) => {
+                    let alpn =
+                        stream.get_ref().1.alpn_protocol().map(|alpn| String::from_utf8_lossy(alpn).into_owned());
+                    (Box::new(stream) as BoxStream, alpn)
+                }
                 Err(error) => {
                     error!("{}: process connection from {source}: TLS handshake: {error}", self.log_prefix());
                     return;
                 }
             },
-            None => stream,
+            None => (stream, None),
         };
+        if let Some(crate::v2ray::StreamTransport::Http(options)) = &self.transport {
+            let session =
+                match crate::v2ray::http::server_session(stream, options, self.tls.is_some(), alpn.as_deref()).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        error!("{}: process HTTP connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+            match session {
+                crate::v2ray::http::ServerSession::Http1(stream) => {
+                    if let Err(error) = self.serve(stream, context).await {
+                        error!("{}: process HTTP/1.1 stream from {source}: {error}", self.log_prefix());
+                    }
+                }
+                crate::v2ray::http::ServerSession::Http2(server) => {
+                    let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                        error!("{}: HTTP handler is not initialized", self.log_prefix());
+                        return;
+                    };
+                    loop {
+                        let stream = match server.accept().await {
+                            Ok(Some(stream)) => stream,
+                            Ok(None) => return,
+                            Err(error) => {
+                                error!("{}: process HTTP/2 connection from {source}: {error}", self.log_prefix());
+                                return;
+                            }
+                        };
+                        let inbound = inbound.clone();
+                        let context = context.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = inbound.serve(stream, context).await {
+                                error!("{}: process HTTP/2 stream from {source}: {error}", inbound.log_prefix());
+                            }
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(crate::v2ray::StreamTransport::Grpc(options)) = &self.transport {
+            let server = crate::v2ray::grpc_lite::GrpcLiteServer::new(stream, options);
+            let Some(inbound) = self.this.get().and_then(Weak::upgrade) else {
+                error!("{}: gRPC handler is not initialized", self.log_prefix());
+                return;
+            };
+            loop {
+                let stream = match server.accept().await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        error!("{}: process gRPC connection from {source}: {error}", self.log_prefix());
+                        return;
+                    }
+                };
+                let inbound = inbound.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let log_prefix = inbound.log_prefix();
+                    if let Err(error) = inbound.serve(stream, context).await {
+                        error!("{log_prefix}: process gRPC stream from {source}: {error}");
+                    }
+                });
+            }
+        }
+        if let Some(transport) = &self.transport {
+            stream = match crate::v2ray::transport_server(stream, transport).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    error!(
+                        "{}: process connection from {source}: {} handshake: {error}",
+                        self.log_prefix(),
+                        transport.log_name()
+                    );
+                    return;
+                }
+            };
+        }
         if let Err(error) = self.serve(stream, context).await {
             error!("{}: process connection from {source}: {error}", self.log_prefix());
         }
@@ -133,6 +218,7 @@ impl Inbound for VmessInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let _ = self.this.set(Arc::downgrade(&self));
         if self.users.has_legacy() {
             // sing-vmess `Service.Start`: the legacy keys move every ten
             // seconds.
