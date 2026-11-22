@@ -116,19 +116,30 @@ async fn connect_with_options_inner(
 
 /// Builds a Quinn server configuration from the shared TLS and QUIC options.
 pub fn server_config(tls: Arc<rustls::ServerConfig>, options: &QuicOptions) -> io::Result<quinn::ServerConfig> {
-    server_config_inner(tls, options, false)
+    server_config_inner(tls, options, false, None)
 }
 
 /// Builds TUIC's QUIC server configuration, including its very high uni-stream
 /// limit for one-stream-per-UDP-packet relay mode.
 pub fn tuic_server_config(tls: Arc<rustls::ServerConfig>, options: &QuicOptions) -> io::Result<quinn::ServerConfig> {
-    server_config_inner(tls, options, true)
+    server_config_inner(tls, options, true, None)
+}
+
+/// Builds a Hysteria2 server config with a per-connection negotiated
+/// congestion controller and the protocol's high incoming stream limits.
+pub fn hysteria2_server_config(
+    tls: Arc<rustls::ServerConfig>,
+    options: &QuicOptions,
+    controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> io::Result<quinn::ServerConfig> {
+    server_config_inner(tls, options, true, Some(controller))
 }
 
 fn server_config_inner(
     tls: Arc<rustls::ServerConfig>,
     options: &QuicOptions,
     allow_many_uni_streams: bool,
+    controller: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
 ) -> io::Result<quinn::ServerConfig> {
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|error| io::Error::other(format!("QUIC TLS configuration: {error}")))?;
@@ -140,6 +151,9 @@ fn server_config_inner(
     }
     if allow_many_uni_streams {
         transport.max_concurrent_uni_streams(default_stream_limit);
+    }
+    if let Some(controller) = controller {
+        transport.congestion_controller_factory(controller);
     }
     transport.datagram_receive_buffer_size(Some(64 * 1024));
     transport.datagram_send_buffer_size(64 * 1024);
