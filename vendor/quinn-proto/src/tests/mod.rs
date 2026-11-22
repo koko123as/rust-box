@@ -635,7 +635,7 @@ fn packet_callbacks_track_real_pair_stream_packets_and_acks() {
     pair.client_send(client_ch, stream).finish().unwrap();
     pair.client.drive_outgoing(pair.time);
     assert!(pair.client.outbound.len() >= 4, "enough application packets are needed to trigger packet-threshold loss");
-    pair.client.outbound.pop_front().expect("drop one application packet");
+    let _dropped_packet = pair.client.outbound.pop_front().expect("drop one application packet");
     pair.drive();
 
     let state = log.0.lock().unwrap();

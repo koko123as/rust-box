@@ -282,6 +282,11 @@ impl RttEstimator {
         self.smoothed.unwrap_or(self.latest)
     }
 
+    /// The smoothed RTT once an acknowledgment sample has been received.
+    pub fn smoothed(&self) -> Option<Duration> {
+        self.smoothed
+    }
+
     /// Conservative estimate of RTT
     ///
     /// Takes the maximum of smoothed and latest RTT, as recommended

@@ -183,28 +183,24 @@ impl PacketBuilder {
         let exact_number = self.exact_number;
         let space_id = self.space;
         let (packet_bytes, padded) = self.finish(conn, now, buffer);
-        let size = packet_bytes;
-        let sent = match sent {
-            Some(sent) => sent,
-            None => return,
-        };
-
         let size = match padded || ack_eliciting {
-            true => size as u16,
+            true => packet_bytes as u16,
             false => 0,
         };
 
-        let packet = SentPacket {
-            path_generation: conn.path.generation(),
-            largest_acked: sent.largest_acked,
-            time_sent: now,
-            size,
-            ack_eliciting,
-            retransmits: sent.retransmits,
-            stream_frames: sent.stream_frames,
-        };
+        if let Some(sent) = sent {
+            let packet = SentPacket {
+                path_generation: conn.path.generation(),
+                largest_acked: sent.largest_acked,
+                time_sent: now,
+                size,
+                ack_eliciting,
+                retransmits: sent.retransmits,
+                stream_frames: sent.stream_frames,
+            };
 
-        conn.path.sent(exact_number, packet, &mut conn.spaces[space_id]);
+            conn.path.sent(exact_number, packet, &mut conn.spaces[space_id]);
+        }
         conn.path.congestion.on_packet_sent(
             match space_id {
                 SpaceId::Initial => PacketNumberSpace::Initial,

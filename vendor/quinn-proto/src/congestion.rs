@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 mod bbr;
 mod cubic;
+mod hysteria_brutal;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
 pub use cubic::{Cubic, CubicConfig};
+pub use hysteria_brutal::BrutalConfig;
 pub use new_reno::{NewReno, NewRenoConfig};
 
 /// QUIC packet number space, without exposing Quinn's internal space identifier.
@@ -66,6 +68,9 @@ pub trait Controller: Send + Sync {
         bytes_in_flight: u64,
     ) {
     }
+    /// The path's smoothed RTT estimate was updated after processing an ACK.
+    #[allow(unused_variables)]
+    fn on_rtt_update(&mut self, rtt: &RttEstimator) {}
     /// One or more packets were just sent
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
