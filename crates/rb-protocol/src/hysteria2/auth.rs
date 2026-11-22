@@ -9,6 +9,7 @@ use rand::Rng;
 pub const AUTH_HOST: &str = "hysteria";
 pub const AUTH_PATH: &str = "/auth";
 pub const AUTH_OK_STATUS: u16 = 233;
+pub const HYSTERIA_MBPS_TO_BPS: i64 = 125_000;
 
 const HEADER_AUTH: HeaderName = HeaderName::from_static("hysteria-auth");
 const HEADER_UDP_ENABLED: HeaderName = HeaderName::from_static("hysteria-udp");
@@ -19,14 +20,14 @@ const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthRequest {
     pub password: String,
-    /// Receive bandwidth in bits per second; zero requests server-side detection.
+    /// Receive bandwidth in bytes per second; zero requests server-side detection.
     pub receive_bps: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthResponse {
     pub udp_enabled: bool,
-    /// Zero means unlimited; `receive_auto` requests bandwidth detection.
+    /// Zero means unlimited; `receive_auto` requests bandwidth detection. The unit is bytes per second.
     pub receive_bps: u64,
     pub receive_auto: bool,
 }
@@ -60,6 +61,11 @@ impl AuthResponse {
         let receive_bps = if receive_auto { 0 } else { receive_header.parse().unwrap_or(0) };
         Self { udp_enabled, receive_bps, receive_auto }
     }
+}
+
+/// Converts sing-box's `*_mbps` fields using sing-quic's `MbpsToBps` constant.
+pub fn hysteria_mbps_to_bps(mbps: i64) -> u64 {
+    mbps.wrapping_mul(HYSTERIA_MBPS_TO_BPS) as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,5 +160,13 @@ mod tests {
             AuthResponse::default().congestion_control(4_000_000),
             CongestionControl::Brutal { send_bps: 4_000_000 }
         );
+    }
+
+    #[test]
+    fn mbps_conversion_matches_sing_quic_byte_rate_constant() {
+        assert_eq!(hysteria_mbps_to_bps(0), 0);
+        assert_eq!(hysteria_mbps_to_bps(1), 125_000);
+        assert_eq!(hysteria_mbps_to_bps(20), 2_500_000);
+        assert_eq!(hysteria_mbps_to_bps(-1), (-125_000_i64) as u64);
     }
 }
