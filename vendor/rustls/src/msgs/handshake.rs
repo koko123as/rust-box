@@ -873,7 +873,7 @@ impl Codec<'_> for ServerTicketRequestHint {
 /// Opaque entries are for locally constructed extensions that do not have a
 /// typed Rustls representation. Unknown extensions received from a peer remain
 /// intentionally lossy when parsed into `ClientExtensions`.
-#[allow(dead_code)] // Staged for profile wiring; exercised by this crate's unit tests.
+#[allow(dead_code)] // Exercised by the client profile and this crate's unit tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClientHelloExtensionOrderEntry {
     Typed(ExtensionType),
@@ -891,7 +891,7 @@ impl ClientHelloExtensionOrderEntry {
     }
 }
 
-#[allow(dead_code)] // Staged for profile wiring; exercised by this crate's unit tests.
+#[allow(dead_code)] // Exercised by the client profile and this crate's unit tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientHelloExtensionOrderError {
     DuplicateExtension(u16),
@@ -901,6 +901,11 @@ pub(crate) enum ClientHelloExtensionOrderError {
     OpaquePreSharedKey,
     OpaqueKnownExtension(u16),
     OpaqueExtensionTooLong,
+    TypedUnknownExtension(u16),
+    StaticGreaseCodepoint(u16),
+    InvalidGreaseSeedCount,
+    NoGreaseCodepointAvailable,
+    TooManyGreaseExtensions,
     ExtensionBlockTooLong,
 }
 

@@ -8,10 +8,10 @@ use pki_types::{CertificateDer, ServerName};
 
 use crate::client::{ClientConfig, ClientConnection, Resumption, Tls12Resumption};
 use crate::crypto::CryptoProvider;
-use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+use crate::enums::{CipherSuite, ContentType, ProtocolVersion, SignatureScheme};
 use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::Reader;
-use crate::msgs::enums::{Compression, NamedGroup};
+use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, Random,
     ServerHelloPayload, SessionId,
@@ -31,6 +31,9 @@ mod tests {
     use crate::enums::CertificateType;
     use crate::msgs::base::PayloadU8;
     use crate::msgs::ccs::ChangeCipherSpecPayload;
+    use crate::msgs::client_hello_profile::{
+        ClientHelloExtensionProfile, ClientHelloExtensionProfileEntry,
+    };
     use crate::msgs::enums::ECCurveType;
     use crate::msgs::handshake::{
         CertificateChain, EcParameters, HelloRetryRequestExtensions, KeyShareEntry,
@@ -44,6 +47,95 @@ mod tests {
     use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
     use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use crate::{DigitallySignedStruct, DistinguishedName, KeyLog, version};
+
+    #[test]
+    fn client_hello_profile_orders_wire_extensions_and_reuses_grease_after_hrr() {
+        let mut config = ClientConfig::builder_with_provider(super::provider::default_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        let baseline = client_hello_sent_for_config(config.clone()).unwrap();
+        let typed_extensions = baseline.extensions.collect_used();
+        assert!(typed_extensions.contains(&ExtensionType::KeyShare));
+
+        let mut profile_entries = vec![
+            ClientHelloExtensionProfileEntry::Grease { payload: vec![0x41] },
+            ClientHelloExtensionProfileEntry::Opaque {
+                extension_type: ExtensionType::Unknown(0x1234),
+                payload: vec![0xaa, 0xbb],
+            },
+            ClientHelloExtensionProfileEntry::Typed(ExtensionType::Cookie),
+        ];
+        profile_entries.extend(
+            typed_extensions
+                .iter()
+                .copied()
+                .map(ClientHelloExtensionProfileEntry::Typed),
+        );
+        config.client_hello_extension_profile =
+            Some(ClientHelloExtensionProfile::new(profile_entries).unwrap());
+
+        let mut conn =
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+        let mut first_bytes = Vec::new();
+        conn.write_tls(&mut first_bytes).unwrap();
+        let first_extensions = client_hello_extensions_from_wire(&first_bytes);
+        assert_eq!(
+            first_extensions[1],
+            (ExtensionType::Unknown(0x1234), vec![0xaa, 0xbb])
+        );
+        let first_extension_types = first_extensions
+            .iter()
+            .map(|(extension_type, _)| *extension_type)
+            .collect::<Vec<_>>();
+        assert_eq!(&first_extension_types[2..], typed_extensions.as_slice());
+        let grease_extension = first_extensions[0].0;
+        let grease_codepoint = u16::from(grease_extension);
+        assert_eq!((grease_codepoint >> 8) as u8, grease_codepoint as u8);
+        assert_eq!(grease_codepoint as u8 & 0x0f, 0x0a);
+
+        let first_hello = client_hello_from_wire(&first_bytes);
+        let first_key_share = first_hello.extensions.key_shares.as_ref().unwrap()[0].group;
+        let hrr = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id: first_hello.session_id,
+                    cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    extensions: HelloRetryRequestExtensions {
+                        cookie: Some(PayloadU16::new(vec![1, 2, 3, 4])),
+                        supported_versions: Some(ProtocolVersion::TLSv1_3),
+                        ..HelloRetryRequestExtensions::default()
+                    },
+                }),
+            )),
+        };
+        conn.read_tls(&mut hrr.into_wire_bytes().as_slice()).unwrap();
+        conn.process_new_packets().unwrap();
+
+        let mut retry_bytes = Vec::new();
+        conn.write_tls(&mut retry_bytes).unwrap();
+        let retry_extensions = client_hello_extensions_from_wire(&retry_bytes);
+        assert_eq!(retry_extensions[0].0, grease_extension);
+        assert_eq!(
+            retry_extensions[1],
+            (ExtensionType::Unknown(0x1234), vec![0xaa, 0xbb])
+        );
+        assert_eq!(retry_extensions[2].0, ExtensionType::Cookie);
+        let retry_extension_types = retry_extensions
+            .iter()
+            .map(|(extension_type, _)| *extension_type)
+            .collect::<Vec<_>>();
+        assert_eq!(&retry_extension_types[3..], typed_extensions.as_slice());
+        let retry_hello = client_hello_from_wire(&retry_bytes);
+        assert_eq!(
+            retry_hello.extensions.key_shares.as_ref().unwrap()[0].group,
+            first_key_share
+        );
+    }
 
     /// Tests that session_ticket(35) extension
     /// is not sent if the client does not support TLS 1.2.
@@ -759,6 +851,84 @@ fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPaylo
         } => Ok(ch),
         other => panic!("unexpected message {other:?}"),
     }
+}
+
+fn client_hello_from_wire(bytes: &[u8]) -> ClientHelloPayload {
+    let mut reader = Reader::init(bytes);
+    while reader.any_left() {
+        let record = OutboundOpaqueMessage::read(&mut reader).unwrap();
+        if record.typ != ContentType::Handshake {
+            continue;
+        }
+        return match Message::try_from(record.into_plain_message()).unwrap() {
+            Message {
+                payload:
+                    MessagePayload::Handshake {
+                        parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(hello)),
+                        ..
+                    },
+                ..
+            } => hello,
+            other => panic!("unexpected message {other:?}"),
+        };
+    }
+    panic!("no ClientHello record in wire bytes");
+}
+
+fn client_hello_extensions_from_wire(bytes: &[u8]) -> Vec<(ExtensionType, Vec<u8>)> {
+    let mut record_offset = 0;
+    while record_offset < bytes.len() {
+        assert!(bytes.len() - record_offset >= 5);
+        let record_type = bytes[record_offset];
+        let record_length = usize::from(u16::from_be_bytes([
+            bytes[record_offset + 3],
+            bytes[record_offset + 4],
+        ]));
+        let record_end = record_offset + 5 + record_length;
+        assert!(record_end <= bytes.len());
+
+        if record_type == u8::from(ContentType::Handshake) {
+            let payload = &bytes[record_offset + 5..record_end];
+            assert!(payload.len() >= 4);
+            if payload[0] == 0x01 {
+                let mut cursor = 4 + 2 + 32;
+                cursor += 1 + usize::from(payload[cursor]);
+                let cipher_suites_length = usize::from(u16::from_be_bytes([
+                    payload[cursor],
+                    payload[cursor + 1],
+                ]));
+                cursor += 2 + cipher_suites_length;
+                cursor += 1 + usize::from(payload[cursor]);
+                let extensions_length = usize::from(u16::from_be_bytes([
+                    payload[cursor],
+                    payload[cursor + 1],
+                ]));
+                cursor += 2;
+                let extensions_end = cursor + extensions_length;
+                assert_eq!(extensions_end, payload.len());
+
+                let mut extensions = Vec::new();
+                while cursor < extensions_end {
+                    let extension_type = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+                    let extension_length = usize::from(u16::from_be_bytes([
+                        payload[cursor + 2],
+                        payload[cursor + 3],
+                    ]));
+                    cursor += 4;
+                    assert!(cursor + extension_length <= extensions_end);
+                    extensions.push((
+                        ExtensionType::from(extension_type),
+                        payload[cursor..cursor + extension_length].to_vec(),
+                    ));
+                    cursor += extension_length;
+                }
+                return extensions;
+            }
+        }
+
+        record_offset = record_end;
+    }
+    panic!("no ClientHello record in wire bytes");
 }
 
 fn roots() -> RootCertStore {

@@ -4,7 +4,10 @@ use alloc::vec::Vec;
 use super::ResolvesClientCert;
 use crate::log::{debug, trace};
 use crate::msgs::enums::ExtensionType;
-use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
+use crate::msgs::handshake::{
+    CertificateChain, ClientHelloExtensionOrderEntry, DistinguishedName, ProtocolName,
+    ServerExtensions,
+};
 use crate::sync::Arc;
 use crate::{CipherSuite, SignatureScheme, compress, sign};
 
@@ -38,16 +41,22 @@ pub(super) struct ClientHelloDetails {
     pub(super) alpn_protocols: Vec<ProtocolName>,
     pub(super) sent_extensions: Vec<ExtensionType>,
     pub(super) extension_order_seed: u16,
+    pub(super) profile_extension_order: Option<Vec<ClientHelloExtensionOrderEntry>>,
     pub(super) offered_cert_compression: bool,
     pub(super) offered_cipher_suites: Vec<CipherSuite>,
 }
 
 impl ClientHelloDetails {
-    pub(super) fn new(alpn_protocols: Vec<ProtocolName>, extension_order_seed: u16) -> Self {
+    pub(super) fn new(
+        alpn_protocols: Vec<ProtocolName>,
+        extension_order_seed: u16,
+        profile_extension_order: Option<Vec<ClientHelloExtensionOrderEntry>>,
+    ) -> Self {
         Self {
             alpn_protocols,
             sent_extensions: Vec::new(),
             extension_order_seed,
+            profile_extension_order,
             offered_cert_compression: false,
             offered_cipher_suites: Vec::new(),
         }

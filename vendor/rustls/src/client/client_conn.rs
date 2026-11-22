@@ -18,6 +18,7 @@ use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
 use crate::kernel::KernelConnection;
 use crate::log::trace;
+use crate::msgs::client_hello_profile::ClientHelloExtensionProfile;
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::ClientExtensionsInput;
 use crate::msgs::persist;
@@ -287,6 +288,9 @@ pub struct ClientConfig {
 
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
+
+    /// Optional internal ClientHello extension profile; absent by default.
+    pub(super) client_hello_extension_profile: Option<ClientHelloExtensionProfile>,
 
     /// Request a specific number of TLS 1.3 session tickets via [RFC 9149].
     ///

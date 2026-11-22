@@ -27,6 +27,7 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
+use crate::msgs::client_hello_profile::ClientHelloExtensionProfile;
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -119,12 +120,25 @@ impl ClientHelloInput {
             None => SessionId::random(config.provider.secure_random)?,
         };
 
+        let extension_order_seed = crate::rand::random_u16(config.provider.secure_random)?;
+        let profile_extension_order = match &config.client_hello_extension_profile {
+            Some(profile) => {
+                let mut grease_seeds = Vec::with_capacity(profile.grease_count());
+                for _ in 0..profile.grease_count() {
+                    grease_seeds.push(crate::rand::random_u16(config.provider.secure_random)?);
+                }
+                Some(profile.instantiate(&grease_seeds).map_err(|error| {
+                    Error::General(alloc::format!(
+                        "invalid ClientHello extension profile: {error:?}"
+                    ))
+                })?)
+            }
+            None => None,
+        };
         let hello = ClientHelloDetails::new(
-            extra_exts
-                .protocols
-                .clone()
-                .unwrap_or_default(),
-            crate::rand::random_u16(config.provider.secure_random)?,
+            extra_exts.protocols.clone().unwrap_or_default(),
+            extension_order_seed,
+            profile_extension_order,
         );
 
         Ok(Self {
@@ -440,6 +454,22 @@ fn emit_client_hello_for_retry(
             }
         }
         _ => {}
+    }
+
+    if let Some(instantiated_order) = &input.hello.profile_extension_order {
+        let present_extensions = chp_payload.extensions.collect_used();
+        let profile_order = ClientHelloExtensionProfile::order_for_present_extensions(
+            instantiated_order,
+            &present_extensions,
+        );
+        chp_payload
+            .extensions
+            .set_explicit_extension_order(profile_order)
+            .map_err(|error| {
+                Error::General(alloc::format!(
+                    "ClientHello extension profile does not match this handshake: {error:?}"
+                ))
+            })?;
     }
 
     // Note what extensions we sent.
