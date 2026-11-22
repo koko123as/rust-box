@@ -86,5 +86,6 @@ codegen-units = 1
 strip = true
 
 [patch.crates-io]
+rustls = { path = "vendor/rustls" }
 quinn-proto = { path = "vendor/quinn-proto" }
 h3-quinn = { path = "vendor/h3-quinn" }
