@@ -617,6 +617,13 @@ impl UrlTest {
         self.url_test().await;
     }
 
+    /// `PerformUpdateCheck`: re-selects from the current results.
+    pub fn perform_update_check(&self) {
+        if let Some(group) = self.state.get() {
+            group.perform_update_check();
+        }
+    }
+
     /// The test URL (empty for the default) and the tolerance.
     pub fn link(&self) -> &str {
         &self.options.url
