@@ -123,6 +123,40 @@ async fn sing_box(config: &Value, port: u16) -> Option<SingBox> {
     panic!("sing-box did not start listening on {port}");
 }
 
+/// Runs sing-box with a QUIC-only inbound and waits until its UDP port is bound.
+async fn sing_box_quic(config: &Value, port: u16) -> Option<SingBox> {
+    let binary = match std::env::var("SING_BOX_BIN") {
+        Ok(binary) if !binary.is_empty() => binary,
+        _ => {
+            eprintln!("SING_BOX_BIN not set: skipping the sing-box QUIC interop case");
+            return None;
+        }
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(config).unwrap()).unwrap();
+    let child = Command::new(binary)
+        .args(["run", "-c"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn sing-box");
+    let mut process = SingBox(child, directory);
+    for _ in 0..100 {
+        if let Some(status) = process.0.try_wait().expect("check sing-box process") {
+            panic!("sing-box exited before binding QUIC port {port}: {status}");
+        }
+        match UdpSocket::bind(("127.0.0.1", port)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Some(process),
+            Ok(socket) => drop(socket),
+            Err(error) => panic!("check sing-box UDP port {port}: {error}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("sing-box did not bind QUIC UDP port {port}");
+}
+
 /// A SOCKS5 CONNECT through `proxy`.
 async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
     let mut stream = TcpStream::connect(proxy).await.unwrap();
@@ -685,4 +719,51 @@ async fn interop_vless_v2ray_transports_with_sing_box() {
         )
         .await;
     }
+}
+
+/// rust-box TUIC/Hysteria2 client → sing-box QUIC server, TCP streams and UDP.
+async fn interop_quic_to_sing_box(inbound: Value, port: u16, outbound: Value) {
+    let (echo, udp_target) = (tcp_echo().await, udp_echo().await);
+    let Some(_sing_box) = sing_box_quic(&server_config(inbound), port).await else { return };
+    let (_client, clients) = start(&client_config(0, outbound)).await;
+    assert_tcp_echo(clients[0], echo).await;
+    assert_udp_echo(clients[0], udp_target).await;
+}
+
+#[tokio::test]
+async fn interop_rust_box_tuic_to_sing_box() {
+    let pki = pki();
+    let port = free_port();
+    let inbound = json!({
+        "type": "tuic", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
+        "users": [{"name": "alice", "uuid": UUID, "password": "tuic-password"}],
+        "congestion_control": "cubic",
+        "tls": server_tls(&pki)
+    });
+    let outbound = json!({
+        "type": "tuic", "tag": "proxy", "server": "127.0.0.1", "server_port": port,
+        "uuid": UUID, "password": "tuic-password", "congestion_control": "cubic",
+        "tls": client_tls(&pki)
+    });
+    interop_quic_to_sing_box(inbound, port, outbound).await;
+}
+
+#[tokio::test]
+async fn interop_rust_box_hysteria2_to_sing_box() {
+    let pki = pki();
+    let port = free_port();
+    // Both sides advertise bandwidth so sing-box selects Brutal; zero rates
+    // select BBR-meta2, which Quinn does not implement and rust-box rejects.
+    let inbound = json!({
+        "type": "hysteria2", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
+        "users": [{"name": "alice", "password": "hysteria2-password"}],
+        "up_mbps": 10, "down_mbps": 10,
+        "tls": server_tls(&pki)
+    });
+    let outbound = json!({
+        "type": "hysteria2", "tag": "proxy", "server": "127.0.0.1", "server_port": port,
+        "password": "hysteria2-password", "up_mbps": 10, "down_mbps": 10,
+        "disable_chrome_parrot": true, "tls": client_tls(&pki)
+    });
+    interop_quic_to_sing_box(inbound, port, outbound).await;
 }
