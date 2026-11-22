@@ -825,9 +825,6 @@ fn check_hysteria2_outbound(path: &str, options: &Hysteria2Outbound) -> Result<(
         return Err(field("realm"));
     }
     check_hysteria2_obfs(&format!("{path}.obfs"), options.obfs.as_ref())?;
-    if options.network.build().iter().any(|network| network == "udp") {
-        return Err(field("network"));
-    }
     if !options.disable_chrome_parrot {
         return Err(field("disable_chrome_parrot"));
     }
@@ -2471,14 +2468,6 @@ mod tests {
                 "outbounds[0].server_ports: `server_ports` is not supported by rust-box yet",
             ),
             (
-                r#"{"outbounds":[{"type":"hysteria2"}]}"#,
-                "outbounds[0].network: `network` is not supported by rust-box yet",
-            ),
-            (
-                r#"{"outbounds":[{"type":"hysteria2","network":"udp","disable_chrome_parrot":true}]}"#,
-                "outbounds[0].network: `network` is not supported by rust-box yet",
-            ),
-            (
                 r#"{"outbounds":[{"type":"hysteria2","network":"tcp","disable_chrome_parrot":false}]}"#,
                 "outbounds[0].disable_chrome_parrot: `disable_chrome_parrot` is not supported by rust-box yet",
             ),
@@ -2505,6 +2494,14 @@ mod tests {
         let Outbound::Hysteria2(hysteria2) = &options.outbounds[0] else { panic!() };
         assert_eq!(hysteria2.up_mbps, 10);
         assert_eq!(hysteria2.down_mbps, 20);
+    }
+
+    #[test]
+    fn hysteria2_outbound_accepts_udp_network() {
+        let options =
+            parse(r#"{"outbounds":[{"type":"hysteria2","network":"udp","disable_chrome_parrot":true}]}"#).unwrap();
+        let Outbound::Hysteria2(hysteria2) = &options.outbounds[0] else { panic!() };
+        assert_eq!(hysteria2.network.build(), vec!["udp".to_string()]);
     }
 
     #[test]

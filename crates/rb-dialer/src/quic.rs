@@ -58,6 +58,18 @@ pub async fn connect_with_datagrams(
     connect_with_options_inner(packet_conn, destination, tls, server_name, options, true, None).await
 }
 
+/// Connects with DATAGRAM support and a protocol-specific congestion controller factory.
+pub async fn connect_with_datagrams_and_congestion_controller(
+    packet_conn: SharedPacketConn,
+    destination: Socksaddr,
+    tls: Arc<rustls::ClientConfig>,
+    server_name: &str,
+    options: &QuicOptions,
+    controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> io::Result<(Endpoint, Connection)> {
+    connect_with_options_inner(packet_conn, destination, tls, server_name, options, true, Some(controller)).await
+}
+
 /// Connects with a protocol-specific congestion controller factory.
 pub async fn connect_with_congestion_controller(
     packet_conn: SharedPacketConn,

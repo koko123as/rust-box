@@ -1,24 +1,27 @@
-//! Hysteria2 outbound TCP runtime: HTTP/3 authentication followed by raw QUIC
-//! bidirectional streams, matching sing-box's outbound connection sequence.
+//! Hysteria2 outbound runtime: HTTP/3 authentication followed by raw QUIC
+//! TCP streams or UDP QUIC datagrams, matching sing-box's outbound sequence.
 use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use http::{Method, Request, Uri};
-use quinn::{Connection, RecvStream, VarInt};
+use quinn::{Connection, Endpoint, RecvStream, VarInt};
 use rand::Rng;
-use rb_adapter::{BoxStream, InboundContext, Network, Outbound};
+use rb_adapter::{BoxStream, InboundContext, Network, Outbound, PacketConn, SharedPacketConn, Socksaddr};
 use rb_config::{Duration as ConfigDuration, Hysteria2Outbound as OutboundOptions, MemoryBytes, QuicOptions};
 use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use super::auth::{
     hysteria_mbps_to_bps, AuthRequest, AuthResponse, CongestionControl, AUTH_HOST, AUTH_OK_STATUS, AUTH_PATH,
 };
+use super::packet::{fragment, Reassembler, UdpMessage, MAX_UDP_SIZE};
 use super::tcp;
 
 const TCP_REQUEST_PADDING_MIN: usize = 64;
@@ -26,8 +29,9 @@ const TCP_REQUEST_PADDING_MAX: usize = 512;
 const TCP_RESPONSE_MESSAGE_LIMIT: usize = 2048;
 const TCP_RESPONSE_PADDING_LIMIT: usize = 4096;
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const HYSTERIA2_UDP_MTU: usize = 1200 - 3;
 
-/// A Hysteria2 outbound with TCP and negotiated Brutal support. UDP, obfuscation,
+/// A Hysteria2 outbound with TCP/UDP and negotiated Brutal support. Obfuscation,
 /// Chrome mimic, and BBR-meta2 remain unavailable until their runtime paths land.
 pub struct Hysteria2Outbound {
     tag: String,
@@ -40,6 +44,7 @@ pub struct Hysteria2Outbound {
     send_bps: u64,
     receive_bps: u64,
     quic: QuicOptions,
+    networks: Vec<Network>,
 }
 
 impl Hysteria2Outbound {
@@ -58,9 +63,6 @@ impl Hysteria2Outbound {
                 "salamander" | "gecko" => Err(unsupported_config_field(config_path, "obfs.type", "obfs.type")),
                 other => Err(format!("{config_path}.obfs.type: unknown Hysteria2 obfs type: {other}")),
             };
-        }
-        if options.network.build().iter().any(|network| network == "udp") {
-            return Err(unsupported_config_field(config_path, "network", "network"));
         }
         if !options.disable_chrome_parrot {
             return Err(unsupported_config_field(config_path, "disable_chrome_parrot", "disable_chrome_parrot"));
@@ -89,6 +91,16 @@ impl Hysteria2Outbound {
         let server_name = tls_client.server_name().to_string();
         let tls = tls_client.rustls_config();
         let server = rb_adapter::Socksaddr::from_host_port(&options.server, options.server_port);
+        let networks = options
+            .network
+            .build()
+            .into_iter()
+            .map(|network| match network.as_str() {
+                "tcp" => Ok(Network::Tcp),
+                "udp" => Ok(Network::Udp),
+                other => Err(format!("{config_path}.network: unknown network: {other}")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let dialer = new_outbound_dialer(
             &options.dialer_options(),
             server.domain().is_some(),
@@ -108,21 +120,34 @@ impl Hysteria2Outbound {
             send_bps: hysteria_mbps_to_bps(options.up_mbps),
             receive_bps: hysteria_mbps_to_bps(options.down_mbps),
             quic,
+            networks,
         }))
     }
 
-    async fn connect_tcp(&self, destination: &rb_adapter::Socksaddr) -> io::Result<BoxStream> {
+    async fn open_authenticated_connection(&self) -> io::Result<(Endpoint, Connection, JoinHandle<()>, AuthResponse)> {
         let packet_conn = self.dialer.dial_udp(&self.server).await?;
         let controller = Arc::new(quinn::congestion::Hysteria2NegotiatedConfig::default());
-        let (endpoint, connection) = rb_dialer::quic::connect_with_congestion_controller(
-            packet_conn,
-            self.server.clone(),
-            self.tls.clone(),
-            &self.server_name,
-            &self.quic,
-            controller.clone(),
-        )
-        .await?;
+        let (endpoint, connection) = if self.networks.contains(&Network::Udp) {
+            rb_dialer::quic::connect_with_datagrams_and_congestion_controller(
+                packet_conn,
+                self.server.clone(),
+                self.tls.clone(),
+                &self.server_name,
+                &self.quic,
+                controller.clone(),
+            )
+            .await?
+        } else {
+            rb_dialer::quic::connect_with_congestion_controller(
+                packet_conn,
+                self.server.clone(),
+                self.tls.clone(),
+                &self.server_name,
+                &self.quic,
+                controller.clone(),
+            )
+            .await?
+        };
         let (driver, auth_response) =
             match tokio::time::timeout(self.auth_timeout, authenticate(&connection, &self.password, self.receive_bps))
                 .await
@@ -158,28 +183,39 @@ impl Hysteria2Outbound {
                 ));
             }
         }
+        Ok((endpoint, connection, driver, auth_response))
+    }
 
+    async fn connect_tcp(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
+        let (endpoint, connection, driver, _auth_response) = self.open_authenticated_connection().await?;
         let (mut send, mut recv) = match connection.open_bi().await {
             Ok(streams) => streams,
             Err(error) => {
-                driver.abort();
+                close_hysteria2_session(&endpoint, &connection, &driver, b"Hysteria2 open TCP stream failed").await;
                 return Err(io::Error::other(format!("Hysteria2 open TCP stream: {error}")));
             }
         };
-        let request = tcp::encode_tcp_request(&destination.to_string(), &random_padding())?;
+        let request = match tcp::encode_tcp_request(&destination.to_string(), &random_padding()) {
+            Ok(request) => request,
+            Err(error) => {
+                close_hysteria2_session(&endpoint, &connection, &driver, b"Hysteria2 TCP request encoding failed")
+                    .await;
+                return Err(error);
+            }
+        };
         if let Err(error) = send.write_all(&request).await {
-            driver.abort();
+            close_hysteria2_session(&endpoint, &connection, &driver, b"Hysteria2 TCP request write failed").await;
             return Err(io::Error::other(format!("Hysteria2 write TCP request: {error}")));
         }
         let (status, message) = match read_tcp_response(&mut recv).await {
             Ok(response) => response,
             Err(error) => {
-                driver.abort();
+                close_hysteria2_session(&endpoint, &connection, &driver, b"Hysteria2 TCP response read failed").await;
                 return Err(error);
             }
         };
         if status != 0 {
-            driver.abort();
+            close_hysteria2_session(&endpoint, &connection, &driver, b"Hysteria2 TCP request rejected").await;
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("Hysteria2 TCP request rejected: {}", String::from_utf8_lossy(&message)),
@@ -187,6 +223,35 @@ impl Hysteria2Outbound {
         }
         let inner = rb_dialer::quic::bidi_stream_with_close(endpoint, connection, send, recv);
         Ok(Box::new(Hysteria2TcpStream { inner, h3_driver: driver }))
+    }
+
+    async fn connect_udp(&self) -> io::Result<SharedPacketConn> {
+        if !self.networks.contains(&Network::Udp) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Hysteria2 UDP network is disabled"));
+        }
+        let (endpoint, connection, driver, auth_response) = self.open_authenticated_connection().await?;
+        if !auth_response.udp_enabled {
+            driver.abort();
+            connection.close(VarInt::from_u32(0), b"Hysteria2 UDP disabled by server");
+            endpoint.wait_idle().await;
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Hysteria2 UDP disabled by server"));
+        }
+        let Some(max_datagram) = connection.max_datagram_size() else {
+            driver.abort();
+            connection.close(VarInt::from_u32(0), b"Hysteria2 QUIC DATAGRAM unavailable");
+            endpoint.wait_idle().await;
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Hysteria2 QUIC DATAGRAM is not supported"));
+        };
+        Ok(Arc::new(Hysteria2PacketConn {
+            _endpoint: endpoint,
+            connection,
+            h3_driver: driver,
+            session_id: 0,
+            packet_id: AtomicU32::new(0),
+            max_datagram: HYSTERIA2_UDP_MTU.min(max_datagram),
+            read_lock: Mutex::new(()),
+            reassembler: Mutex::new(Reassembler::new(256, MAX_UDP_SIZE)),
+        }))
     }
 }
 
@@ -201,12 +266,115 @@ impl Outbound for Hysteria2Outbound {
     }
 
     fn networks(&self) -> &[Network] {
-        &[Network::Tcp]
+        &self.networks
     }
 
     async fn dial_tcp(&self, context: &InboundContext) -> io::Result<BoxStream> {
         self.connect_tcp(&context.destination).await
     }
+
+    async fn listen_packet(&self, _context: &InboundContext) -> io::Result<SharedPacketConn> {
+        self.connect_udp().await
+    }
+}
+
+struct Hysteria2PacketConn {
+    _endpoint: Endpoint,
+    connection: Connection,
+    h3_driver: JoinHandle<()>,
+    session_id: u32,
+    packet_id: AtomicU32,
+    max_datagram: usize,
+    read_lock: Mutex<()>,
+    reassembler: Mutex<Reassembler>,
+}
+
+impl Drop for Hysteria2PacketConn {
+    fn drop(&mut self) {
+        self.h3_driver.abort();
+        self.connection.close(VarInt::from_u32(0), b"UDP session closed");
+    }
+}
+
+#[async_trait]
+impl PacketConn for Hysteria2PacketConn {
+    async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
+        let _read_guard = self.read_lock.lock().await;
+        loop {
+            let datagram = self
+                .connection
+                .read_datagram()
+                .await
+                .map_err(|error| io::Error::other(format!("Hysteria2 receive UDP datagram: {error}")))?;
+            let message = UdpMessage::decode(&datagram)?;
+            if message.session_id != self.session_id {
+                continue;
+            }
+            let Some(message) = self.reassembler.lock().await.push(message)? else { continue };
+            if message.payload.len() > MAX_UDP_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Hysteria2 UDP payload exceeds 4096 bytes"));
+            }
+            if message.payload.len() > buffer.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "short buffer"));
+            }
+            buffer[..message.payload.len()].copy_from_slice(&message.payload);
+            return Ok((message.payload.len(), parse_destination(&message.destination)?));
+        }
+    }
+
+    async fn write_packet(&self, data: &[u8], address: &Socksaddr) -> io::Result<()> {
+        if data.len() > MAX_UDP_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Hysteria2 UDP payload exceeds 4096 bytes"));
+        }
+        if address.domain().is_some_and(|domain| domain.len() > super::packet::MAX_FQDN_LENGTH) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Hysteria2 destination FQDN exceeds 255 bytes"));
+        }
+        let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % u16::MAX as u32;
+        let message = UdpMessage {
+            session_id: self.session_id,
+            packet_id: packet_id as u16,
+            fragment_id: 0,
+            fragment_total: 1,
+            destination: address.to_string(),
+            payload: data.to_vec(),
+        };
+        for fragment in fragment(&message, self.max_datagram)? {
+            self.connection
+                .send_datagram(fragment.encode()?.into())
+                .map_err(|error| io::Error::other(format!("Hysteria2 send UDP datagram: {error:?}")))?;
+        }
+        Ok(())
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(self.connection.remote_address())
+    }
+}
+
+async fn close_hysteria2_session(endpoint: &Endpoint, connection: &Connection, driver: &JoinHandle<()>, reason: &[u8]) {
+    driver.abort();
+    connection.close(VarInt::from_u32(0), reason);
+    endpoint.wait_idle().await;
+}
+
+fn parse_destination(destination: &str) -> io::Result<Socksaddr> {
+    let (host, port) = if let Some(bracketed) = destination.strip_prefix('[') {
+        let end = bracketed.find(']').ok_or_else(|| invalid_data("invalid Hysteria2 UDP destination"))?;
+        let remainder = &bracketed[end + 1..];
+        let port = remainder.strip_prefix(':').ok_or_else(|| invalid_data("invalid Hysteria2 UDP destination port"))?;
+        let host = &bracketed[..end];
+        if host.parse::<std::net::IpAddr>().is_err() {
+            return Err(invalid_data("invalid Hysteria2 UDP IPv6 destination"));
+        }
+        (host, port)
+    } else {
+        destination.rsplit_once(':').ok_or_else(|| invalid_data("invalid Hysteria2 UDP destination"))?
+    };
+    let port = port.parse::<u16>().map_err(|_| invalid_data("invalid Hysteria2 UDP destination port"))?;
+    if host.is_empty() || (host.contains(':') && host.parse::<std::net::IpAddr>().is_err()) {
+        return Err(invalid_data("invalid Hysteria2 UDP destination host"));
+    }
+    Ok(Socksaddr::from_host_port(host, port))
 }
 
 fn unsupported_config_field(config_path: &str, path: &str, name: &str) -> String {

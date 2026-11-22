@@ -4,9 +4,15 @@
 //! then opaque payload. Destination itself is the canonical `host:port` string used by
 //! upstream; this module preserves it verbatim rather than inventing a second address wire format.
 use std::io;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 const FIXED_HEADER: usize = 8;
 const SALT_LEN: usize = 8;
+pub const MAX_ADDRESS_LENGTH: usize = 2048;
+pub const MAX_FQDN_LENGTH: usize = 255;
+pub const MAX_UDP_SIZE: usize = 4096;
+const REASSEMBLY_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpMessage {
@@ -51,7 +57,8 @@ impl UdpMessage {
         if self.fragment_total == 0 || self.fragment_id >= self.fragment_total {
             return Err(invalid("invalid fragment indices"));
         }
-        if self.destination.len() > 65535 {
+        validate_destination(&self.destination)?;
+        if self.destination.len() > MAX_ADDRESS_LENGTH {
             return Err(invalid("destination string too long"));
         }
         let mut out = Vec::with_capacity(FIXED_HEADER + 8 + self.destination.len() + self.payload.len());
@@ -72,17 +79,18 @@ impl UdpMessage {
         let packet_id = u16::from_be_bytes(input[4..6].try_into().unwrap());
         let fragment_id = input[6];
         let fragment_total = input[7];
-        if fragment_total == 0 || fragment_id >= fragment_total {
+        if fragment_total > 1 && fragment_id >= fragment_total {
             return Err(invalid("invalid fragment indices"));
         }
         let mut pos = FIXED_HEADER;
         let n = usize::try_from(take_varint(input, &mut pos)?).map_err(|_| invalid("destination length overflow"))?;
+        if n > MAX_ADDRESS_LENGTH {
+            return Err(invalid("destination string too long"));
+        }
         let end = pos.checked_add(n).ok_or_else(|| invalid("destination length overflow"))?;
         let dest = std::str::from_utf8(input.get(pos..end).ok_or_else(|| invalid("truncated destination"))?)
             .map_err(|_| invalid("destination is not UTF-8"))?;
-        if dest.is_empty() {
-            return Err(invalid("empty destination"));
-        }
+        validate_destination(dest)?;
         Ok(Self {
             session_id,
             packet_id,
@@ -94,18 +102,48 @@ impl UdpMessage {
     }
 }
 
+fn validate_destination(destination: &str) -> io::Result<()> {
+    let (host, port) = if let Some(bracketed) = destination.strip_prefix('[') {
+        let end = bracketed.find(']').ok_or_else(|| invalid("invalid bracketed destination"))?;
+        let remainder = &bracketed[end + 1..];
+        let port = remainder.strip_prefix(':').ok_or_else(|| invalid("destination port is missing"))?;
+        (&bracketed[..end], port)
+    } else {
+        destination.rsplit_once(':').ok_or_else(|| invalid("destination port is missing"))?
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return Err(invalid("invalid destination"));
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.parse::<IpAddr>().is_err() {
+        if host.contains(':') {
+            return Err(invalid("invalid IP destination"));
+        }
+        if host.len() > MAX_FQDN_LENGTH {
+            return Err(invalid("destination FQDN exceeds 255 bytes"));
+        }
+    }
+    Ok(())
+}
+
 /// Split a datagram into upstream-compatible fragments. Every fragment repeats destination/header.
 pub fn fragment(message: &UdpMessage, max_datagram: usize) -> io::Result<Vec<UdpMessage>> {
+    if message.payload.len() > MAX_UDP_SIZE {
+        return Err(invalid("UDP payload exceeds 4096 bytes"));
+    }
     let mut probe = message.clone();
     probe.fragment_id = 0;
     probe.fragment_total = 1;
     let overhead = probe.encode()?.len() - message.payload.len();
-    if max_datagram <= overhead {
+    if max_datagram < overhead {
         return Err(invalid("datagram limit cannot contain packet header"));
     }
     let chunk = max_datagram - overhead;
     if message.payload.len() <= chunk {
         return Ok(vec![probe]);
+    }
+    if chunk == 0 {
+        return Err(invalid("datagram limit cannot contain packet payload"));
     }
     let count = message.payload.len().div_ceil(chunk);
     if count > u8::MAX as usize {
@@ -128,21 +166,29 @@ pub fn fragment(message: &UdpMessage, max_datagram: usize) -> io::Result<Vec<Udp
 /// Bounded reassembly keyed by the actual upstream identity pair (session, packet).
 #[derive(Debug, Default)]
 pub struct Reassembler {
-    entries: std::collections::HashMap<(u32, u16), Vec<Option<UdpMessage>>>,
+    entries: std::collections::HashMap<(u32, u16), ReassemblyEntry>,
     max_entries: usize,
     max_bytes: usize,
 }
+
+#[derive(Debug)]
+struct ReassemblyEntry {
+    updated: Instant,
+    parts: Vec<Option<UdpMessage>>,
+}
+
 impl Reassembler {
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self { entries: Default::default(), max_entries, max_bytes }
     }
     /// Returns None for an incomplete fragment set; malformed/inconsistent sets are discarded.
     pub fn push(&mut self, m: UdpMessage) -> io::Result<Option<UdpMessage>> {
-        if m.fragment_total == 0 || m.fragment_id >= m.fragment_total {
-            return Err(invalid("invalid fragment indices"));
-        }
-        if m.fragment_total == 1 {
+        self.entries.retain(|_, entry| entry.updated.elapsed() <= REASSEMBLY_TTL);
+        if m.fragment_total <= 1 {
             return Ok(Some(m));
+        }
+        if m.fragment_id >= m.fragment_total {
+            return Err(invalid("invalid fragment indices"));
         }
         let key = (m.session_id, m.packet_id);
         let total = m.fragment_total as usize;
@@ -150,34 +196,31 @@ impl Reassembler {
             if self.entries.len() >= self.max_entries {
                 return Err(invalid("reassembly entry limit reached"));
             }
-            self.entries.insert(key, vec![None; total]);
+            self.entries.insert(key, ReassemblyEntry { updated: Instant::now(), parts: vec![None; total] });
         }
-        let slots = self.entries.get_mut(&key).unwrap();
-        if slots.len() != total {
-            self.entries.remove(&key);
-            return Err(invalid("fragment total mismatch"));
+        let entry = self.entries.get_mut(&key).unwrap();
+        if entry.parts.len() != total {
+            entry.parts = vec![None; total];
         }
-        if slots[m.fragment_id as usize].is_some() {
+        entry.updated = Instant::now();
+        if entry.parts[m.fragment_id as usize].is_some() {
             return Ok(None);
         }
         let fragment_index = m.fragment_id as usize;
-        slots[fragment_index] = Some(m);
-        let bytes: usize = slots.iter().filter_map(|x| x.as_ref()).map(|x| x.payload.len()).sum();
+        entry.parts[fragment_index] = Some(m);
+        let bytes: usize = entry.parts.iter().filter_map(|x| x.as_ref()).map(|x| x.payload.len()).sum();
         if bytes > self.max_bytes {
             self.entries.remove(&key);
             return Err(invalid("reassembly byte limit exceeded"));
         }
-        if slots.iter().any(Option::is_none) {
+        if entry.parts.iter().any(Option::is_none) {
             return Ok(None);
         }
-        let slots = self.entries.remove(&key).unwrap();
-        let mut all = slots.into_iter().map(Option::unwrap);
+        let entry = self.entries.remove(&key).unwrap();
+        let mut all = entry.parts.into_iter().map(Option::unwrap);
         let mut result = all.next().unwrap();
         let mut payload = result.payload;
         for part in all {
-            if part.destination != result.destination {
-                return Err(invalid("fragment destination mismatch"));
-            }
             payload.extend_from_slice(&part.payload);
         }
         result.fragment_id = 0;
@@ -327,11 +370,55 @@ mod tests {
         }
         assert_eq!(done.unwrap().payload, m.payload);
     }
+
+    #[test]
+    fn empty_payload_fits_a_header_sized_datagram() {
+        let mut message = msg("example.org:53");
+        message.payload.clear();
+        let header_size = message.encode().unwrap().len();
+        assert_eq!(fragment(&message, header_size).unwrap(), vec![message]);
+    }
+
     #[test]
     fn malformed_truncated_inputs() {
         for b in [&[][..], &[0u8; 7][..], &[0, 0, 0, 1, 0, 1, 0, 1, 5][..]] {
             assert!(UdpMessage::decode(b).is_err());
         }
+    }
+
+    #[test]
+    fn destination_limits_match_upstream() {
+        let long_name = msg(&format!("{}:443", "a".repeat(MAX_FQDN_LENGTH + 1)));
+        assert!(long_name.encode().is_err());
+        let mut oversized_wire = vec![0; FIXED_HEADER];
+        oversized_wire[7] = 1;
+        put_varint(&mut oversized_wire, (MAX_ADDRESS_LENGTH + 1) as u64).unwrap();
+        oversized_wire.resize(oversized_wire.len() + MAX_ADDRESS_LENGTH + 1, b'a');
+        assert!(UdpMessage::decode(&oversized_wire).is_err());
+        assert!(msg("example.org:not-a-port").encode().is_err());
+    }
+
+    #[test]
+    fn reassembly_expires_stale_entries_and_resets_mismatched_totals() {
+        let mut message = msg("example.org:53");
+        message.fragment_total = 2;
+        let mut reassembler = Reassembler::new(8, MAX_UDP_SIZE);
+        assert!(reassembler.push(message.clone()).unwrap().is_none());
+        let mut mismatch = message.clone();
+        mismatch.fragment_total = 3;
+        mismatch.fragment_id = 1;
+        assert!(reassembler.push(mismatch).unwrap().is_none());
+        assert_eq!(reassembler.entries[&(7, 42)].parts.len(), 3);
+
+        reassembler
+            .entries
+            .values_mut()
+            .for_each(|entry| entry.updated = Instant::now() - REASSEMBLY_TTL - Duration::from_secs(1));
+        let mut next = message;
+        next.packet_id = 43;
+        assert!(reassembler.push(next).unwrap().is_none());
+        assert_eq!(reassembler.entries.len(), 1);
+        assert!(reassembler.entries.contains_key(&(7, 43)));
     }
     #[test]
     fn salamander_roundtrip_and_wrong_key_is_not_plain() {
