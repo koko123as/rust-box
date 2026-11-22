@@ -1352,6 +1352,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-cachefile"
+version = "0.1.0"
+dependencies = [
+ "rb-bbolt",
+ "rb-config",
+ "rb-dns",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "rb-certificate"
 version = "0.1.0"
 dependencies = [
