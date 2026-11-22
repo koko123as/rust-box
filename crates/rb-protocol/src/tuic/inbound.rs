@@ -29,9 +29,12 @@ use tracing::debug;
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAGMENT_SESSIONS: usize = 256;
+const MAX_UDP_SESSIONS: usize = 1024;
 const MAX_UNI_STREAM_SIZE: usize = u16::MAX as usize + 512;
 const STREAM_UDP_MTU: usize = 1200 - 3;
 const UDP_QUEUE_SIZE: usize = 64;
+const MAX_UNI_READERS: usize = 64;
+const _: () = assert!(MAX_UNI_READERS <= UDP_QUEUE_SIZE);
 
 type UdpSessions = Arc<AsyncMutex<HashMap<u16, Arc<TuicUdpSession>>>>;
 
@@ -52,6 +55,8 @@ pub struct TuicInbound {
     detour: Option<String>,
     local_addr: OnceLock<SocketAddr>,
     task: Mutex<Option<JoinHandle<()>>>,
+    endpoint: Mutex<Option<quinn::Endpoint>>,
+    closing: AtomicBool,
 }
 
 impl TuicInbound {
@@ -100,6 +105,8 @@ impl TuicInbound {
             detour: (!listen.detour.is_empty()).then_some(listen.detour),
             local_addr: OnceLock::new(),
             task: Mutex::new(None),
+            endpoint: Mutex::new(None),
+            closing: AtomicBool::new(false),
         })
     }
 
@@ -110,6 +117,7 @@ impl TuicInbound {
     async fn serve(self: Arc<Self>, connection: Connection, user: Option<String>) {
         let sessions: UdpSessions = Arc::new(AsyncMutex::new(HashMap::new()));
         let (uni_tx, mut uni_rx) = mpsc::channel(UDP_QUEUE_SIZE);
+        let uni_readers = Arc::new(tokio::sync::Semaphore::new(MAX_UNI_READERS));
         let mut tasks = JoinSet::new();
 
         let heartbeat_connection = connection.clone();
@@ -131,10 +139,15 @@ impl TuicInbound {
         loop {
             tokio::select! {
                 _ = connection.closed() => break,
-                accepted = connection.accept_uni() => match accepted {
-                    Ok(stream) => {
+                accepted = async {
+                    let permit = uni_readers.clone().acquire_owned().await.map_err(other)?;
+                    let stream = connection.accept_uni().await.map_err(other)?;
+                    Ok::<_, io::Error>((permit, stream))
+                } => match accepted {
+                    Ok((permit, stream)) => {
                         let tx = uni_tx.clone();
                         tasks.spawn(async move {
+                            let _permit = permit;
                             let _ = tx.send(UniEvent::Message(read_uni_stream(stream).await)).await;
                         });
                     }
@@ -209,9 +222,9 @@ impl TuicInbound {
             }
         }
 
+        close_all_sessions(&sessions).await;
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        close_all_sessions(&sessions).await;
     }
 
     async fn handle_uni_message(
@@ -249,6 +262,10 @@ impl TuicInbound {
         let packet = wire::decode_udp(message)?;
         let session = {
             let mut sessions = sessions.lock().await;
+            if should_reject_new_session(sessions.len(), sessions.contains_key(&packet.session_id)) {
+                // Do not evict or disturb established sessions when capacity is exhausted.
+                return Ok(());
+            }
             sessions
                 .entry(packet.session_id)
                 .or_insert_with(|| Arc::new(TuicUdpSession::new(packet.session_id, connection.clone(), udp_stream)))
@@ -371,6 +388,16 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn validate_start_state(closing: bool, started: bool) -> io::Result<()> {
+    if closing {
+        return Err(io::Error::new(io::ErrorKind::NotConnected, "TUIC inbound is closing"));
+    }
+    if started {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "TUIC inbound is already started"));
+    }
+    Ok(())
+}
+
 async fn dissociate_session(sessions: &UdpSessions, session_id: u16) {
     if let Some(session) = sessions.lock().await.remove(&session_id) {
         session.close();
@@ -396,6 +423,10 @@ async fn close_all_sessions(sessions: &UdpSessions) {
     for session in sessions.into_values() {
         session.close();
     }
+}
+
+fn should_reject_new_session(session_count: usize, exists: bool) -> bool {
+    !exists && session_count >= MAX_UDP_SESSIONS
 }
 
 struct TuicUdpSession {
@@ -683,6 +714,8 @@ impl Inbound for TuicInbound {
     }
 
     async fn start(self: Arc<Self>) -> io::Result<()> {
+        let mut task_slot = self.task.lock().unwrap();
+        validate_start_state(self.closing.load(Ordering::Acquire), task_slot.is_some())?;
         self.tls.start().map_err(other)?;
         let socket = self.listener.listen_udp()?;
         let local = socket.local_addr()?;
@@ -690,8 +723,9 @@ impl Inbound for TuicInbound {
         let mut tls = (*self.tls.rustls_config()).clone();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         let endpoint = rb_dialer::quic::tuic_server_endpoint(socket, Arc::new(tls), &self.quic)?;
+        *self.endpoint.lock().unwrap() = Some(endpoint.clone());
         let inbound = self.clone();
-        *self.task.lock().unwrap() = Some(tokio::spawn(async move {
+        *task_slot = Some(tokio::spawn(async move {
             let mut connections = JoinSet::new();
             while let Some(connecting) = endpoint.accept().await {
                 let inbound = inbound.clone();
@@ -708,16 +742,24 @@ impl Inbound for TuicInbound {
                 });
                 while connections.try_join_next().is_some() {}
             }
-            connections.abort_all();
+            endpoint.close(VarInt::from_u32(0), b"TUIC endpoint stopped");
             while connections.join_next().await.is_some() {}
+            endpoint.wait_idle().await;
         }));
         Ok(())
     }
 
     async fn close(&self) {
-        let task = { self.task.lock().unwrap().take() };
+        self.closing.store(true, Ordering::Release);
+        let (endpoint, task) = {
+            let mut task_slot = self.task.lock().unwrap();
+            let endpoint = self.endpoint.lock().unwrap().take();
+            (endpoint, task_slot.take())
+        };
+        if let Some(endpoint) = endpoint {
+            endpoint.close(VarInt::from_u32(0), b"TUIC inbound closed");
+        }
         if let Some(task) = task {
-            task.abort();
             let _ = task.await;
         }
         self.tls.close();
@@ -764,5 +806,30 @@ mod tests {
         let mut inconsistent = packet(1, wire::TuicAddress::Empty, b"b");
         inconsistent.fragment_total = 3;
         assert!(defragger.feed(inconsistent).is_err());
+    }
+
+    #[test]
+    fn udp_session_limit_rejects_only_new_sessions_when_full() {
+        assert_eq!(MAX_UDP_SESSIONS, 1024);
+        assert!(!should_reject_new_session(0, false));
+        assert!(!should_reject_new_session(MAX_UDP_SESSIONS, true));
+        assert!(should_reject_new_session(MAX_UDP_SESSIONS, false));
+    }
+
+    #[test]
+    fn uni_reader_concurrency_is_bounded_by_configured_permits() {
+        let readers = Arc::new(tokio::sync::Semaphore::new(MAX_UNI_READERS));
+        let permits = (0..MAX_UNI_READERS).map(|_| readers.clone().try_acquire_owned().unwrap()).collect::<Vec<_>>();
+
+        assert!(readers.clone().try_acquire_owned().is_err());
+        drop(permits);
+        assert!(readers.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn start_rejects_duplicate_and_post_close_attempts() {
+        assert!(validate_start_state(false, false).is_ok());
+        assert_eq!(validate_start_state(false, true).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(validate_start_state(true, false).unwrap_err().kind(), io::ErrorKind::NotConnected);
     }
 }
