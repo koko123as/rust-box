@@ -13,17 +13,23 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use rb_adapter::{ConnectionRouter, DnsResolver, Inbound, InboundRegistry, Outbound, OutboundRegistry};
+use rb_adapter::{
+    ConnectionRouter, ConnectionTracker, DnsResolver, HistoryStorage, Inbound, InboundRegistry, Outbound,
+    OutboundRegistry,
+};
+use rb_cachefile::CacheFile;
+use rb_clashapi::{ApiParts, ClashApi, ModeManager, TrafficManager};
 use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions};
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
+use rb_group::{GroupContext, Selector, UrlTest};
 use rb_protocol::{
     Block, Direct, HttpOutbound, ProxyInbound, ProxyKind, ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound,
     TrojanInbound, TrojanOutbound, VlessInbound, VlessOutbound, VmessInbound, VmessOutbound,
 };
-use rb_route::Router;
+use rb_route::{Management, Router};
 use rb_rule::{RuleSet, RuleSets};
-use rb_rule_set::{Env as RuleSetEnv, ManagedRuleSet, Updater};
+use rb_rule_set::{Env as RuleSetEnv, ManagedRuleSet, RuleSetCache, SavedRuleSet, Updater};
 use tracing::info;
 
 /// How many rule-sets start at once (sing-box runs them in a task group
@@ -31,6 +37,40 @@ use tracing::info;
 const RULE_SET_START_CONCURRENCY: usize = 5;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The sing-box version whose behaviour rust-box follows (what the Clash
+/// API reports with its own).
+pub const SING_BOX_VERSION: &str = "1.14.4";
+
+/// The cache file's `rule_set` bucket as remote rule-sets use it.
+struct RuleSetStore(Arc<CacheFile>);
+
+impl RuleSetCache for RuleSetStore {
+    fn load_rule_set(&self, tag: &str) -> Option<SavedRuleSet> {
+        self.0.load_rule_set(tag).map(|saved| SavedRuleSet {
+            content: saved.content,
+            last_updated: saved.last_updated,
+            last_etag: saved.last_etag,
+            url_hash: saved.url_hash,
+        })
+    }
+
+    fn save_rule_set(&self, tag: &str, saved: &SavedRuleSet) -> Result<(), String> {
+        let saved = rb_cachefile::SavedBinary {
+            content: saved.content.clone(),
+            last_updated: saved.last_updated,
+            last_etag: saved.last_etag.clone(),
+            url_hash: saved.url_hash.clone(),
+        };
+        self.0.save_rule_set(tag, &saved).map_err(|error| error.to_string())
+    }
+}
+
+/// A group outbound, started with the others.
+enum Group {
+    Selector(Arc<Selector>),
+    UrlTest(Arc<UrlTest>),
+}
 
 pub struct RustBox {
     inbounds: Vec<Arc<dyn Inbound>>,
@@ -41,6 +81,12 @@ pub struct RustBox {
     managed_rule_sets: Vec<Arc<ManagedRuleSet>>,
     rule_set_env: RuleSetEnv,
     updater: Mutex<Option<Updater>>,
+    outbound_registry: Arc<OutboundRegistry>,
+    groups: Vec<Group>,
+    cache_file: Option<Arc<CacheFile>>,
+    dns_disable_expire: bool,
+    mode: Option<Arc<ModeManager>>,
+    clash_api: Option<ClashApi>,
 }
 
 impl RustBox {
@@ -68,12 +114,22 @@ impl RustBox {
                 None => "direct".into(),
             }
         };
+        let experimental = options.experimental.clone().unwrap_or_default();
+        let cache_file = experimental
+            .cache_file
+            .as_ref()
+            .filter(|cache_file| cache_file.enabled)
+            .map(|cache_file| Arc::new(CacheFile::new(cache_file)));
         let rule_set_env = RuleSetEnv {
             certificates: certificates.clone(),
             outbounds: outbound_registry.clone(),
             default_outbound,
             validator: Arc::default(),
+            cache: Arc::default(),
         };
+        if let Some(cache_file) = &cache_file {
+            let _ = rule_set_env.cache.set(Arc::new(RuleSetStore(cache_file.clone())));
+        }
         let mut rule_sets = RuleSets::new();
         let mut managed_rule_sets = Vec::new();
         for (index, rule_set) in options.route.rule_set.iter().enumerate() {
@@ -104,6 +160,19 @@ impl RustBox {
                     }
                 }));
         }
+        // The Clash mode exists with the Clash API (sing-box creates it with
+        // the traffic manager).
+        let mode = experimental.clash_api.as_ref().map(|clash_api| {
+            let list = rb_config::experimental::clash_mode_list(&options.route.rules, &options.dns.rules);
+            Arc::new(ModeManager::new(&clash_api.default_mode, list, Some(dns_router.clone()), cache_file.clone()))
+        });
+        if let Some(mode) = &mode {
+            dns_router.set_clash_mode(mode.clash_mode());
+        }
+        let history = HistoryStorage::new();
+        let group_context =
+            GroupContext { cache_file: cache_file.clone(), history: history.clone(), store: certificates.clone() };
+        let mut groups = Vec::new();
         let dns: Arc<dyn DnsResolver> = dns_router.clone();
         let default_resolver = options.route.default_domain_resolver.as_ref();
         // What remote proxy outbounds dial their server with.
@@ -150,13 +219,17 @@ impl RustBox {
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
                     built
                 }
-                // The group outbounds are parsed and checked; running them is
-                // not wired up yet.
-                OutboundOptions::Selector(_) => {
-                    return Err(anyhow!("outbounds[{index}]: `selector` is not supported by rust-box yet"))
+                OutboundOptions::Selector(selector) => {
+                    let selector = rb_config::SelectorOutbound { tag: tag.clone(), ..selector.clone() };
+                    let built = Arc::new(Selector::new(&selector, group_context.clone()));
+                    groups.push(Group::Selector(built.clone()));
+                    built
                 }
-                OutboundOptions::UrlTest(_) => {
-                    return Err(anyhow!("outbounds[{index}]: `urltest` is not supported by rust-box yet"))
+                OutboundOptions::UrlTest(urltest) => {
+                    let urltest = rb_config::UrlTestOutbound { tag: tag.clone(), ..urltest.clone() };
+                    let built = Arc::new(UrlTest::new(&urltest, group_context.clone()));
+                    groups.push(Group::UrlTest(built.clone()));
+                    built
                 }
             });
         }
@@ -168,10 +241,47 @@ impl RustBox {
             ));
         }
         outbound_registry.set(&outbounds);
+        let all_outbounds = outbounds.clone();
         let router = Arc::new(
-            Router::new(&options.route, outbounds, dns, inbound_registry.clone(), &rule_sets)
-                .context("initialize router")?,
+            Router::with_clash_mode(
+                &options.route,
+                outbounds,
+                dns,
+                inbound_registry.clone(),
+                &rule_sets,
+                mode.as_ref().map(|mode| mode.clash_mode()),
+            )
+            .context("initialize router")?,
         );
+        let traffic = experimental.clash_api.as_ref().map(|_| TrafficManager::new());
+        let trackers: Vec<Arc<dyn ConnectionTracker>> =
+            traffic.iter().map(|traffic| Arc::new(traffic.clone()) as Arc<dyn ConnectionTracker>).collect();
+        router.set_management(Management { trackers, history: history.clone() });
+        let clash_api = match (&experimental.clash_api, traffic, &mode) {
+            (Some(clash_api), Some(traffic), Some(mode)) => {
+                let log_level = if options.log.level.is_empty() {
+                    rb_clashapi::log::LEVEL_INFO
+                } else {
+                    rb_clashapi::log::parse_level(&options.log.level).unwrap_or(rb_clashapi::log::LEVEL_INFO)
+                };
+                let parts = ApiParts {
+                    options: clash_api.clone(),
+                    router: router.clone(),
+                    dns: dns_router.clone(),
+                    outbounds: all_outbounds,
+                    registry: outbound_registry.clone(),
+                    traffic,
+                    history,
+                    mode: mode.clone(),
+                    cache_file: cache_file.clone(),
+                    store: certificates.clone(),
+                    log_level,
+                    version: format!("sing-box {SING_BOX_VERSION} (rust-box {VERSION})"),
+                };
+                Some(ClashApi::new(parts).map_err(|error| anyhow!("create clash-server: {error}"))?)
+            }
+            _ => None,
+        };
         let connection_router: Arc<dyn ConnectionRouter> = router.clone();
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
         for (index, inbound) in options.inbounds.iter().enumerate() {
@@ -218,6 +328,12 @@ impl RustBox {
             managed_rule_sets,
             rule_set_env,
             updater: Mutex::new(None),
+            outbound_registry,
+            groups,
+            cache_file,
+            dns_disable_expire: options.dns.disable_expire,
+            mode,
+            clash_api,
         })
     }
 
@@ -243,7 +359,29 @@ impl RustBox {
     }
 
     pub async fn start(&self) -> Result<()> {
+        if let Some(cache_file) = &self.cache_file {
+            cache_file.open().map_err(|error| anyhow!("start cache-file: {error}"))?;
+            cache_file.set_disable_expire(self.dns_disable_expire);
+            cache_file.start();
+            let storage = rb_dns::DnsStorage {
+                fakeip: cache_file.store_fakeip().then(|| cache_file.clone() as Arc<dyn rb_dns::FakeIpStorage>),
+                rdrc: cache_file.store_rdrc().then(|| cache_file.clone() as Arc<dyn rb_dns::RdrcStore>),
+                dns_cache: cache_file.store_dns().then(|| cache_file.clone() as Arc<dyn rb_dns::DnsCacheStore>),
+            };
+            self.dns.set_storage(storage);
+        }
         self.certificates.start().map_err(|error| anyhow!("start certificate store: {error}"))?;
+        let lookup = |tag: &str| self.outbound_registry.get(tag).ok();
+        for group in &self.groups {
+            match group {
+                Group::Selector(selector) => selector.start(&lookup),
+                Group::UrlTest(urltest) => urltest.start(&lookup),
+            }
+            .map_err(|error| anyhow!("start outbound: {error}"))?;
+        }
+        if let Some(mode) = &self.mode {
+            mode.start();
+        }
         self.start_rule_sets().await.context("start router")?;
         self.dns.start(&self.rule_sets).context("start dns-router")?;
         for inbound in &self.inbounds {
@@ -254,11 +392,27 @@ impl RustBox {
                 .with_context(|| format!("start inbound/{}[{}]", inbound.kind(), inbound.tag()))?;
         }
         *self.updater.lock().unwrap() = Updater::start(self.managed_rule_sets.clone());
+        for group in &self.groups {
+            if let Group::UrlTest(urltest) = group {
+                urltest.post_start();
+            }
+        }
+        if let Some(clash_api) = &self.clash_api {
+            clash_api.start().await.map_err(|error| anyhow!("start clash-server: {error}"))?;
+        }
         info!("rust-box started");
         Ok(())
     }
 
     pub async fn close(&self) {
+        if let Some(clash_api) = &self.clash_api {
+            clash_api.close();
+        }
+        for group in &self.groups {
+            if let Group::UrlTest(urltest) = group {
+                urltest.close();
+            }
+        }
         if let Some(updater) = self.updater.lock().unwrap().take() {
             updater.close();
         }
@@ -270,6 +424,9 @@ impl RustBox {
             rule_set.close();
         }
         self.certificates.close();
+        if let Some(cache_file) = &self.cache_file {
+            cache_file.close();
+        }
     }
 
     pub fn rule_sets(&self) -> &RuleSets {

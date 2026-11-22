@@ -60,6 +60,8 @@ fn load(path: &PathBuf) -> Result<rb_config::Options> {
 }
 
 fn init_log(options: &rb_config::LogOptions) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     if options.disabled {
         return Ok(());
     }
@@ -78,14 +80,14 @@ fn init_log(options: &rb_config::LogOptions) -> Result<()> {
             std::fs::OpenOptions::new().create(true).append(true).open(&options.output).context("open log output")?;
         let builder = builder.with_ansi(false).with_writer(std::sync::Mutex::new(file));
         if options.timestamp {
-            builder.init()
+            builder.finish().with(rb_clashapi::ObservableLayer).init()
         } else {
-            builder.without_time().init()
+            builder.without_time().finish().with(rb_clashapi::ObservableLayer).init()
         }
     } else if options.timestamp {
-        builder.init()
+        builder.finish().with(rb_clashapi::ObservableLayer).init()
     } else {
-        builder.without_time().init()
+        builder.without_time().finish().with(rb_clashapi::ObservableLayer).init()
     }
     Ok(())
 }

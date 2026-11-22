@@ -277,3 +277,37 @@ sing-box v1.14.4 binary in both directions (`SING_BOX_BIN`).
   interoperability test against sing-box v1.14.4. DoT/DoH/DoQ/DoH3 transport
   tests use local fixtures; live public resolvers and non-Linux platforms have
   not been verified.
+
+## Known differences in milestone 9
+
+- The Clash API runs on its own small HTTP/1.1 server (no HTTP/2, no TLS on
+  the controller). Request bodies over 16 MiB and header blocks over 1 MiB
+  are refused. A trailing slash is accepted on every route, where chi only
+  accepts it on mounted sub-routers.
+- `/version` reports `sing-box 1.14.4 (rust-box <version>)` so dashboards
+  that look for `sing-box` keep working.
+- `/memory` and the `memory` field of `/connections` report the resident set
+  size from `/proc/self/statm` (0 off Linux), not the Go heap in use;
+  `oslimit` is always 0.
+- `/dns/query` builds the answer data with hickory's record formatting, which
+  can differ from miekg/dns `RR.String()` for types other than A, AAAA and
+  CNAME. A query the DNS rules drop answers 500 "response rejected".
+- `/group/{name}/delay` answers 504 when its timeout passes; sing-box returns
+  the partial results it has at that point.
+- `/logs` streams `tracing` events; messages carry rust-box's own wording and
+  fields, not sing-box's, and level `panic`/`fatal` entries never occur.
+- Connection metadata leaves `processPath` empty (no process lookup) and
+  `dnsMode` is always `normal`.
+- The external UI archive is read with a built-in ZIP reader (stored and
+  deflate entries only, no ZIP64), and the download has a 300 s overall
+  limit.
+- The DNS cache persisted in the cache file stores the A/AAAA answer rebuilt
+  from the addresses and TTL rust-box keeps, not the upstream response as
+  received; ECS and environment parts of sing-box's key are not used.
+- RDRC entries are only consulted and written for rules with an address limit
+  in the lookup path; a non-success rcode is not recorded as a rejection.
+- No interoperability test against a running sing-box v1.14.4 has been run in
+  this milestone: the comparison test (`clash_api_matches_sing_box`) is
+  ignored and needs `SING_BOX_BIN`. Cache file compatibility was checked
+  against bbolt files written and read by sing-box's own code through the
+  `RB_BBOLT_TOOL` helper.
