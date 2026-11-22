@@ -4,7 +4,10 @@
 //! `route/dns.go` (`hijack-dns`).
 
 pub mod nat;
+mod prematch;
 pub mod sniff;
+
+pub use prematch::PreMatch;
 
 use std::collections::HashMap;
 use std::io;
