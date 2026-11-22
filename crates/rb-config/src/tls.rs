@@ -104,10 +104,55 @@ impl<'de> Deserialize<'de> for Base64Bytes {
     }
 }
 
-/// Whether a nested object such as `ech`, `reality` or `utls` asks for its
+/// Whether a nested object such as `ech` or `reality` asks for its
 /// feature (`"enabled": true`).
 fn object_enabled(value: &Option<Value>) -> bool {
     matches!(value, Some(Value::Object(object)) if object.get("enabled") == Some(&Value::Bool(true)))
+}
+
+/// sing-box `option.OutboundTLSUTLSOptions`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UtlsOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Empty means sing-box `HelloChrome_Auto`.
+    #[serde(default)]
+    pub fingerprint: String,
+}
+
+impl UtlsOptions {
+    /// Rejects fingerprints that this fork cannot reproduce exactly yet.
+    pub fn validate(&self, path: &str) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let fingerprint = if self.fingerprint.is_empty() { "chrome" } else { &self.fingerprint };
+        let path = format!("{path}.fingerprint");
+        let message = if matches!(
+            fingerprint,
+            "chrome"
+                | "chrome_psk"
+                | "chrome_psk_shuffle"
+                | "chrome_padding_psk_shuffle"
+                | "chrome_pq"
+                | "chrome_pq_psk"
+                | "firefox"
+                | "edge"
+                | "safari"
+                | "360"
+                | "qq"
+                | "ios"
+                | "android"
+                | "random"
+                | "randomized"
+        ) {
+            format!("uTLS fingerprint `{fingerprint}` is not supported by rust-box yet")
+        } else {
+            format!("unknown uTLS fingerprint: {fingerprint}")
+        };
+        Err(ConfigError::Field { path, message })
+    }
 }
 
 fn unsupported(path: &str, name: &str) -> ConfigError {
@@ -274,7 +319,7 @@ pub struct OutboundTlsOptions {
     #[serde(default)]
     pub ech: Option<Value>,
     #[serde(default)]
-    pub utls: Option<Value>,
+    pub utls: Option<UtlsOptions>,
     #[serde(default)]
     pub reality: Option<Value>,
 }
@@ -304,8 +349,8 @@ impl OutboundTlsOptions {
         if object_enabled(&self.ech) {
             return Err(unsupported(path, "ech"));
         }
-        if object_enabled(&self.utls) {
-            return Err(unsupported(path, "utls"));
+        if let Some(utls) = &self.utls {
+            utls.validate(&format!("{path}.utls"))?;
         }
         if object_enabled(&self.reality) {
             return Err(unsupported(path, "reality"));
@@ -371,7 +416,17 @@ mod tests {
             let options: OutboundTlsOptions = serde_json::from_str(json).unwrap();
             options.validate("outbounds[0].tls").unwrap_err().to_string()
         };
-        assert!(outbound(r#"{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}"#).contains("tls.utls"));
+        assert_eq!(
+            outbound(r#"{"enabled":true,"utls":{"enabled":true}}"#),
+            "outbounds[0].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet"
+        );
+        assert_eq!(
+            outbound(r#"{"enabled":true,"utls":{"enabled":true,"fingerprint":"made-up"}}"#),
+            "outbounds[0].tls.utls.fingerprint: unknown uTLS fingerprint: made-up"
+        );
+        let disabled_utls: OutboundTlsOptions =
+            serde_json::from_str(r#"{"enabled":true,"utls":{"enabled":false,"fingerprint":"made-up"}}"#).unwrap();
+        disabled_utls.validate("outbounds[0].tls").unwrap();
         assert!(outbound(r#"{"enabled":true,"ech":{"enabled":true}}"#).contains("tls.ech"));
         assert!(outbound(r#"{"enabled":true,"spoof":"a.com"}"#).contains("tls.spoof"));
         assert!(outbound(r#"{"enabled":true,"kernel_rx":true}"#).contains("tls.kernel_rx"));

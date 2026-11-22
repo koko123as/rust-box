@@ -61,6 +61,9 @@ impl TlsClient {
         if server_name.is_empty() && !options.insecure && !allow_empty_server_name {
             return Err(MISSING_SERVER_NAME.into());
         }
+        // Callers can use this public constructor without parsing a root config;
+        // keep unsupported TLS options fail-closed in that path as well.
+        options.validate("tls").map_err(|error| error.to_string())?;
         let crypto =
             crypto(&options.min_version, &options.max_version, &options.cipher_suites, &options.curve_preferences)?;
         let mut certificate = Vec::new();

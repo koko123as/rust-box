@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rb_certificate::Store;
-use rb_config::{CertificateOptions, InboundTlsOptions, Listable, OutboundTlsOptions};
+use rb_config::{CertificateOptions, InboundTlsOptions, Listable, OutboundTlsOptions, UtlsOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -57,6 +57,17 @@ fn server_default_alpn_is_used_only_when_unconfigured() {
 
 fn client_options(pki: &TestPki) -> OutboundTlsOptions {
     OutboundTlsOptions { enabled: true, certificate: lines(&pki.ca), ..Default::default() }
+}
+
+#[test]
+fn client_constructor_rejects_unimplemented_utls_without_root_config() {
+    let options = OutboundTlsOptions {
+        enabled: true,
+        utls: Some(UtlsOptions { enabled: true, fingerprint: "chrome".into() }),
+        ..Default::default()
+    };
+    let error = TlsClient::new(&options, "example.test", &empty_store()).unwrap_err();
+    assert_eq!(error, "tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet");
 }
 
 /// Runs one handshake over an in-memory pipe and echoes a line through it.

@@ -43,7 +43,7 @@ pub use rule_set::{
     DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,
     RuleSetKind, RuleSetOptions,
 };
-pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions};
+pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions, UtlsOptions};
 pub use types::{DomainResolveOptions, DomainStrategy, Duration, IpPrefix, Listable, QueryType, UdpTimeout, User};
 pub use wireguard::{Endpoint, WireGuardEndpointOptions, WireGuardPeer};
 
@@ -1443,6 +1443,45 @@ fn validate_fakeip_ranges(value: &Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// `#[serde(tag = "type")]` buffers tagged variant content and loses the
+/// nested path for unknown fields. Preflight client TLS `utls` objects so the
+/// error matches sing-box's full field path.
+fn validate_utls_unknown_fields_in_tls(tls: &Value, path: &str) -> Result<(), ConfigError> {
+    let Some(tls_fields) = tls.as_object() else { return Ok(()) };
+    let Some(utls) = tls_fields.get("utls") else { return Ok(()) };
+    let Some(utls_fields) = utls.as_object() else { return Ok(()) };
+    for field in utls_fields.keys() {
+        if !matches!(field.as_str(), "enabled" | "fingerprint") {
+            return Err(ConfigError::Field {
+                path: format!("{path}.utls.{field}"),
+                message: format!("json: unknown field \"{field}\""),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_utls_unknown_fields(value: &Value) -> Result<(), ConfigError> {
+    let Some(root) = value.as_object() else { return Ok(()) };
+    if let Some(outbounds) = root.get("outbounds").and_then(Value::as_array) {
+        for (index, outbound) in outbounds.iter().enumerate() {
+            if let Some(tls) = outbound.as_object().and_then(|object| object.get("tls")) {
+                validate_utls_unknown_fields_in_tls(tls, &format!("outbounds[{index}].tls"))?;
+            }
+        }
+    }
+    if let Some(servers) =
+        root.get("dns").and_then(Value::as_object).and_then(|dns| dns.get("servers")).and_then(Value::as_array)
+    {
+        for (index, server) in servers.iter().enumerate() {
+            if let Some(tls) = server.as_object().and_then(|object| object.get("tls")) {
+                validate_utls_unknown_fields_in_tls(tls, &format!("dns.servers[{index}].tls"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses a configuration, naming the path of a field that fails.
 pub fn parse(content: &str) -> Result<Options, ConfigError> {
     let clean = strip_json_comments(content.as_bytes()).map_err(ConfigError::Unsupported)?;
@@ -1456,6 +1495,7 @@ pub fn parse(content: &str) -> Result<Options, ConfigError> {
     }
     validate_hosts_predefined(&value)?;
     validate_fakeip_ranges(&value)?;
+    validate_utls_unknown_fields(&value)?;
     let options: Options = serde_path_to_error::deserialize(value)
         .map_err(|error| ConfigError::Field { path: error.path().to_string(), message: error.inner().to_string() })?;
     options.validate()?;
@@ -2238,7 +2278,21 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("dns.servers[1].tls.utls: `utls` is not supported by rust-box yet"), "{error}");
+        assert!(
+            error.contains(
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet"
+            ),
+            "{error}"
+        );
+
+        let error = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"tls","server":"dns.example","domain_resolver":"local",
+                 "tls":{"utls":{"enabled":false,"unknown":true}}}]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dns.servers[1].tls.utls.unknown: json: unknown field \"unknown\""), "{error}");
 
         let error =
             parse(r#"{"dns":{"servers":[{"type":"tls","server":"1.1.1.1","unknown":true}]}}"#).unwrap_err().to_string();
@@ -2265,7 +2319,7 @@ mod tests {
                 r#"{"dns":{"servers":[{"type":"local","tag":"local"},
                     {"type":"quic","server":"dns.example","domain_resolver":"local",
                      "tls":{"utls":{"enabled":true}}}]}}"#,
-                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
             ),
             (r#"{"dns":{"servers":[{"type":"quic","server":"1.1.1.1","unknown":true}]}}"#, "unknown field `unknown`"),
         ] {
@@ -2300,7 +2354,7 @@ mod tests {
                 r#"{"dns":{"servers":[{"type":"local","tag":"local"},
                     {"type":"https","server":"dns.example","domain_resolver":"local",
                      "tls":{"utls":{"enabled":true}}}]}}"#,
-                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
             ),
             (
                 r#"{"dns":{"servers":[{"type":"https","server":"dns.example","unknown":true}]}}"#,
@@ -2337,7 +2391,7 @@ mod tests {
                 r#"{"dns":{"servers":[{"type":"local","tag":"local"},
                     {"type":"h3","server":"dns.example","domain_resolver":"local",
                      "tls":{"utls":{"enabled":true}}}]}}"#,
-                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
             ),
             (r#"{"dns":{"servers":[{"type":"h3","server":"1.1.1.1","unknown":true}]}}"#, "unknown field `unknown`"),
         ] {
@@ -2445,8 +2499,12 @@ mod tests {
             (r#"{"outbounds":[{"type":"socks","network":"icmp"}]}"#, "unknown network: icmp"),
             (r#"{"outbounds":[{"type":"http","detour":"x"}]}"#, "outbounds[0].detour: outbound detour not found: x"),
             (
-                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":true}}}]}"#,
-                "outbounds[0].tls.utls: `utls` is not supported by rust-box yet",
+                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}]}"#,
+                "outbounds[0].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":false,"unknown":true}}}]}"#,
+                "outbounds[0].tls.utls.unknown: json: unknown field \"unknown\"",
             ),
             (r#"{"inbounds":[{"type":"socks","tls":{"enabled":true}}]}"#, "inbounds[0]: unknown field `tls`"),
             (
@@ -2806,7 +2864,7 @@ mod tests {
             (r#"{"outbounds":[{"type":"vless","method":"x"}]}"#, "unknown field `method`"),
             (
                 r#"{"outbounds":[{"type":"trojan","tls":{"enabled":true,"utls":{"enabled":true}}}]}"#,
-                "outbounds[0].tls.utls",
+                "outbounds[0].tls.utls.fingerprint",
             ),
         ] {
             let error = parse(config).unwrap_err().to_string();
