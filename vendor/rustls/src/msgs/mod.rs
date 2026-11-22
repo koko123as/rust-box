@@ -38,6 +38,8 @@ pub(crate) mod alert;
 pub(crate) mod base;
 pub(crate) mod ccs;
 pub(crate) mod codec;
+#[allow(dead_code)] // Connected to ClientHello profile ordering in a later validated slice.
+pub(crate) mod go_math_rand;
 pub(crate) mod client_hello_profile;
 pub(crate) mod deframer;
 pub(crate) mod enums;
