@@ -1263,11 +1263,49 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
 }
 
+#[cfg(feature = "aws-lc-rs")]
+#[test]
+fn client_hello_x25519_mlkem768_share_matches_utls_chrome133_wire_shape() {
+    use crate::crypto::aws_lc_rs;
+
+    let provider = CryptoProvider {
+        kx_groups: vec![aws_lc_rs::kx_group::X25519MLKEM768],
+        ..aws_lc_rs::default_provider()
+    };
+    let config = ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+    let wire = client_hello_wire_for_config(config).unwrap();
+    let key_share = client_hello_extensions_from_wire(&wire)
+        .into_iter()
+        .find(|(extension_type, _)| *extension_type == ExtensionType::KeyShare)
+        .unwrap()
+        .1;
+
+    // uTLS v1.8.7 Chrome 133 emits ML-KEM-768 EncapsulationKey768 (1184 bytes)
+    // followed by the X25519 public key (32 bytes) for group 0x11ec. These bytes
+    // are ephemeral, so pin the wire structure rather than their values.
+    const MLKEM768_ENCAPSULATION_KEY_LEN: usize = 1184;
+    const X25519_PUBLIC_KEY_LEN: usize = 32;
+    let hybrid_share_len = MLKEM768_ENCAPSULATION_KEY_LEN + X25519_PUBLIC_KEY_LEN;
+    let entry_len = 4 + hybrid_share_len;
+    assert_eq!(key_share.len(), 2 + entry_len);
+    assert_eq!(&key_share[..2], &u16::try_from(entry_len).unwrap().to_be_bytes());
+    assert_eq!(&key_share[2..4], &[0x11, 0xec]);
+    assert_eq!(
+        &key_share[4..6],
+        &u16::try_from(hybrid_share_len).unwrap().to_be_bytes()
+    );
+    let (mlkem_encapsulation_key, x25519_public_key) =
+        key_share[6..].split_at(MLKEM768_ENCAPSULATION_KEY_LEN);
+    assert_eq!(mlkem_encapsulation_key.len(), MLKEM768_ENCAPSULATION_KEY_LEN);
+    assert_eq!(x25519_public_key.len(), X25519_PUBLIC_KEY_LEN);
+}
+
 fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {
-    let mut conn =
-        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
-    let mut bytes = Vec::new();
-    conn.write_tls(&mut bytes).unwrap();
+    let bytes = client_hello_wire_for_config(config)?;
 
     let message = OutboundOpaqueMessage::read(&mut Reader::init(&bytes))
         .unwrap()
@@ -1284,6 +1322,14 @@ fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPaylo
         } => Ok(ch),
         other => panic!("unexpected message {other:?}"),
     }
+}
+
+fn client_hello_wire_for_config(config: ClientConfig) -> Result<Vec<u8>, Error> {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+    Ok(bytes)
 }
 
 fn client_hello_from_wire(bytes: &[u8]) -> ClientHelloPayload {
