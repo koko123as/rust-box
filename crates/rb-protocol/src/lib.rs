@@ -21,6 +21,7 @@ pub mod v2ray;
 pub mod vless;
 pub mod vmess;
 
+pub use hysteria2::outbound::Hysteria2Outbound;
 pub use inbound::{ProxyInbound, ProxyKind};
 pub use outbound::{Block, Direct};
 pub use proxy_outbound::{HttpOutbound, SocksOutbound};

@@ -44,7 +44,7 @@ pub async fn connect_with_options(
     server_name: &str,
     options: &QuicOptions,
 ) -> io::Result<(Endpoint, Connection)> {
-    connect_with_options_inner(packet_conn, destination, tls, server_name, options, false).await
+    connect_with_options_inner(packet_conn, destination, tls, server_name, options, false, None).await
 }
 
 /// Connects with QUIC DATAGRAM support enabled for protocols such as TUIC.
@@ -55,7 +55,19 @@ pub async fn connect_with_datagrams(
     server_name: &str,
     options: &QuicOptions,
 ) -> io::Result<(Endpoint, Connection)> {
-    connect_with_options_inner(packet_conn, destination, tls, server_name, options, true).await
+    connect_with_options_inner(packet_conn, destination, tls, server_name, options, true, None).await
+}
+
+/// Connects with a protocol-specific congestion controller factory.
+pub async fn connect_with_congestion_controller(
+    packet_conn: SharedPacketConn,
+    destination: Socksaddr,
+    tls: Arc<rustls::ClientConfig>,
+    server_name: &str,
+    options: &QuicOptions,
+    controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> io::Result<(Endpoint, Connection)> {
+    connect_with_options_inner(packet_conn, destination, tls, server_name, options, false, Some(controller)).await
 }
 
 async fn connect_with_options_inner(
@@ -65,6 +77,7 @@ async fn connect_with_options_inner(
     server_name: &str,
     options: &QuicOptions,
     enable_datagrams: bool,
+    controller: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
 ) -> io::Result<(Endpoint, Connection)> {
     let socket = QuicPacketSocket::new(packet_conn, destination);
     let peer = socket.peer_addr;
@@ -74,6 +87,9 @@ async fn connect_with_options_inner(
         Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, Arc::new(quinn::TokioRuntime))?;
     let mut client = ClientConfig::new(Arc::new(crypto));
     let mut transport = transport_config(options)?;
+    if let Some(controller) = controller {
+        transport.congestion_controller_factory(controller);
+    }
     if enable_datagrams {
         transport.datagram_receive_buffer_size(Some(64 * 1024));
         transport.datagram_send_buffer_size(64 * 1024);

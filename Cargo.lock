@@ -1498,6 +1498,8 @@ dependencies = [
  "crc32fast",
  "futures-util",
  "h2",
+ "h3",
+ "h3-quinn",
  "hmac",
  "http",
  "httparse",
