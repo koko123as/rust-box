@@ -768,6 +768,12 @@ fn check_v2ray_transport(
                     return Err(field(format!("{path}.{name}"), format!("`{name}` is not supported by rust-box yet")));
                 }
             }
+            if options.permit_without_stream {
+                return Err(field(
+                    format!("{path}.permit_without_stream"),
+                    "`permit_without_stream` is not supported by rust-box yet".into(),
+                ));
+            }
             Ok(())
         }
         _ => Err(field(path.to_string(), "`transport` is not supported by rust-box yet".into())),
@@ -1443,10 +1449,6 @@ impl Options {
                 Inbound::Vmess(options) => options.transport.as_ref(),
                 _ => None,
             };
-            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
-            if let Inbound::Hysteria2(options) = inbound {
-                check_hysteria2_inbound(&format!("inbounds[{index}]"), options)?;
-            }
             if let Inbound::Vless(options) = inbound {
                 if options.users.iter().any(|user| user.flow == "xtls-rprx-vision")
                     && options.transport.as_ref().is_some_and(|t| matches!(&t.config, V2RayTransportConfig::Grpc(_)))
@@ -1456,6 +1458,16 @@ impl Options {
                         "`transport` is not supported by rust-box yet with flow `xtls-rprx-vision`".into(),
                     ));
                 }
+            }
+            check_v2ray_transport(&format!("inbounds[{index}].transport"), transport, true)?;
+            if transport.is_some_and(|transport| matches!(&transport.config, V2RayTransportConfig::Grpc(_))) {
+                return Err(field(
+                    format!("inbounds[{index}].transport"),
+                    "`transport` is not supported by rust-box yet".into(),
+                ));
+            }
+            if let Inbound::Hysteria2(options) = inbound {
+                check_hysteria2_inbound(&format!("inbounds[{index}]"), options)?;
             }
             if let Inbound::Trojan(trojan) = inbound {
                 trojan.validate_fallback(&format!("inbounds[{index}]"))?;
@@ -2360,6 +2372,26 @@ mod tests {
             (
                 r#"{"outbounds":[{"type":"vmess","transport":{"type":"ws","early_data_header_name":"Sec-WebSocket-Protocol"}}]}"#,
                 "outbounds[0].transport.early_data_header_name: `early_data_header_name` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#,
+                "outbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","ping_timeout":"1s"}}]}"#,
+                "outbounds[0].transport.ping_timeout: `ping_timeout` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"vmess","transport":{"type":"grpc","permit_without_stream":true}}]}"#,
+                "outbounds[0].transport.permit_without_stream: `permit_without_stream` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc"}}]}"#,
+                "inbounds[0].transport: `transport` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"inbounds":[{"type":"vmess","transport":{"type":"grpc","idle_timeout":"1s"}}]}"#,
+                "inbounds[0].transport.idle_timeout: `idle_timeout` is not supported by rust-box yet",
             ),
             (r#"{"outbounds":[{"type":"vmess","transport":{"type":"kcp"}}]}"#, "unknown transport type: kcp"),
             (r#"{"inbounds":[{"type":"vmess","users":[{"alter_id":1}]}]}"#, "unknown field `alter_id`"),
