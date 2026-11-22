@@ -1344,6 +1344,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-bbolt"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "rb-certificate"
 version = "0.1.0"
 dependencies = [
