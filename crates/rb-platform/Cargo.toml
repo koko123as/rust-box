@@ -1,0 +1,10 @@
+[package]
+name = "rb-platform"
+description = "rust-box platform interface (Android VpnService) and shared network state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc.workspace = true

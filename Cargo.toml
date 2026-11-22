@@ -24,6 +24,7 @@ rb-tls = { path = "crates/rb-tls" }
 rb-shadowsocks = { path = "crates/rb-shadowsocks" }
 rb-mux = { path = "crates/rb-mux" }
 rb-netstack = { path = "crates/rb-netstack" }
+rb-platform = { path = "crates/rb-platform" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -163,11 +163,11 @@ async fn interface_mark_and_netns() {
         Err(error) => assert!(error.to_string().contains("set mark 16"), "{error}"),
     }
     // route.default_mark applies when the dialer has no mark of its own.
-    let defaults = NetworkDefaults { default_mark: 7, default_interface: String::new() };
+    let defaults = NetworkDefaults { default_mark: 7, ..Default::default() };
     let with_default = DefaultDialer::new(&DialerOptions::default(), &defaults, false).unwrap();
     assert_eq!(with_default.routing_mark, Some(7));
     // default_interface does not apply when the dialer binds an address.
-    let defaults = NetworkDefaults { default_mark: 0, default_interface: "eth9".into() };
+    let defaults = NetworkDefaults { default_interface: "eth9".into(), ..Default::default() };
     let bound = DefaultDialer::new(
         &DialerOptions { inet4_bind_address: Some("127.0.0.1".parse().unwrap()), ..Default::default() },
         &defaults,

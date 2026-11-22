@@ -57,6 +57,10 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(75);
 pub struct NetworkDefaults {
     pub default_interface: String,
     pub default_mark: u32,
+    /// `route.auto_detect_interface`: sockets without an interface of their
+    /// own are protected by the platform, or bound to the default
+    /// interface ([`rb_platform::auto_detect_interface_control`]).
+    pub auto_detect_interface: bool,
 }
 
 impl NetworkDefaults {
@@ -113,6 +117,8 @@ pub struct DefaultDialer {
     inet6_bind_address: Option<Ipv6Addr>,
     bind_address_no_port: bool,
     protect_path: Option<PathBuf>,
+    /// `route.auto_detect_interface` applies (no interface or address bound).
+    auto_detect_interface: bool,
     reuse_addr: bool,
     netns: Option<PathBuf>,
     tcp_fast_open: bool,
@@ -202,6 +208,9 @@ impl DefaultDialer {
             inet6_bind_address,
             bind_address_no_port: options.bind_address_no_port,
             protect_path: (!options.protect_path.is_empty()).then(|| PathBuf::from(&options.protect_path)),
+            auto_detect_interface: defaults.auto_detect_interface
+                && !disable_default_bind
+                && defaults.default_interface.is_empty(),
             reuse_addr: options.reuse_addr,
             netns: (!options.netns.is_empty()).then(|| sys::netns_path(&options.netns)),
             tcp_fast_open: options.tcp_fast_open,
@@ -266,6 +275,9 @@ impl DefaultDialer {
             }
             if let Some(path) = &self.protect_path {
                 sys::protect(fd, path)?;
+            }
+            if self.auto_detect_interface {
+                rb_platform::auto_detect_interface_control(fd, domain == Domain::IPV6)?;
             }
             match kind {
                 SocketKind::TcpConnect => {

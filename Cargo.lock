@@ -1459,6 +1459,7 @@ dependencies = [
  "rand 0.9.5",
  "rb-adapter",
  "rb-config",
+ "rb-platform",
  "serde_json",
  "socket2",
  "tokio",
@@ -1524,6 +1525,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rb-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1543,6 +1551,7 @@ dependencies = [
  "rb-config",
  "rb-dialer",
  "rb-mux",
+ "rb-platform",
  "rb-route",
  "rb-shadowsocks",
  "rb-tls",

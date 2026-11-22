@@ -999,8 +999,8 @@ pub struct RouteOptions {
     pub r#final: String,
     #[serde(default)]
     pub default_domain_resolver: Option<DomainResolveOptions>,
-    /// Accepted and ignored: rust-box has no TUN yet, and without a TUN
-    /// nothing needs to bind to the default interface.
+    /// Outbound sockets are protected by the platform interface, or bound
+    /// to the default interface (Linux), so they do not loop into a TUN.
     #[serde(default)]
     pub auto_detect_interface: bool,
     /// Interface outbound connections bind to by default (Linux).
