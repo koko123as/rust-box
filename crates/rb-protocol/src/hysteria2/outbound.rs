@@ -451,8 +451,11 @@ async fn authenticate(
     let (mut driver, mut sender) = h3::client::new(h3_connection)
         .await
         .map_err(|error| io::Error::other(format!("Hysteria2 establish HTTP/3: {error}")))?;
+    let sender_keepalive = sender.clone();
     let driver = tokio::spawn(async move {
-        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        let result = poll_fn(|cx| driver.poll_close(cx)).await;
+        drop(sender_keepalive);
+        let _ = result;
     });
     let uri = Uri::builder()
         .scheme("https")
