@@ -69,12 +69,16 @@ impl<'a> Streams<'a> {
         }
 
         let x = self.state.next_reported_remote[dir as usize];
+        let id = StreamId::new(!self.state.side, dir, x);
+        if !self.state.ensure_remote_stream_state(id) {
+            return None;
+        }
         self.state.next_reported_remote[dir as usize] = x + 1;
         if dir == Dir::Bi {
             self.state.send_streams += 1;
         }
 
-        Some(StreamId::new(!self.state.side, dir, x))
+        Some(id)
     }
 
     #[cfg(fuzzing)]
