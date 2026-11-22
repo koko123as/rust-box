@@ -29,16 +29,16 @@ mod tests {
     use crate::crypto::cipher::MessageEncrypter;
     use crate::crypto::tls13::OkmBlock;
     use crate::enums::CertificateType;
-    use crate::msgs::base::PayloadU8;
+    use crate::msgs::base::{Payload, PayloadU8};
     use crate::msgs::ccs::ChangeCipherSpecPayload;
     use crate::msgs::client_hello_profile::{
         ClientHelloExtensionProfile, ClientHelloExtensionProfileEntry,
     };
     use crate::msgs::enums::ECCurveType;
     use crate::msgs::handshake::{
-        CertificateChain, EcParameters, HelloRetryRequestExtensions, KeyShareEntry,
+        CertificateChain, EcParameters, HelloRetryRequestExtensions, KeyShareEntry, ProtocolName,
         ServerEcdhParams, ServerExtensions, ServerKeyExchange, ServerKeyExchangeParams,
-        ServerKeyExchangePayload,
+        ServerKeyExchangePayload, SingleProtocolName,
     };
     use crate::msgs::message::PlainMessage;
     use crate::pki_types::pem::PemObject;
@@ -504,6 +504,85 @@ mod tests {
             }),
             Ok(())
         );
+    }
+
+    #[test]
+    fn client_rejects_application_settings_response_without_alpn() {
+        assert_eq!(
+            client_receives_application_settings(None).map(|_| ()),
+            Err(Error::General(
+                "tls: server sent application settings without ALPN".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn client_records_application_settings_response_after_alpn_negotiation() {
+        let conn = client_receives_application_settings(Some(SingleProtocolName::new(
+            ProtocolName::from(b"h2".to_vec()),
+        )))
+        .unwrap();
+        assert!(conn.core.data.application_settings_response_received);
+    }
+
+    fn client_receives_application_settings(
+        selected_protocol: Option<SingleProtocolName>,
+    ) -> Result<ClientConnection, Error> {
+        let fake_server_crypto = Arc::new(FakeServerCrypto::new());
+        let mut config = client_config_for_rpk(fake_server_crypto.clone());
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        config.application_settings_protocols = Some(vec![b"h2".to_vec()]);
+        let mut conn = ClientConnection::new(
+            config.into(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut sent = Vec::new();
+        conn.write_tls(&mut sent).unwrap();
+
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_3,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        key_share: Some(KeyShareEntry {
+                            group: NamedGroup::X25519,
+                            payload: PayloadU16::new(vec![0xaa; 32]),
+                        }),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        };
+        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+            .unwrap();
+        conn.process_new_packets().unwrap();
+
+        let ee = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::EncryptedExtensions(Box::new(ServerExtensions {
+                    selected_protocol,
+                    application_settings: Some(Payload::empty()),
+                    client_certificate_type: Some(CertificateType::RawPublicKey),
+                    server_certificate_type: Some(CertificateType::RawPublicKey),
+                    ..ServerExtensions::default()
+                })),
+            )),
+        };
+        let mut encrypter = fake_server_crypto.server_handshake_encrypter();
+        let encrypted_ee = encrypter
+            .encrypt(PlainMessage::from(ee).borrow_outbound(), 0)
+            .unwrap();
+        conn.read_tls(&mut encrypted_ee.encode().as_slice())
+            .unwrap();
+        conn.process_new_packets()?;
+        Ok(conn)
     }
 
     fn client_requiring_rpk_receives_server_ee(

@@ -506,6 +506,14 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                 .map(|protocol| protocol.as_ref()),
             self.config.check_selected_alpn,
         )?;
+        if exts.application_settings.is_some() {
+            if cx.common.alpn_protocol.is_none() {
+                return Err(Error::General(
+                    "tls: server sent application settings without ALPN".into(),
+                ));
+            }
+            cx.data.application_settings_response_received = true;
+        }
         hs::process_client_cert_type_extension(
             cx.common,
             &self.config,
@@ -1312,6 +1320,19 @@ fn emit_finished_tls13(flight: &mut HandshakeFlightTls13<'_>, verify_data: &cryp
     )));
 }
 
+fn client_application_settings_response(
+    received: bool,
+) -> Option<HandshakeMessagePayload<'static>> {
+    received.then(|| {
+        HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(Box::new(
+            ServerExtensions {
+                application_settings: Some(Payload::empty()),
+                ..ServerExtensions::default()
+            },
+        )))
+    })
+}
+
 fn emit_end_of_early_data_tls13(transcript: &mut HandshakeHash, common: &mut CommonState) {
     if common.is_quic() {
         return;
@@ -1387,6 +1408,11 @@ impl State<ClientConnectionData> for ExpectFinished {
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */
+        if let Some(response) = client_application_settings_response(
+            cx.data.application_settings_response_received,
+        ) {
+            flight.add(response);
+        }
         if let Some(client_auth) = st.client_auth {
             match client_auth {
                 ClientAuthDetails::Empty {
@@ -1728,5 +1754,23 @@ impl KernelState for ExpectQuicTraffic {
         nst: &NewSessionTicketPayloadTls13,
     ) -> Result<(), Error> {
         self.0.handle_new_ticket_impl(cx, nst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::client_application_settings_response;
+    use crate::msgs::codec::Codec;
+
+    #[test]
+    fn client_application_settings_response_is_absent_by_default_and_has_empty_payload() {
+        assert!(client_application_settings_response(false).is_none());
+
+        let response = client_application_settings_response(true).unwrap();
+        let mut encoded = Vec::new();
+        response.encode(&mut encoded);
+        assert_eq!(encoded, b"\x08\x00\x00\x06\x00\x04\x44\xcd\x00\x00");
     }
 }

@@ -1091,6 +1091,7 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
+    pub(super) application_settings_response_received: bool,
 }
 
 impl ClientConnectionData {
@@ -1098,6 +1099,7 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
+            application_settings_response_received: false,
         }
     }
 }
