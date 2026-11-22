@@ -1513,7 +1513,7 @@ dependencies = [
  "rb-rule",
  "rb-rule-set",
  "serde_json",
- "sha1",
+ "sha1 0.10.7",
  "tempfile",
  "tokio",
  "tracing",
