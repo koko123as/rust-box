@@ -164,6 +164,10 @@ impl Controller for Hysteria2NegotiatedController {
         self.refresh(now).inner.on_congestion_event(now, sent, persistent, lost_bytes);
     }
 
+    fn on_congestion_event_batch_end(&mut self, now: Instant, prior_in_flight: u64, space: PacketNumberSpace) {
+        self.refresh(now).inner.on_congestion_event_batch_end(now, prior_in_flight, space);
+    }
+
     fn on_mtu_update(&mut self, new_mtu: u16) {
         let mut state = self.refresh(Instant::now());
         state.current_mtu = new_mtu;

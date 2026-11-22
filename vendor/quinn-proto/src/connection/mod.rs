@@ -1406,6 +1406,7 @@ impl Connection {
             return Ok(());
         }
 
+        let prior_in_flight = self.path.in_flight.bytes;
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
@@ -1458,6 +1459,15 @@ impl Connection {
 
         // Must be called before crypto/pto_count are clobbered
         self.detect_lost_packets(now, space, true);
+        self.path.congestion.on_congestion_event_batch_end(
+            now,
+            prior_in_flight,
+            match space {
+                SpaceId::Initial => PacketNumberSpace::Initial,
+                SpaceId::Handshake => PacketNumberSpace::Handshake,
+                SpaceId::Data => PacketNumberSpace::Data,
+            },
+        );
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -1563,7 +1573,17 @@ impl Connection {
     fn on_loss_detection_timeout(&mut self, now: Instant) {
         if let Some((_, pn_space)) = self.loss_time_and_space() {
             // Time threshold loss Detection
+            let prior_in_flight = self.path.in_flight.bytes;
             self.detect_lost_packets(now, pn_space, false);
+            self.path.congestion.on_congestion_event_batch_end(
+                now,
+                prior_in_flight,
+                match pn_space {
+                    SpaceId::Initial => PacketNumberSpace::Initial,
+                    SpaceId::Handshake => PacketNumberSpace::Handshake,
+                    SpaceId::Data => PacketNumberSpace::Data,
+                },
+            );
             self.set_loss_detection_timer(now);
             return;
         }

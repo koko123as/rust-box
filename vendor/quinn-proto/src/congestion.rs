@@ -96,6 +96,12 @@ pub trait Controller: Send + Sync {
     /// `lost_bytes` indicates how many bytes were lost. This value will be 0 for ECN triggers.
     fn on_congestion_event(&mut self, now: Instant, sent: Instant, is_persistent_congestion: bool, lost_bytes: u64);
 
+    /// End a packet-acknowledgment/loss processing batch after all per-packet
+    /// ACK and loss callbacks for that event have run. `prior_in_flight` is the
+    /// byte count before any ACKs or losses in this batch were removed.
+    #[allow(unused_variables)]
+    fn on_congestion_event_batch_end(&mut self, now: Instant, prior_in_flight: u64, space: PacketNumberSpace) {}
+
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);
 
