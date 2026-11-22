@@ -10,6 +10,7 @@
 pub mod dial;
 pub mod adguard;
 pub mod deprecated;
+pub mod experimental;
 pub mod query_types;
 pub mod quic;
 pub mod rule;
@@ -25,6 +26,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use dial::{DialerOptions, FwMark, InterfaceType, ListenOptions, NetworkStrategy};
+pub use experimental::{
+    CacheFileOptions, ClashApiOptions, DebugOptions, ExperimentalOptions, SelectorOutbound, UrlTestOutbound,
+    V2RayApiOptions,
+};
 pub use quic::{
     Hysteria2Inbound, Hysteria2Obfs, Hysteria2Outbound, Hysteria2User, MemoryBytes, QuicOptions, TuicInbound,
     TuicOutbound, TuicUser,
@@ -52,7 +57,7 @@ pub enum ConfigError {
 
 /// Top-level sections sing-box has and rust-box does not implement yet.
 const UNSUPPORTED_SECTIONS: &[&str] =
-    &["ntp", "certificate_providers", "endpoints", "services", "experimental", "http_clients", "network_namespaces"];
+    &["ntp", "certificate_providers", "endpoints", "services", "http_clients", "network_namespaces"];
 
 /// sing-box `option.Options`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -72,6 +77,8 @@ pub struct Options {
     pub route: RouteOptions,
     #[serde(default)]
     pub certificate: Option<CertificateOptions>,
+    #[serde(default)]
+    pub experimental: Option<ExperimentalOptions>,
 }
 
 /// The top-level `certificate` section (sing-box `option.CertificateOptions`).
@@ -524,6 +531,10 @@ pub enum Outbound {
     Vless(VlessOutbound),
     #[serde(rename = "vmess")]
     Vmess(VmessOutbound),
+    #[serde(rename = "selector")]
+    Selector(SelectorOutbound),
+    #[serde(rename = "urltest")]
+    UrlTest(UrlTestOutbound),
     #[serde(rename = "tuic")]
     Tuic(TuicOutbound),
     #[serde(rename = "hysteria2")]
@@ -541,6 +552,8 @@ impl Outbound {
             Outbound::Trojan(options) => &options.tag,
             Outbound::Vless(options) => &options.tag,
             Outbound::Vmess(options) => &options.tag,
+            Outbound::Selector(options) => &options.tag,
+            Outbound::UrlTest(options) => &options.tag,
             Outbound::Tuic(options) => &options.tag,
             Outbound::Hysteria2(options) => &options.tag,
         }
@@ -558,6 +571,7 @@ impl Outbound {
             Outbound::Trojan(options) => Some(options.dialer_options()),
             Outbound::Vless(options) => Some(options.dialer_options()),
             Outbound::Vmess(options) => Some(options.dialer_options()),
+            Outbound::Selector(_) | Outbound::UrlTest(_) => None,
             Outbound::Tuic(options) => Some(options.dialer_options()),
             Outbound::Hysteria2(options) => Some(options.dialer_options()),
         }
@@ -1343,6 +1357,9 @@ impl Options {
     /// the box (duplicate tags, unknown outbounds and DNS servers).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let field = |path: String, message: String| ConfigError::Field { path, message };
+        if let Some(experimental) = &self.experimental {
+            experimental.validate_debug()?;
+        }
         // sing-box `route.NewNetworkManager`.
         if self.route.default_network_strategy.is_some() {
             if !self.route.default_interface.is_empty() {
@@ -1533,6 +1550,8 @@ impl Options {
                     check_proxy_outbound(&path, vmess.tls.as_ref(), vmess.multiplex.as_ref(), &vmess.transport)?;
                     self.check_dialer(&path, &vmess.dialer_options(), &server_known)?;
                 }
+                Outbound::Selector(selector) => experimental::check_group_tags(&path, &selector.outbounds)?,
+                Outbound::UrlTest(urltest) => experimental::check_group_tags(&path, &urltest.outbounds)?,
                 Outbound::Tuic(tuic) => {
                     check_tuic_outbound(&path, tuic)?;
                     self.check_dialer(&path, &tuic.dialer_options(), &server_known)?;
@@ -1633,6 +1652,9 @@ impl Options {
                 }
                 _ => {}
             }
+        }
+        if let Some(experimental) = &self.experimental {
+            experimental.validate_services()?;
         }
         Ok(())
     }
@@ -1827,8 +1849,8 @@ mod tests {
 
     #[test]
     fn rejects_what_is_not_implemented() {
-        let error = parse(r#"{"experimental": {}}"#).unwrap_err().to_string();
-        assert!(error.contains("experimental"), "{error}");
+        let error = parse(r#"{"ntp": {}}"#).unwrap_err().to_string();
+        assert!(error.contains("ntp"), "{error}");
         let error = parse(r#"{"network_namespaces": []}"#).unwrap_err().to_string();
         assert!(error.contains("network_namespaces"), "{error}");
         let error = parse(r#"{"inbounds":[{"type":"tproxy"}]}"#).unwrap_err().to_string();

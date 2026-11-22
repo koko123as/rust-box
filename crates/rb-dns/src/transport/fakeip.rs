@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use rb_config::{FakeIpDnsServer, IpPrefix};
 
 use super::Answer;
+use crate::storage::{FakeIpMetadata, FakeIpStorage};
 
 const FAKEIP_TTL: u32 = 600;
 
@@ -53,7 +54,12 @@ struct Store {
 pub struct FakeIpTransport {
     inet4_range: Option<AddressRange>,
     inet6_range: Option<AddressRange>,
+    /// The ranges as configured, which the saved metadata is compared with.
+    inet4_prefix: Option<IpPrefix>,
+    inet6_prefix: Option<IpPrefix>,
     store: Mutex<Store>,
+    /// The cache file's FakeIP storage, which replaces the in-memory maps.
+    storage: RwLock<Option<Arc<dyn FakeIpStorage>>>,
 }
 
 impl std::fmt::Debug for FakeIpTransport {
@@ -77,8 +83,60 @@ impl FakeIpTransport {
         Ok(FakeIpTransport {
             inet4_range,
             inet6_range,
+            inet4_prefix: options.inet4_range,
+            inet6_prefix: options.inet6_range,
             store: Mutex::new(Store { current4, current6, ..Default::default() }),
+            storage: RwLock::new(None),
         })
+    }
+
+    fn metadata(&self, store: &Store) -> FakeIpMetadata {
+        FakeIpMetadata {
+            inet4_range: self.inet4_prefix,
+            inet6_range: self.inet6_prefix,
+            inet4_current: store.current4,
+            inet6_current: store.current6,
+        }
+    }
+
+    /// `Store.Start` with the cache file's storage: the saved cursors are
+    /// kept when the ranges did not change, else the storage is reset.
+    pub fn start(&self, storage: Arc<dyn FakeIpStorage>) {
+        let mut store = self.store.lock().unwrap();
+        match storage.metadata() {
+            Some(metadata)
+                if metadata.inet4_range == self.inet4_prefix && metadata.inet6_range == self.inet6_prefix =>
+            {
+                store.current4 = metadata.inet4_current;
+                store.current6 = metadata.inet6_current;
+            }
+            _ => {
+                store.current4 = self.inet4_range.and_then(AddressRange::initial);
+                store.current6 = self.inet6_range.and_then(AddressRange::initial);
+                storage.reset();
+            }
+        }
+        *self.storage.write().unwrap() = Some(storage);
+    }
+
+    /// `Store.Close`: saves the cursors.
+    pub fn close(&self) {
+        if let Some(storage) = self.storage.read().unwrap().as_ref() {
+            storage.save_metadata(&self.metadata(&self.store.lock().unwrap()));
+        }
+    }
+
+    /// `Store.Reset` (the Clash API's FakeIP flush).
+    pub fn reset(&self) {
+        match self.storage.read().unwrap().as_ref() {
+            Some(storage) => storage.reset(),
+            None => {
+                let mut store = self.store.lock().unwrap();
+                store.by_address.clear();
+                store.by_domain4.clear();
+                store.by_domain6.clear();
+            }
+        }
     }
 
     /// `FakeIPStore.Contains`.
@@ -89,6 +147,9 @@ impl FakeIpTransport {
 
     /// `FakeIPStore.Lookup`.
     pub fn lookup(&self, address: IpAddr) -> Option<String> {
+        if let Some(storage) = self.storage.read().unwrap().as_ref() {
+            return storage.load(address);
+        }
         self.store.lock().unwrap().by_address.get(&address).cloned()
     }
 
@@ -107,10 +168,17 @@ impl FakeIpTransport {
             return Ok(Answer { addresses: Vec::new(), ttl: 0 });
         };
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        let storage = self.storage.read().unwrap().clone();
         let mut store = self.store.lock().unwrap();
-        let domain_map = if is_ipv6 { &store.by_domain6 } else { &store.by_domain4 };
-        if let Some(address) = domain_map.get(&domain) {
-            return Ok(Answer { addresses: vec![*address], ttl: FAKEIP_TTL });
+        if let Some(storage) = &storage {
+            if let Some(address) = storage.load_domain(&domain, is_ipv6) {
+                return Ok(Answer { addresses: vec![address], ttl: FAKEIP_TTL });
+            }
+        } else {
+            let domain_map = if is_ipv6 { &store.by_domain6 } else { &store.by_domain4 };
+            if let Some(address) = domain_map.get(&domain) {
+                return Ok(Answer { addresses: vec![*address], ttl: FAKEIP_TTL });
+            }
         }
 
         let current = if is_ipv6 { &mut store.current6 } else { &mut store.current4 };
@@ -130,6 +198,11 @@ impl FakeIpTransport {
         };
         *current = Some(address);
 
+        if let Some(storage) = &storage {
+            storage.store(address, &domain);
+            storage.save_metadata_async(&self.metadata(&store));
+            return Ok(Answer { addresses: vec![address], ttl: FAKEIP_TTL });
+        }
         if let Some(old_domain) = store.by_address.insert(address, domain.clone()) {
             if is_ipv6 {
                 store.by_domain6.remove(&old_domain);

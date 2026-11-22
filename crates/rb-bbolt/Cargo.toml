@@ -1,0 +1,13 @@
+[package]
+name = "rb-bbolt"
+description = "rust-box bbolt-compatible key/value file (github.com/sagernet/bbolt)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

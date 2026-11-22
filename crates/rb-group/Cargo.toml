@@ -1,0 +1,22 @@
+[package]
+name = "rb-group"
+description = "rust-box outbound groups: selector and urltest (sing-box protocol/group)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-adapter.workspace = true
+rb-cachefile.workspace = true
+rb-certificate.workspace = true
+rb-config.workspace = true
+rb-tls.workspace = true
+async-trait.workspace = true
+http.workspace = true
+httparse.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

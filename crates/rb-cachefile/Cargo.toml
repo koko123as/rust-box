@@ -1,0 +1,16 @@
+[package]
+name = "rb-cachefile"
+description = "rust-box cache file (sing-box experimental/cachefile)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-bbolt.workspace = true
+rb-config.workspace = true
+rb-dns.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

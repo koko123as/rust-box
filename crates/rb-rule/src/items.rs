@@ -47,6 +47,10 @@ pub(crate) enum Item {
         ranges: Vec<(u16, u16)>,
         source: bool,
     },
+    ClashMode {
+        mode: String,
+        current: Option<Arc<crate::ClashMode>>,
+    },
     /// Items that need what rust-box does not have (a process searcher, a
     /// platform network monitor): they never match.
     Never,
@@ -160,6 +164,7 @@ impl Item {
     pub(crate) fn matches(&self, metadata: &Metadata) -> bool {
         match self {
             Item::Inbound(set) => set.contains(metadata.inbound),
+            Item::ClashMode { mode, current } => current.as_ref().is_some_and(|current| current.is(mode)),
             Item::IpVersion(v6) => {
                 metadata.ip_version.is_some_and(|version| (version == 6) == *v6)
                     || metadata.destination_ip.is_some_and(|ip| ip.to_canonical().is_ipv6() == *v6)

@@ -1,0 +1,34 @@
+[package]
+name = "rb-clashapi"
+description = "rust-box Clash API (sing-box experimental/clashapi)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rb-adapter.workspace = true
+rb-cachefile.workspace = true
+rb-certificate.workspace = true
+rb-config.workspace = true
+rb-dialer.workspace = true
+rb-dns.workspace = true
+rb-group.workspace = true
+rb-route.workspace = true
+rb-rule.workspace = true
+rb-rule-set.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+flate2.workspace = true
+hickory-proto.workspace = true
+httparse.workspace = true
+libc.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

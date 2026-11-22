@@ -1461,6 +1461,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-bbolt"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
+name = "rb-cachefile"
+version = "0.1.0"
+dependencies = [
+ "rb-bbolt",
+ "rb-config",
+ "rb-dns",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "rb-certificate"
 version = "0.1.0"
 dependencies = [
@@ -1470,6 +1489,35 @@ dependencies = [
  "rustls-pki-types",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "rb-clashapi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "flate2",
+ "hickory-proto",
+ "httparse",
+ "libc",
+ "rand 0.9.5",
+ "rb-adapter",
+ "rb-cachefile",
+ "rb-certificate",
+ "rb-config",
+ "rb-dialer",
+ "rb-dns",
+ "rb-group",
+ "rb-route",
+ "rb-rule",
+ "rb-rule-set",
+ "serde_json",
+ "sha1 0.10.7",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1540,6 +1588,23 @@ version = "0.1.0"
 dependencies = [
  "notify",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "rb-group"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "httparse",
+ "rb-adapter",
+ "rb-cachefile",
+ "rb-certificate",
+ "rb-config",
+ "rb-tls",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -1664,6 +1729,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -1800,11 +1866,14 @@ dependencies = [
  "anyhow",
  "clap",
  "rb-adapter",
+ "rb-cachefile",
  "rb-certificate",
+ "rb-clashapi",
  "rb-common",
  "rb-config",
  "rb-dialer",
  "rb-dns",
+ "rb-group",
  "rb-mux",
  "rb-protocol",
  "rb-route",

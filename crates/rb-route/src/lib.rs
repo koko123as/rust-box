@@ -3,6 +3,7 @@
 //! (`ConnectionManager.NewConnection`, `NewPacketConnection`) and
 //! `route/dns.go` (`hijack-dns`).
 
+pub mod describe;
 pub mod nat;
 mod prematch;
 pub mod sniff;
@@ -12,18 +13,19 @@ pub use prematch::PreMatch;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rb_adapter::{
-    BoxStream, CachedPacketConn, ConnectionHandshake, ConnectionRouter, DnsResolver, Host, InboundContext,
-    InboundRegistry, LookupOptions, Network, Outbound, PacketConn, PrefixedStream, RouteError, SharedPacketConn,
+    Attachment, BoxStream, CachedPacketConn, ConnectionHandshake, ConnectionRouter, ConnectionTracker, DnsResolver,
+    HistoryStorage, Host, InboundContext, InboundRegistry, Interrupt, InterruptPacketConn, InterruptStream,
+    LookupOptions, Network, Outbound, PacketConn, PrefixedStream, RouteError, RoutedConnection, SharedPacketConn,
     Socksaddr, MAX_PACKET_SIZE,
 };
 use rb_config::{RejectMethod, RouteActionOptions, RouteOptions, RuleAction};
 use rb_dialer::tls_fragment::TlsFragmentStream;
-use rb_rule::{compile, compile_route_match, Compiled, Context as RuleContext, Metadata, RuleSets};
+use rb_rule::{compile, compile_route_match, ClashMode, Compiled, Context as RuleContext, Metadata, RuleSets};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 use tracing::{debug, info};
@@ -80,6 +82,14 @@ pub struct Router {
     final_outbound: String,
     dns: Arc<dyn DnsResolver>,
     inbounds: Arc<InboundRegistry>,
+    management: OnceLock<Management>,
+}
+
+/// What the box adds to the router once its management parts exist
+/// (sing-box `Router.AppendTracker` and the URL test history storage).
+pub struct Management {
+    pub trackers: Vec<Arc<dyn ConnectionTracker>>,
+    pub history: Arc<HistoryStorage>,
 }
 
 #[derive(Debug)]
@@ -170,6 +180,18 @@ impl Router {
         inbounds: Arc<InboundRegistry>,
         rule_sets: &RuleSets,
     ) -> Result<Self, RouterError> {
+        Self::with_clash_mode(options, outbounds, dns, inbounds, rule_sets, None)
+    }
+
+    /// [`Router::new`] with the Clash mode that `clash_mode` items read.
+    pub fn with_clash_mode(
+        options: &RouteOptions,
+        outbounds: Vec<Arc<dyn Outbound>>,
+        dns: Arc<dyn DnsResolver>,
+        inbounds: Arc<InboundRegistry>,
+        rule_sets: &RuleSets,
+        clash_mode: Option<Arc<ClashMode>>,
+    ) -> Result<Self, RouterError> {
         let final_outbound = if !options.r#final.is_empty() {
             options.r#final.clone()
         } else {
@@ -183,13 +205,46 @@ impl Router {
             .iter()
             .enumerate()
             .map(|(index, rule)| {
-                let context = RuleContext::new(rule_sets);
+                let context = RuleContext { clash_mode: clash_mode.clone(), ..RuleContext::new(rule_sets) };
                 compile(rule, &|options| compile_route_match(options, &context))
                     .map_err(|error| RouterError(format!("route.rules[{index}]: {error}")))
             })
             .collect::<Result<_, _>>()?;
         let outbounds = outbounds.into_iter().map(|outbound| (outbound.tag().to_string(), outbound)).collect();
-        Ok(Router { rules, outbounds, final_outbound, dns, inbounds })
+        Ok(Router { rules, outbounds, final_outbound, dns, inbounds, management: OnceLock::new() })
+    }
+
+    /// Adds the connection trackers and the URL test history; later calls
+    /// are ignored.
+    pub fn set_management(&self, management: Management) {
+        let _ = self.management.set(management);
+    }
+
+    /// The outbound connections go to when no rule routes them.
+    pub fn default_outbound(&self) -> &str {
+        &self.final_outbound
+    }
+
+    /// The rules as the Clash API lists them: type (`default` or
+    /// `logical`), the rule (`Rule.String()`) and its action.
+    pub fn rule_descriptions(&self) -> Vec<(&'static str, String, String)> {
+        self.rules
+            .iter()
+            .map(|rule| {
+                let kind = match rule.matcher {
+                    rb_rule::Matcher::Default(_) => "default",
+                    rb_rule::Matcher::Logical(_) => "logical",
+                };
+                let action = rule.action().map(describe::describe_action).unwrap_or_default();
+                (kind, rule.matcher.to_string(), action)
+            })
+            .collect()
+    }
+
+    fn describe_rule(&self, index: Option<usize>) -> Option<String> {
+        let rule = &self.rules[index?];
+        let action = rule.action().map(describe::describe_action).unwrap_or_default();
+        Some(format!("{} => {action}", rule.matcher))
     }
 
     /// Matches the rules for a TCP connection (see [`Router::decide_input`]).
@@ -204,11 +259,17 @@ impl Router {
     /// Walks the rules: `sniff`, `resolve` and `route-options` add to the
     /// context and go on; `route`, `reject` and `hijack-dns` end the walk
     /// (sing-box `Router.matchRule`).
-    pub async fn decide_input(
+    pub async fn decide_input(&self, context: &mut InboundContext, input: Input<'_>) -> Result<Decision, RouteError> {
+        Ok(self.decide_rule(context, input).await?.0)
+    }
+
+    /// [`Router::decide_input`] with the index of the rule that decided
+    /// (`None` for the final outbound).
+    async fn decide_rule(
         &self,
         context: &mut InboundContext,
         mut input: Input<'_>,
-    ) -> Result<Decision, RouteError> {
+    ) -> Result<(Decision, Option<usize>), RouteError> {
         self.reverse_fakeip(context)?;
         let mut last_sniffers: Option<&[String]> = None;
         for (index, rule) in self.rules.iter().enumerate() {
@@ -224,7 +285,7 @@ impl Router {
                 RuleAction::Route { outbound, options } => {
                     debug!(rule = index, outbound, "match");
                     apply_route_options(context, options);
-                    return Ok(Decision::Route(outbound.clone()));
+                    return Ok((Decision::Route(outbound.clone()), Some(index)));
                 }
                 RuleAction::RouteOptions(options) => {
                     debug!(rule = index, "match: route-options");
@@ -237,15 +298,15 @@ impl Router {
                 RuleAction::Bypass { outbound, options } => {
                     debug!(rule = index, outbound, "match: bypass");
                     apply_route_options(context, options);
-                    return Ok(Decision::Route(outbound.clone()));
+                    return Ok((Decision::Route(outbound.clone()), Some(index)));
                 }
                 RuleAction::Reject(reject) => {
                     debug!(rule = index, "match: reject");
-                    return Ok(Decision::Reject(reject.method));
+                    return Ok((Decision::Reject(reject.method), Some(index)));
                 }
                 RuleAction::HijackDns => {
                     debug!(rule = index, "match: hijack-dns");
-                    return Ok(Decision::HijackDns);
+                    return Ok((Decision::HijackDns, Some(index)));
                 }
                 RuleAction::Sniff { sniffer, timeout } => {
                     if context.protocol.is_some() {
@@ -306,7 +367,7 @@ impl Router {
                 }
             }
         }
-        Ok(Decision::Route(self.final_outbound.clone()))
+        Ok((Decision::Route(self.final_outbound.clone()), None))
     }
 
     /// The inbound a connection's `detour` names (sing-box
@@ -324,18 +385,71 @@ impl Router {
         self.inbounds.get(detour).ok_or_else(|| error(format!("inbound detour not found: {detour}")))
     }
 
-    /// The outbound for a network (sing-box `resolveOutbound`).
-    fn outbound(&self, tag: &str, network: Network) -> Result<&Arc<dyn Outbound>, RouteError> {
+    /// The outbound a tag names, then what each group in it selects for
+    /// the network (sing-box `resolveOutbound`).
+    fn resolve_chain(&self, tag: &str, network: Network) -> Result<Vec<Arc<dyn Outbound>>, RouteError> {
         let outbound = self.outbounds.get(tag).ok_or_else(|| {
             RouteError::Dial(io::Error::new(io::ErrorKind::NotFound, format!("outbound not found: {tag}")))
         })?;
-        if !outbound.networks().contains(&network) {
-            return Err(RouteError::Dial(io::Error::new(
+        let unsupported = |tag: &str| {
+            RouteError::Dial(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("{} is not supported by outbound: {tag}", network.as_str().to_uppercase()),
-            )));
+            ))
+        };
+        let mut chain = vec![outbound.clone()];
+        loop {
+            let last = chain.last().unwrap().clone();
+            let Some(group) = last.group() else { break };
+            let selected = group.selected(network).ok_or_else(|| unsupported(last.tag()))?;
+            if chain.len() > 64 {
+                return Err(unsupported(last.tag()));
+            }
+            chain.push(selected);
         }
-        Ok(outbound)
+        let last = chain.last().unwrap();
+        if !last.networks().contains(&network) {
+            return Err(unsupported(last.tag()));
+        }
+        Ok(chain)
+    }
+
+    /// What the trackers and groups need of a routed connection: its
+    /// interrupt and route, or `None` when nothing watches it.
+    fn routed<'a>(
+        &self,
+        context: &'a InboundContext,
+        rule: Option<usize>,
+        chain: &[Arc<dyn Outbound>],
+    ) -> Option<(RoutedConnection<'a>, Vec<Attachment>)> {
+        let trackers = self.management.get().map(|management| management.trackers.as_slice()).unwrap_or_default();
+        let groups: Vec<_> = chain.iter().filter_map(|outbound| outbound.group()).collect();
+        if trackers.is_empty() && groups.is_empty() {
+            return None;
+        }
+        let interrupt = Interrupt::new(true);
+        let attachments = groups.iter().map(|group| group.attach(interrupt.clone())).collect();
+        let routed = RoutedConnection {
+            context,
+            rule: if trackers.is_empty() { None } else { self.describe_rule(rule) },
+            chain: chain.iter().map(|outbound| (outbound.tag().to_string(), outbound.kind())).collect(),
+            interrupt,
+        };
+        Some((routed, attachments))
+    }
+
+    fn trackers(&self) -> &[Arc<dyn ConnectionTracker>] {
+        self.management.get().map(|management| management.trackers.as_slice()).unwrap_or_default()
+    }
+
+    /// `ConnectionManager.deleteURLTestHistory`: a failed dial through a URL
+    /// test group drops the outbound's last result.
+    fn delete_url_test_history(&self, chain: &[Arc<dyn Outbound>]) {
+        if chain.iter().any(|outbound| outbound.group().is_some_and(|group| group.is_url_test())) {
+            if let Some(management) = self.management.get() {
+                management.history.delete(chain.last().unwrap().tag());
+            }
+        }
     }
 
     async fn route_connection_inner(
@@ -357,7 +471,7 @@ impl Router {
             let client = client.take().expect("client stream is always given back");
             return inbound.new_connection(context, client).await.map_err(RouteError::Io);
         }
-        let decision = self.decide(&mut context, client).await?;
+        let (decision, rule) = self.decide_rule(&mut context, Input::Stream(client)).await?;
         let tag = match decision {
             Decision::Route(tag) => tag,
             Decision::Reject(_) => {
@@ -379,18 +493,35 @@ impl Router {
                 return Ok(());
             }
         };
-        let outbound = self.outbound(&tag, Network::Tcp)?;
+        let chain = self.resolve_chain(&tag, Network::Tcp)?;
+        let outbound = chain.last().unwrap().clone();
+        let mut _attachments = Vec::new();
+        if let Some((routed, attachments)) = self.routed(&context, rule, &chain) {
+            _attachments = attachments;
+            let mut tracked = client.take().expect("client stream is always given back");
+            tracked = Box::new(InterruptStream::new(tracked, routed.interrupt.clone()));
+            for tracker in self.trackers() {
+                tracked = tracker.routed_connection(&routed, tracked);
+            }
+            *client = Some(tracked);
+        }
         info!(
             "outbound/{}[{}]: outbound connection to {}",
             outbound.kind(),
-            tag,
+            outbound.tag(),
             context
                 .sniff_host
                 .as_ref()
                 .map(|host| format!("{host}:{}", context.destination.port))
                 .unwrap_or_else(|| context.destination.to_string())
         );
-        let mut remote = outbound.dial_tcp(&context).await.map_err(RouteError::Dial)?;
+        let mut remote = match outbound.dial_tcp(&context).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.delete_url_test_history(&chain);
+                return Err(RouteError::Dial(error));
+            }
+        };
         if let Some(handshake) = handshake {
             *handshake_replied = true;
             handshake
@@ -698,8 +829,9 @@ impl ConnectionRouter for Router {
         }
         context.network = Network::Udp;
         let mut cached = Vec::new();
-        let decision = self.decide_input(&mut context, Input::Packet { conn: &client, cached: &mut cached }).await?;
-        let client: SharedPacketConn =
+        let (decision, rule) =
+            self.decide_rule(&mut context, Input::Packet { conn: &client, cached: &mut cached }).await?;
+        let mut client: SharedPacketConn =
             if cached.is_empty() { client } else { Arc::new(CachedPacketConn::new(cached, client)) };
         let tag = match decision {
             Decision::Route(tag) => tag,
@@ -714,18 +846,33 @@ impl ConnectionRouter for Router {
                 return Ok(());
             }
         };
-        let outbound = self.outbound(&tag, Network::Udp)?;
+        let chain = self.resolve_chain(&tag, Network::Udp)?;
+        let outbound = chain.last().unwrap().clone();
+        let mut _attachments = Vec::new();
+        if let Some((routed, attachments)) = self.routed(&context, rule, &chain) {
+            _attachments = attachments;
+            client = Arc::new(InterruptPacketConn::new(client, routed.interrupt.clone()));
+            for tracker in self.trackers() {
+                client = tracker.routed_packet_connection(&routed, client);
+            }
+        }
         info!(
             "outbound/{}[{}]: outbound packet connection to {}",
             outbound.kind(),
-            tag,
+            outbound.tag(),
             context
                 .sniff_host
                 .as_ref()
                 .map(|host| format!("{host}:{}", context.destination.port))
                 .unwrap_or_else(|| context.destination.to_string())
         );
-        let mut remote = outbound.listen_packet(&context).await.map_err(RouteError::Dial)?;
+        let mut remote = match outbound.listen_packet(&context).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.delete_url_test_history(&chain);
+                return Err(RouteError::Dial(error));
+            }
+        };
         // With override_address/override_port, packets the client sends to
         // the original destination go to the new one and replies come back
         // from the original (sing `bufio.NewDestinationNATPacketConn`).

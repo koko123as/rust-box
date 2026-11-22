@@ -45,6 +45,7 @@ fn env(store: &str, certificates: &[&str]) -> Env {
         outbounds,
         default_outbound: "direct".into(),
         validator: Arc::default(),
+        cache: Arc::default(),
     }
 }
 

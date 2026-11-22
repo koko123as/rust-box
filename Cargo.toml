@@ -24,6 +24,10 @@ rb-rule-set = { path = "crates/rb-rule-set" }
 rb-tls = { path = "crates/rb-tls" }
 rb-shadowsocks = { path = "crates/rb-shadowsocks" }
 rb-mux = { path = "crates/rb-mux" }
+rb-bbolt = { path = "crates/rb-bbolt" }
+rb-cachefile = { path = "crates/rb-cachefile" }
+rb-group = { path = "crates/rb-group" }
+rb-clashapi = { path = "crates/rb-clashapi" }
 rb-netstack = { path = "crates/rb-netstack" }
 rb-platform = { path = "crates/rb-platform" }
 rb-tun = { path = "crates/rb-tun" }

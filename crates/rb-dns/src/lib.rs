@@ -5,6 +5,7 @@
 //! where a rule's address limit is checked against the response and the
 //! walk goes on when it fails) and the default mode.
 
+mod storage;
 mod transport;
 
 mod mode;
@@ -26,6 +27,7 @@ use rb_rule::{
     RuleSets,
 };
 
+pub use storage::{DnsCacheStore, DnsStorage, FakeIpMetadata, FakeIpStorage, RdrcStore};
 pub use transport::{
     Answer, DohTransport, DoqTransport, DotTransport, FakeIpTransport, H3Transport, HostsTransport, Transport, QTYPE_A,
     QTYPE_AAAA,
@@ -347,6 +349,10 @@ pub struct DnsRouter {
     strategy: DomainStrategy,
     timeout: Duration,
     cache: Option<Mutex<Cache>>,
+    /// What `clash_mode` rule items read (set by the Clash API).
+    clash_mode: RwLock<Option<Arc<rb_rule::ClashMode>>>,
+    /// The cache file's parts (set before the start).
+    storage: RwLock<DnsStorage>,
 }
 
 #[derive(Default)]
@@ -390,6 +396,30 @@ impl std::fmt::Display for DnsError {
 }
 
 impl std::error::Error for DnsError {}
+
+/// `storeCache` with a cache file: the answer packed as a response.
+fn save_persistent(store: &dyn DnsCacheStore, key: &CacheKey, answer: &Answer) {
+    if answer.ttl == 0 {
+        return;
+    }
+    let fqdn = format!("{}.", key.1);
+    let Ok(name) = Name::from_ascii(&fqdn) else { return };
+    let mut message = Message::new();
+    message.set_message_type(MessageType::Response);
+    message.set_recursion_desired(true);
+    message.set_recursion_available(true);
+    message.add_query(Query::query(name.clone(), RecordType::from(key.2)));
+    for address in &answer.addresses {
+        let data = match address {
+            IpAddr::V4(address) => RData::A((*address).into()),
+            IpAddr::V6(address) => RData::AAAA((*address).into()),
+        };
+        message.add_answer(Record::from_rdata(name.clone(), answer.ttl, data));
+    }
+    let Ok(packed) = message.to_vec() else { return };
+    let expire_at = std::time::SystemTime::now() + Duration::from_secs(u64::from(answer.ttl));
+    store.save_dns_cache(&key.0, &fqdn, key.2, &packed, expire_at);
+}
 
 fn rejected(domain: &str) -> io::Error {
     io::Error::other(format!("{domain}: response rejected"))
@@ -658,6 +688,8 @@ impl DnsRouter {
             strategy: options.strategy,
             timeout,
             cache,
+            clash_mode: RwLock::new(None),
+            storage: RwLock::new(DnsStorage::default()),
         });
         *dns_resolver.router.write().unwrap() = Some(Arc::downgrade(&router));
         let (rules, _) = router.build_rules(rule_sets)?;
@@ -673,7 +705,8 @@ impl DnsRouter {
         if !legacy {
             mode::validate_disabled_rules(&self.raw_rules, &lookup).map_err(DnsError)?;
         }
-        let context = RuleContext { rule_sets, legacy_dns_mode: legacy, network_manager: true };
+        let clash_mode = self.clash_mode.read().unwrap().clone();
+        let context = RuleContext { rule_sets, legacy_dns_mode: legacy, network_manager: true, clash_mode };
         let rules = self
             .raw_rules
             .iter()
@@ -684,6 +717,37 @@ impl DnsRouter {
             })
             .collect::<Result<_, _>>()?;
         Ok((DnsRules { rules, legacy }, flags))
+    }
+
+    /// The Clash mode `clash_mode` rule items read; set before
+    /// [`DnsRouter::start`] builds the rules.
+    pub fn set_clash_mode(&self, clash_mode: Arc<rb_rule::ClashMode>) {
+        *self.clash_mode.write().unwrap() = Some(clash_mode);
+    }
+
+    /// `Router.ClearCache`: drops the cached answers, the cache file's
+    /// included.
+    pub fn clear_cache(&self) {
+        if let Some(cache) = &self.cache {
+            cache.lock().unwrap().entries.clear();
+        }
+        if let Some(store) = &self.storage.read().unwrap().dns_cache {
+            store.clear_dns_cache();
+        }
+    }
+
+    /// Uses the cache file: FakeIP servers keep their mappings in it, and
+    /// RDRC and DNS responses are stored when it is set to (the client's
+    /// `RDRC` and `DNSCache` hooks, FakeIP `Store.Start`).
+    pub fn set_storage(&self, storage: DnsStorage) {
+        if let Some(fakeip_storage) = &storage.fakeip {
+            for server in self.servers.values() {
+                if let Transport::FakeIp(fakeip) = server.as_ref() {
+                    fakeip.start(fakeip_storage.clone());
+                }
+            }
+        }
+        *self.storage.write().unwrap() = storage;
     }
 
     /// Builds the rules with the loaded rule-sets (sing-box `Router.Start`).
@@ -1141,8 +1205,13 @@ impl DnsRouter {
     ) -> io::Result<Answer> {
         let transport = self.transport(server)?;
         let key = (server.to_string(), domain.to_string(), query_type);
+        let persistent = self.cache.as_ref().and(self.storage.read().unwrap().dns_cache.clone());
         if !disable_cache {
-            if let Some(cache) = &self.cache {
+            if let Some(store) = &persistent {
+                if let Some(answer) = self.load_persistent(store.as_ref(), &key) {
+                    return Ok(answer);
+                }
+            } else if let Some(cache) = &self.cache {
                 if let Some(answer) = cache.lock().unwrap().get(&key) {
                     return Ok(answer);
                 }
@@ -1158,11 +1227,45 @@ impl DnsRouter {
             }
         }
         if !disable_cache {
-            if let Some(cache) = &self.cache {
+            if let Some(store) = &persistent {
+                save_persistent(store.as_ref(), &key, &answer);
+            } else if let Some(cache) = &self.cache {
                 cache.lock().unwrap().put(key, answer.addresses.clone(), answer.ttl);
             }
         }
         Ok(answer)
+    }
+
+    /// `loadPersistentResponse`: a stored response, with its TTL counted
+    /// down unless `disable_expire`.
+    fn load_persistent(&self, store: &dyn DnsCacheStore, key: &CacheKey) -> Option<Answer> {
+        let (raw, expire_at) = store.load_dns_cache(&key.0, &format!("{}.", key.1), key.2)?;
+        let message = Message::from_vec(&raw).ok()?;
+        let addresses: Vec<IpAddr> = message
+            .answers()
+            .iter()
+            .filter_map(|record| match record.data() {
+                RData::A(address) => Some(IpAddr::V4(address.0)),
+                RData::AAAA(address) => Some(IpAddr::V6(address.0)),
+                _ => None,
+            })
+            .collect();
+        let disable_expire = self.cache.as_ref().is_some_and(|cache| cache.lock().unwrap().disable_expire);
+        let ttl = if disable_expire {
+            message.answers().iter().map(|record| record.ttl()).min().unwrap_or(0)
+        } else {
+            let remaining = expire_at.duration_since(std::time::SystemTime::now()).ok()?;
+            remaining.as_secs() as u32
+        };
+        Some(Answer { addresses, ttl })
+    }
+
+    /// The RDRC store, unless caching is off for this query.
+    fn rdrc(&self, disable_cache: bool) -> Option<Arc<dyn RdrcStore>> {
+        if disable_cache || self.cache.is_none() {
+            return None;
+        }
+        self.storage.read().unwrap().rdrc.clone()
     }
 
     fn base_metadata<'a>(domain: &'a str, options: &'a LookupOptions) -> Metadata<'a> {
@@ -1225,14 +1328,27 @@ impl DnsRouter {
         strategy: DomainStrategy,
         options: &LookupOptions,
     ) -> io::Result<Vec<IpAddr>> {
-        let query = |query_type: u16| async move {
-            let answer = self.query_server(server, disable_cache, domain, query_type, options).await?;
-            if let Some((index, metadata)) = check {
-                if !rules.rules[index].matcher.match_address_limit(metadata, &answer.addresses) {
-                    return Err(rejected(domain));
+        let rdrc = self.rdrc(disable_cache);
+        let query = |query_type: u16| {
+            let rdrc = rdrc.clone();
+            async move {
+                let fqdn = format!("{domain}.");
+                if let (Some(_), Some(rdrc)) = (check, &rdrc) {
+                    if rdrc.load_rdrc(server, &fqdn, query_type) {
+                        return Err(io::Error::other(format!("{domain}: response rejected (cached)")));
+                    }
                 }
+                let answer = self.query_server(server, disable_cache, domain, query_type, options).await?;
+                if let Some((index, metadata)) = check {
+                    if !rules.rules[index].matcher.match_address_limit(metadata, &answer.addresses) {
+                        if let Some(rdrc) = &rdrc {
+                            rdrc.save_rdrc(server, &fqdn, query_type);
+                        }
+                        return Err(rejected(domain));
+                    }
+                }
+                Ok(answer.addresses)
             }
-            Ok(answer.addresses)
         };
         let (a, aaaa) = match strategy {
             DomainStrategy::Ipv4Only => (Some(query(QTYPE_A).await), None),

@@ -36,7 +36,7 @@ fn route(text: &str) -> Compiled<RuleAction> {
 
 fn dns_with(sets: &RuleSets, text: &str, legacy: bool) -> Compiled<DnsRuleAction> {
     let rule: DnsRule = json(text);
-    let context = Context { rule_sets: sets, legacy_dns_mode: legacy, network_manager: true };
+    let context = Context { rule_sets: sets, legacy_dns_mode: legacy, network_manager: true, clash_mode: None };
     compile(&rule, &|options| compile_dns_match(options, &context)).unwrap()
 }
 
@@ -268,8 +268,11 @@ fn headless_platform_items() {
     let sets = RuleSets::new();
     let in_box = compile_headless(&rule, &Context::new(&sets)).unwrap();
     assert!(!in_box.matches(&mut test_metadata("a")));
-    let standalone =
-        compile_headless(&rule, &Context { rule_sets: &sets, legacy_dns_mode: false, network_manager: false }).unwrap();
+    let standalone = compile_headless(
+        &rule,
+        &Context { rule_sets: &sets, legacy_dns_mode: false, network_manager: false, clash_mode: None },
+    )
+    .unwrap();
     assert!(standalone.matches(&mut test_metadata("a")));
     let rule = HeadlessRule::from_value(serde_json::json!({"process_name": "curl"})).unwrap();
     assert!(!compile_headless(&rule, &Context::new(&sets)).unwrap().matches(&mut test_metadata("a")));
