@@ -301,24 +301,77 @@ impl PacketConn for Hysteria2PacketConn {
     async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
         let _read_guard = self.read_lock.lock().await;
         loop {
-            let datagram = self
-                .connection
-                .read_datagram()
-                .await
-                .map_err(|error| io::Error::other(format!("Hysteria2 receive UDP datagram: {error}")))?;
-            let message = UdpMessage::decode(&datagram)?;
+            let datagram = match self.connection.read_datagram().await {
+                Ok(datagram) => datagram,
+                Err(error) => {
+                    close_hysteria2_session(
+                        &self._endpoint,
+                        &self.connection,
+                        &self.h3_driver,
+                        b"Hysteria2 receive UDP datagram failed",
+                    )
+                    .await;
+                    return Err(io::Error::other(format!("Hysteria2 receive UDP datagram: {error}")));
+                }
+            };
+            let message = match UdpMessage::decode(&datagram) {
+                Ok(message) => message,
+                Err(error) => {
+                    close_hysteria2_session(
+                        &self._endpoint,
+                        &self.connection,
+                        &self.h3_driver,
+                        b"Invalid Hysteria2 UDP datagram",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
             if message.session_id != self.session_id {
                 continue;
             }
-            let Some(message) = self.reassembler.lock().await.push(message)? else { continue };
+            let message = match self.reassembler.lock().await.push(message) {
+                Ok(Some(message)) => message,
+                Ok(None) => continue,
+                Err(error) => {
+                    close_hysteria2_session(
+                        &self._endpoint,
+                        &self.connection,
+                        &self.h3_driver,
+                        b"Invalid Hysteria2 UDP fragments",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
             if message.payload.len() > MAX_UDP_SIZE {
+                close_hysteria2_session(
+                    &self._endpoint,
+                    &self.connection,
+                    &self.h3_driver,
+                    b"Oversized Hysteria2 UDP payload",
+                )
+                .await;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Hysteria2 UDP payload exceeds 4096 bytes"));
             }
             if message.payload.len() > buffer.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "short buffer"));
             }
             buffer[..message.payload.len()].copy_from_slice(&message.payload);
-            return Ok((message.payload.len(), parse_destination(&message.destination)?));
+            let destination = match parse_destination(&message.destination) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    close_hysteria2_session(
+                        &self._endpoint,
+                        &self.connection,
+                        &self.h3_driver,
+                        b"Invalid Hysteria2 UDP destination",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            return Ok((message.payload.len(), destination));
         }
     }
 
@@ -339,9 +392,17 @@ impl PacketConn for Hysteria2PacketConn {
             payload: data.to_vec(),
         };
         for fragment in fragment(&message, self.max_datagram)? {
-            self.connection
-                .send_datagram(fragment.encode()?.into())
-                .map_err(|error| io::Error::other(format!("Hysteria2 send UDP datagram: {error:?}")))?;
+            let encoded = fragment.encode()?;
+            if let Err(error) = self.connection.send_datagram(encoded.into()) {
+                close_hysteria2_session(
+                    &self._endpoint,
+                    &self.connection,
+                    &self.h3_driver,
+                    b"Hysteria2 send UDP datagram failed",
+                )
+                .await;
+                return Err(io::Error::other(format!("Hysteria2 send UDP datagram: {error:?}")));
+            }
         }
         Ok(())
     }
