@@ -693,6 +693,47 @@ fn check_proxy_outbound(
     Ok(())
 }
 
+fn check_tuic_outbound(path: &str, options: &TuicOutbound) -> Result<(), ConfigError> {
+    let field = |name: &str, message: String| ConfigError::Field { path: format!("{path}.{name}"), message };
+    let Some(tls) = options.tls.as_ref() else {
+        return Err(field("tls", "TLS is required".into()));
+    };
+    if !tls.enabled {
+        return Err(field("tls.enabled", "TLS is required".into()));
+    }
+    tls.validate(&format!("{path}.tls"))?;
+
+    match options.congestion_control.as_str() {
+        "" | "cubic" => {}
+        "new_reno" | "bbr" => {
+            return Err(field("congestion_control", "`congestion_control` is not supported by rust-box yet".into()));
+        }
+        other => {
+            return Err(field("congestion_control", format!("unknown congestion control algorithm: {other}")));
+        }
+    }
+    if options.udp_over_stream && !options.udp_relay_mode.is_empty() {
+        return Err(field("udp_over_stream", "udp_over_stream is conflict with udp_relay_mode".into()));
+    }
+    match options.udp_relay_mode.as_str() {
+        "" | "native" => {}
+        "quic" => {
+            return Err(field("udp_relay_mode", "`udp_relay_mode` is not supported by rust-box yet".into()));
+        }
+        other => return Err(field("udp_relay_mode", format!("unknown UDP relay mode: {other}"))),
+    }
+    if options.zero_rtt_handshake {
+        return Err(field("zero_rtt_handshake", "`zero_rtt_handshake` is not supported by rust-box yet".into()));
+    }
+    if options.udp_over_stream {
+        return Err(field("udp_over_stream", "`udp_over_stream` is not supported by rust-box yet".into()));
+    }
+    if options.network.build().iter().any(|network| network == "udp") {
+        return Err(field("network", "UDP is not supported by rust-box yet".into()));
+    }
+    Ok(())
+}
+
 fn check_v2ray_transport(
     path: &str,
     transport: Option<&V2RayTransportOptions>,
@@ -1497,6 +1538,10 @@ impl Options {
                     check_proxy_outbound(&path, vmess.tls.as_ref(), vmess.multiplex.as_ref(), &vmess.transport)?;
                     self.check_dialer(&path, &vmess.dialer_options(), &server_known)?;
                 }
+                Outbound::Tuic(tuic) => {
+                    check_tuic_outbound(&path, tuic)?;
+                    self.check_dialer(&path, &tuic.dialer_options(), &server_known)?;
+                }
                 Outbound::Hysteria2(hysteria2) => check_hysteria2_outbound(&path, hysteria2)?,
                 _ => {}
             }
@@ -1806,6 +1851,36 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("outbounds[0].domain_resolver.client_subnet"), "{error}");
+    }
+
+    #[test]
+    fn tuic_outbound_tcp_and_unsupported_options() {
+        let base = r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,
+            "uuid":"550e8400-e29b-41d4-a716-446655440000","tls":{"enabled":true},"network":"tcp"}]}"#;
+        let options = parse(base).unwrap();
+        assert!(matches!(options.outbounds[0], Outbound::Tuic(_)));
+
+        for (config, expected) in [
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"network":"tcp"}]}"#,
+                "outbounds[0].tls: TLS is required",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true}}]}"#,
+                "outbounds[0].network: UDP is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"tcp","zero_rtt_handshake":true}]}"#,
+                "outbounds[0].zero_rtt_handshake: `zero_rtt_handshake` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"tuic","server":"example.org","server_port":443,"tls":{"enabled":true},"network":"tcp","congestion_control":"bbr"}]}"#,
+                "outbounds[0].congestion_control: `congestion_control` is not supported by rust-box yet",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
     }
 
     /// sing-box v1.14.4 without a platform interface: the platform network

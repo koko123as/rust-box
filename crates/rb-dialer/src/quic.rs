@@ -44,6 +44,28 @@ pub async fn connect_with_options(
     server_name: &str,
     options: &QuicOptions,
 ) -> io::Result<(Endpoint, Connection)> {
+    connect_with_options_inner(packet_conn, destination, tls, server_name, options, false).await
+}
+
+/// Connects with QUIC DATAGRAM support enabled for protocols such as TUIC.
+pub async fn connect_with_datagrams(
+    packet_conn: SharedPacketConn,
+    destination: Socksaddr,
+    tls: Arc<rustls::ClientConfig>,
+    server_name: &str,
+    options: &QuicOptions,
+) -> io::Result<(Endpoint, Connection)> {
+    connect_with_options_inner(packet_conn, destination, tls, server_name, options, true).await
+}
+
+async fn connect_with_options_inner(
+    packet_conn: SharedPacketConn,
+    destination: Socksaddr,
+    tls: Arc<rustls::ClientConfig>,
+    server_name: &str,
+    options: &QuicOptions,
+    enable_datagrams: bool,
+) -> io::Result<(Endpoint, Connection)> {
     let socket = QuicPacketSocket::new(packet_conn, destination);
     let peer = socket.peer_addr;
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
@@ -51,7 +73,12 @@ pub async fn connect_with_options(
     let mut endpoint =
         Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, Arc::new(quinn::TokioRuntime))?;
     let mut client = ClientConfig::new(Arc::new(crypto));
-    client.transport_config(Arc::new(transport_config(options)?));
+    let mut transport = transport_config(options)?;
+    if enable_datagrams {
+        transport.datagram_receive_buffer_size(Some(64 * 1024));
+        transport.datagram_send_buffer_size(64 * 1024);
+    }
+    client.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(client);
     let connecting =
         endpoint.connect(peer, server_name).map_err(|error| io::Error::other(format!("QUIC connect: {error}")))?;
@@ -88,13 +115,33 @@ pub fn server_endpoint(
 /// Adapts a Quinn bidirectional stream to the project's TCP stream trait and
 /// keeps its endpoint alive for the duration of the routed connection.
 pub fn bidi_stream(endpoint: Endpoint, send: quinn::SendStream, recv: quinn::RecvStream) -> BoxStream {
-    Box::new(QuicBidiStream { _endpoint: endpoint, send, recv })
+    Box::new(QuicBidiStream { _endpoint: endpoint, close_connection: None, send, recv })
+}
+
+/// Adapts a TUIC stream and closes its per-dial QUIC connection when the
+/// routed stream is dropped, which also stops its heartbeat task.
+pub fn bidi_stream_with_close(
+    endpoint: Endpoint,
+    connection: Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+) -> BoxStream {
+    Box::new(QuicBidiStream { _endpoint: endpoint, close_connection: Some(connection), send, recv })
 }
 
 struct QuicBidiStream {
     _endpoint: Endpoint,
+    close_connection: Option<Connection>,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+}
+
+impl Drop for QuicBidiStream {
+    fn drop(&mut self) {
+        if let Some(connection) = self.close_connection.take() {
+            connection.close(VarInt::from_u32(0), b"stream closed");
+        }
+    }
 }
 
 impl AsyncRead for QuicBidiStream {

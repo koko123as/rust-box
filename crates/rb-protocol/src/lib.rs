@@ -26,5 +26,6 @@ pub use outbound::{Block, Direct};
 pub use proxy_outbound::{HttpOutbound, SocksOutbound};
 pub use shadowsocks::{ShadowsocksInbound, ShadowsocksOutbound};
 pub use trojan::{TrojanInbound, TrojanOutbound};
+pub use tuic::TuicOutbound;
 pub use vless::{VlessInbound, VlessOutbound};
 pub use vmess::{VmessInbound, VmessOutbound};
