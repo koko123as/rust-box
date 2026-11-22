@@ -389,6 +389,25 @@ fn client_extensions_application_settings_new_roundtrip() {
 }
 
 #[test]
+fn server_extensions_application_settings_response_roundtrip() {
+    let application_settings = vec![0x00, 0x03, 0x02, b'h', b'2'];
+    let extensions = ServerExtensions {
+        application_settings: Some(Payload::new(application_settings.clone())),
+        ..Default::default()
+    };
+
+    let encoded = extensions.get_encoding();
+    assert_eq!(encoded, b"\x00\x09\x44\xcd\x00\x05\x00\x03\x02h2");
+
+    let decoded = ServerExtensions::read_bytes(&encoded).unwrap();
+    assert_eq!(
+        decoded.application_settings.as_ref().unwrap().bytes(),
+        application_settings.as_slice()
+    );
+    assert_eq!(decoded.get_encoding(), encoded);
+}
+
+#[test]
 fn client_extensions_explicit_order_encodes_typed_and_opaque_entries() {
     let mut extensions = ClientExtensions {
         extended_master_secret_request: Some(()),
@@ -1026,6 +1045,7 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
             session_ticket_ack: Some(()),
             renegotiation_info: Some(PayloadU8::new(vec![0])),
             selected_protocol: Some(SingleProtocolName::new(ProtocolName::from(vec![0]))),
+            application_settings: None,
             key_share: Some(KeyShareEntry::new(NamedGroup::X25519, &[1, 2, 3][..])),
             preshared_key: Some(3),
             early_data_ack: Some(()),

@@ -1422,6 +1422,10 @@ extension_struct! {
         ExtensionType::ALProtocolNegotiation =>
             pub(crate) selected_protocol: Option<SingleProtocolName>,
 
+        /// Application-Layer Protocol Settings response (ALPS)
+        ExtensionType::ApplicationSettings =>
+            pub(crate) application_settings: Option<Payload<'a>>,
+
         /// Key exchange server share (RFC8446)
         ExtensionType::KeyShare =>
             pub(crate) key_share: Option<KeyShareEntry>,
@@ -1482,6 +1486,7 @@ impl ServerExtensions<'_> {
             session_ticket_ack,
             renegotiation_info,
             selected_protocol,
+            application_settings,
             key_share,
             preshared_key,
             client_certificate_type,
@@ -1502,6 +1507,7 @@ impl ServerExtensions<'_> {
             session_ticket_ack,
             renegotiation_info,
             selected_protocol,
+            application_settings: application_settings.map(|x| x.into_owned()),
             key_share,
             preshared_key,
             client_certificate_type,
