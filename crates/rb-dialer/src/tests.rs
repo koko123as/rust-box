@@ -163,11 +163,11 @@ async fn interface_mark_and_netns() {
         Err(error) => assert!(error.to_string().contains("set mark 16"), "{error}"),
     }
     // route.default_mark applies when the dialer has no mark of its own.
-    let defaults = NetworkDefaults { default_mark: 7, default_interface: String::new() };
+    let defaults = NetworkDefaults { default_mark: 7, ..Default::default() };
     let with_default = DefaultDialer::new(&DialerOptions::default(), &defaults, false).unwrap();
     assert_eq!(with_default.routing_mark, Some(7));
     // default_interface does not apply when the dialer binds an address.
-    let defaults = NetworkDefaults { default_mark: 0, default_interface: "eth9".into() };
+    let defaults = NetworkDefaults { default_interface: "eth9".into(), ..Default::default() };
     let bound = DefaultDialer::new(
         &DialerOptions { inet4_bind_address: Some("127.0.0.1".parse().unwrap()), ..Default::default() },
         &defaults,
@@ -278,4 +278,47 @@ async fn listener_fields() {
     // The UDP socket of an inbound.
     let udp = listener.listen_packet("127.0.0.1:0".parse().unwrap()).unwrap();
     assert!(udp.local_addr().unwrap().port() != 0);
+}
+
+struct Protector(std::sync::Mutex<Vec<std::os::fd::RawFd>>);
+
+impl rb_platform::PlatformInterface for Protector {
+    fn open_tun(&self, _options: &rb_platform::TunOptions) -> io::Result<std::os::fd::RawFd> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn auto_detect_interface_control(&self, fd: std::os::fd::RawFd) -> io::Result<()> {
+        self.0.lock().unwrap().push(fd);
+        Ok(())
+    }
+    fn start_default_interface_monitor(
+        &self,
+        _listener: Arc<dyn rb_platform::InterfaceUpdateListener>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    fn get_interfaces(&self) -> io::Result<Vec<rb_platform::NetworkInterface>> {
+        Ok(Vec::new())
+    }
+}
+
+/// route.auto_detect_interface: sockets go through the platform's protect
+/// unless the dialer binds an address or interface of its own.
+#[tokio::test]
+async fn auto_detect_interface_protects_through_the_platform() {
+    let protector = Arc::new(Protector(Default::default()));
+    rb_platform::set_platform(Some(protector.clone()));
+    let defaults = NetworkDefaults { auto_detect_interface: true, ..Default::default() };
+    let protected = DefaultDialer::new(&DialerOptions::default(), &defaults, false).unwrap();
+    let listener = echo_listener().await;
+    roundtrip(protected.dial_tcp_stream(listener, false).await.unwrap()).await;
+    assert_eq!(protector.0.lock().unwrap().len(), 1);
+    let bound = DefaultDialer::new(
+        &DialerOptions { inet4_bind_address: Some("127.0.0.1".parse().unwrap()), ..Default::default() },
+        &defaults,
+        false,
+    )
+    .unwrap();
+    roundtrip(bound.dial_tcp_stream(listener, false).await.unwrap()).await;
+    rb_platform::set_platform(None);
+    assert_eq!(protector.0.lock().unwrap().len(), 1);
 }

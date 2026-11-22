@@ -30,9 +30,10 @@ HTTP/2, gRPC and HTTPUpgrade), and the Hysteria2/TUIC QUIC protocols:
 | Rule actions | `route`, `route-options`, `bypass`, `reject`, `hijack-dns`, `sniff` (tls, http, quic, dns, stun, bittorrent, dtls, ssh, rdp, ntp), `resolve` | `route/route.go`, `common/sniff` |
 | Route options | `override_address`, `override_port` (TCP and UDP, replies mapped back), `fallback_delay`, `udp_connect`, `udp_timeout`, `udp_disable_domain_unmapping`, `tls_fragment`, `tls_fragment_fallback_delay`, `tls_record_fragment` | `route/route.go`, `common/tlsfragment` |
 | DNS | `local`, `udp`, `tcp`, `tls` (DoT), `https` (DoH), `quic` (DoQ), `h3` servers; `hosts` with predefined mappings, in-memory `fakeip`; rules with `evaluate`/`respond` and `match_response`; `final`, `strategy`, cache | `dns/` |
+| TUN | `tun` inbound on Linux and Android: the device, `address`, `mtu`, `auto_route` (same routes and rules as sing-tun), `strict_route`, `route_address`/`route_exclude_address`, include/exclude interface and UID, DNS hijack, UDP NAT options; a user-space stack on smoltcp for every `stack`; a platform interface for Android; `route.auto_detect_interface` (see the roadmap's milestone 8 differences) | `protocol/tun`, `sing-tun` |
 | CLI | `run`, `check`, `version`; `rule-set compile`, `decompile`, `format`, `upgrade`, `merge`, `match`, `convert` (AdGuard) | `cmd/sing-box` |
 
-Not yet: TUN, TCP Brutal (`multiplex.brutal`), uTLS / REALITY, ECH, Clash API
+Not yet: TCP Brutal (`multiplex.brutal`), uTLS / REALITY, ECH, Clash API
 and `tls_spoof`.
 The `network_strategy` family of fields (dial fields,
 route option, `route.default_network_*`) only works with a platform

@@ -1,0 +1,12 @@
+[package]
+name = "rb-netstack"
+description = "rust-box user-space TCP/IP stack for the tun inbound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+smoltcp.workspace = true

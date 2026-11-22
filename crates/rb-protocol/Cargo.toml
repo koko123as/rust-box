@@ -15,6 +15,7 @@ rb-certificate.workspace = true
 rb-route.workspace = true
 rb-shadowsocks.workspace = true
 rb-mux.workspace = true
+rb-platform.workspace = true
 httparse.workspace = true
 tokio.workspace = true
 h2.workspace = true

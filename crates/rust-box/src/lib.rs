@@ -50,6 +50,7 @@ impl RustBox {
         let defaults = NetworkDefaults {
             default_interface: options.route.default_interface.clone(),
             default_mark: options.route.default_mark.0,
+            auto_detect_interface: options.route.auto_detect_interface,
         };
         defaults.check().map_err(|error| anyhow!("route: {error}"))?;
         // Parts built before the outbounds and inbounds get handles that
@@ -205,6 +206,10 @@ impl RustBox {
                 ),
                 InboundOptions::Vmess(vmess) => Arc::new(
                     VmessInbound::new(vmess, tag, connection_router.clone())
+                        .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
+                ),
+                InboundOptions::Tun(tun) => Arc::new(
+                    rb_tun::TunInbound::new(tun, tag, router.clone(), dns_router.clone())
                         .map_err(|error| anyhow!("inbounds[{index}]: {error}"))?,
                 ),
                 InboundOptions::Tuic(tuic) => Arc::new(

@@ -16,6 +16,7 @@ pub mod rule;
 pub mod rule_set;
 pub mod srs;
 pub mod tls;
+pub mod tun;
 pub mod types;
 
 use std::net::IpAddr;
@@ -323,6 +324,8 @@ pub enum Inbound {
     Vless(VlessInbound),
     #[serde(rename = "vmess")]
     Vmess(VmessInbound),
+    #[serde(rename = "tun")]
+    Tun(tun::TunInbound),
     #[serde(rename = "tuic")]
     Tuic(TuicInbound),
     #[serde(rename = "hysteria2")]
@@ -337,6 +340,7 @@ impl Inbound {
             Inbound::Trojan(options) => &options.tag,
             Inbound::Vless(options) => &options.tag,
             Inbound::Vmess(options) => &options.tag,
+            Inbound::Tun(options) => &options.tag,
             Inbound::Tuic(options) => &options.tag,
             Inbound::Hysteria2(options) => &options.tag,
         }
@@ -350,6 +354,7 @@ impl Inbound {
             Inbound::Trojan(_) => "trojan",
             Inbound::Vless(_) => "vless",
             Inbound::Vmess(_) => "vmess",
+            Inbound::Tun(_) => "tun",
             Inbound::Tuic(_) => "tuic",
             Inbound::Hysteria2(_) => "hysteria2",
         }
@@ -363,6 +368,7 @@ impl Inbound {
             Inbound::Trojan(options) => options.listen_options(),
             Inbound::Vless(options) => options.listen_options(),
             Inbound::Vmess(options) => options.listen_options(),
+            Inbound::Tun(_) => ListenOptions::default(),
             Inbound::Tuic(options) => options.listen_options(),
             Inbound::Hysteria2(options) => options.listen_options(),
         }
@@ -376,6 +382,7 @@ impl Inbound {
             Inbound::Trojan(options) => options.removed_field_error(),
             Inbound::Vless(options) => options.removed_field_error(),
             Inbound::Vmess(options) => options.removed_field_error(),
+            Inbound::Tun(options) => options.removed_field_error(),
             Inbound::Tuic(options) => options.removed_field_error(),
             Inbound::Hysteria2(options) => options.removed_field_error(),
         }
@@ -1234,8 +1241,8 @@ pub struct RouteOptions {
     pub r#final: String,
     #[serde(default)]
     pub default_domain_resolver: Option<DomainResolveOptions>,
-    /// Accepted and ignored: rust-box has no TUN yet, and without a TUN
-    /// nothing needs to bind to the default interface.
+    /// Outbound sockets are protected by the platform interface, or bound
+    /// to the default interface (Linux), so they do not loop into a TUN.
     #[serde(default)]
     pub auto_detect_interface: bool,
     /// Interface outbound connections bind to by default (Linux).
@@ -1448,9 +1455,14 @@ impl Options {
             if let Inbound::Trojan(trojan) = inbound {
                 trojan.validate_fallback(&format!("inbounds[{index}]"))?;
             }
+            if let Inbound::Tun(tun) = inbound {
+                let rule_set_known =
+                    |tag: &str| self.route.rule_set.iter().any(|set| set.tags.iter().any(|t| t == tag));
+                tun.validate(&format!("inbounds[{index}]"), &rule_set_known)?;
+            }
             let tls = match inbound {
                 Inbound::Mixed(options) | Inbound::Socks(options) | Inbound::Http(options) => options.tls.as_ref(),
-                Inbound::Shadowsocks(_) => None,
+                Inbound::Shadowsocks(_) | Inbound::Tun(_) => None,
                 Inbound::Trojan(options) => options.tls.as_ref(),
                 Inbound::Vless(options) => options.tls.as_ref(),
                 Inbound::Vmess(options) => options.tls.as_ref(),
@@ -1819,7 +1831,7 @@ mod tests {
         assert!(error.contains("experimental"), "{error}");
         let error = parse(r#"{"network_namespaces": []}"#).unwrap_err().to_string();
         assert!(error.contains("network_namespaces"), "{error}");
-        let error = parse(r#"{"inbounds":[{"type":"tun"}]}"#).unwrap_err().to_string();
+        let error = parse(r#"{"inbounds":[{"type":"tproxy"}]}"#).unwrap_err().to_string();
         assert!(error.contains("inbounds[0]"), "{error}");
         let error =
             parse(r#"{"inbounds":[{"type":"mixed","listen_port":1,"tcp_brutal":true}]}"#).unwrap_err().to_string();

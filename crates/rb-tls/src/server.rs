@@ -257,7 +257,8 @@ fn absolute(path: &str) -> PathBuf {
 impl Inner {
     /// sing-box `certificateUpdated`.
     fn certificate_updated(&self, path: &Path) -> Result<(), String> {
-        let _reload = self.reload_lock.lock().unwrap();
+        // The per-server lock serializes callbacks for its certificate and key.
+        let _reload = self.reload_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let options = &self.options;
         let is = |configured: &str| !configured.is_empty() && absolute(configured) == path;
         let mut material = self.material.lock().unwrap().clone();

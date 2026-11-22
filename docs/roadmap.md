@@ -44,7 +44,7 @@ silently ignored.
    multiplex (`sing-mux`).
 6. **DNS**: DoT, DoH, DoQ/DoH3, `hosts`, `fakeip`, `predefined`, `evaluate`,
    `match_response`.
-7. **V2Ray transports and QUIC protocols** (done): WebSocket, HTTP/2, gRPC,
+7. **V2Ray transports and QUIC protocols**: WebSocket, HTTP/2, gRPC,
    HTTPUpgrade; `hysteria2`, `tuic`.
 8. **TUN**: Linux and Android TUN, a user-space TCP/IP stack, auto_route, the
    platform interface for Android VpnService.
@@ -299,3 +299,71 @@ path rather than silently ignored.
 - High-packet-loss or high-latency networks, extreme MTUs, long-duration
   runs and high-concurrency load were not part of this milestone's
   verification.
+
+## Known differences in milestone 8
+
+- **User-space stack.** sing-tun's `gvisor`, `system` and `mixed` stacks are
+  replaced by one stack of rust-box's own (`rb-netstack`): TCP on smoltcp
+  0.12, UDP and ICMP written for rust-box. smoltcp was chosen over a custom
+  TCP because it is a maintained pure-Rust TCP/IP implementation (no C, no
+  Go), builds on Rust 1.88 (0.12 is its last release for 1.88; 0.13 needs
+  1.91), and runs entirely in memory, so the stack is tested without a TUN
+  or privileges. gVisor itself has no Rust port; a from-scratch TCP would
+  carry far more risk than the TCP state machine smoltcp already has.
+  `stack` accepts `system`, `gvisor` and `mixed` and runs the same stack for
+  each; another value fails at start with `unknown stack: <value>`, as in
+  sing-box.
+- The TCP handshake with the client completes before the outbound connects;
+  a connection whose outbound then fails is closed (a rejected one is reset
+  at once, before the handshake, as in sing-box).
+- ICMP: echo requests to any address the rules do not refuse are answered
+  by the stack itself; rust-box does not forward pings through an outbound,
+  and route rules have no `icmp` network, so pings are not pre-matched.
+- Packets the stack drops: IPv4 fragments, IPv6 packets with extension
+  headers before the transport header, and destinations that are not
+  global unicast (as sing-tun's system stack).
+- `loopback_address` (system stack only in sing-tun) is refused as not
+  supported.
+- auto_route on Linux installs the same routes, gateways and policy rules as
+  sing-tun (verified against vectors generated from sing-tun's own code and,
+  as root, against the kernel state sing-box v1.14.4 leaves for the same
+  options), over rtnetlink without a netlink library. systemd-resolved is
+  configured with `resolvectl` as sing-tun does; its `flush-caches` on
+  network changes is not ported.
+- Not implemented, refused with the field path and "is not supported by
+  rust-box yet": `netns`, `auto_redirect` and its marks, `nfqueue` and
+  fallback rule index (the nftables mode), `exclude_mptcp`,
+  `include_mac_address`, `exclude_mac_address`, `route_address_set`,
+  `route_exclude_address_set`, `loopback_address`. sing-box accepts these at
+  `check`. The meaning of `bypass` that only exists under `auto_redirect` is
+  therefore not available either; elsewhere `bypass` behaves as before.
+- `dns_mode` takes any string, as in sing-box; on Linux every mode but
+  `disabled` behaves the same.
+- Android: without a platform interface, `include_package`,
+  `exclude_package` and `include_android_user` fail at start (rust-box does
+  not read `packages.xml`); with one, they are passed to the platform in
+  its TUN options. The Android rule that lets another VPN's traffic through
+  is ported but never installed, since rust-box cannot tell that another
+  VPN is running.
+- Platform interface (`rb-platform`): a Rust trait with the parts of
+  libbox's `PlatformInterface` the TUN and the dialer use (open the TUN,
+  protect a socket, the default interface and its monitor, the interface
+  list). There are no gomobile or other FFI bindings, and a VpnService
+  client has only been exercised with an in-process fake.
+- `route.auto_detect_interface` now takes effect: sockets are protected by
+  the platform, or bound (`SO_BINDTODEVICE`) to the default interface,
+  which rust-box reads from `/proc/net/route` and `/proc/net/ipv6_route`
+  instead of following netlink route updates. Dialers with their own bind
+  address or interface are left alone. `network_strategy` and the other
+  network type fields still have no effect.
+- The `direct` outbound's check against dialing back into a TUN range is
+  made when it dials (TCP) or opens its socket (UDP), as sing-box does, for
+  the ranges of TUN interfaces rust-box itself started.
+- `multiplex.brutal` stays unsupported: it needs the `tcp-brutal` kernel
+  module (absent on CI and on stock Android kernels) and a `setsockopt` on
+  the raw TCP socket under the multiplexed connection; rust-box can reach
+  that socket only when no TLS or other layer sits between, so it would
+  work for a fraction of configurations and be untestable in CI.
+- Tests that need root are skipped unless `RB_TUN_TEST=1`
+  (`crates/rust-box/tests/tun.rs`); the stack, rules and netlink encoding
+  are covered by in-memory tests.

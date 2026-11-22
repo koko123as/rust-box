@@ -24,6 +24,9 @@ rb-rule-set = { path = "crates/rb-rule-set" }
 rb-tls = { path = "crates/rb-tls" }
 rb-shadowsocks = { path = "crates/rb-shadowsocks" }
 rb-mux = { path = "crates/rb-mux" }
+rb-netstack = { path = "crates/rb-netstack" }
+rb-platform = { path = "crates/rb-platform" }
+rb-tun = { path = "crates/rb-tun" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -69,6 +72,8 @@ rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
+# 0.12: the last release for Rust 1.88 (0.13 needs 1.91).
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 
 [profile.release]
 lto = true
