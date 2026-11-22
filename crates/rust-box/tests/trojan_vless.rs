@@ -560,7 +560,7 @@ fn build_errors() {
             json!({"inbounds": [{"type": "trojan", "fallback_for_alpn": {"h2": {"server": "127.0.0.1"}}}]}),
             "fallback for ALPN is not supported without TLS",
         ),
-        (json!({"inbounds": [{"type": "tuic"}]}), "inbounds[0].type: `tuic` is not supported by rust-box yet"),
+        (json!({"inbounds": [{"type": "tuic"}]}), "inbounds[0]: TLS is required"),
         (
             json!({"inbounds": [{"type": "hysteria2"}]}),
             "inbounds[0].type: `hysteria2` is not supported by rust-box yet",
@@ -730,6 +730,23 @@ async fn interop_quic_to_sing_box(inbound: Value, port: u16, outbound: Value) {
     assert_udp_echo(clients[0], udp_target).await;
 }
 
+fn tuic_inbound(port: u16, pki: &Pki) -> Value {
+    json!({
+        "type": "tuic", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
+        "users": [{"name": "alice", "uuid": UUID, "password": "tuic-password"}],
+        "congestion_control": "cubic",
+        "tls": server_tls(pki)
+    })
+}
+
+fn tuic_outbound(server: SocketAddr, pki: &Pki) -> Value {
+    json!({
+        "type": "tuic", "tag": "proxy", "server": server.ip().to_string(), "server_port": server.port(),
+        "uuid": UUID, "password": "tuic-password", "congestion_control": "cubic",
+        "tls": client_tls(pki)
+    })
+}
+
 #[tokio::test]
 async fn interop_trojan_v2ray_transports_with_sing_box() {
     let pki = pki();
@@ -767,18 +784,15 @@ async fn interop_trojan_v2ray_transports_with_sing_box() {
 async fn interop_rust_box_tuic_to_sing_box() {
     let pki = pki();
     let port = free_port();
-    let inbound = json!({
-        "type": "tuic", "tag": "server", "listen": "127.0.0.1", "listen_port": port,
-        "users": [{"name": "alice", "uuid": UUID, "password": "tuic-password"}],
-        "congestion_control": "cubic",
-        "tls": server_tls(&pki)
-    });
-    let outbound = json!({
-        "type": "tuic", "tag": "proxy", "server": "127.0.0.1", "server_port": port,
-        "uuid": UUID, "password": "tuic-password", "congestion_control": "cubic",
-        "tls": client_tls(&pki)
-    });
+    let inbound = tuic_inbound(port, &pki);
+    let outbound = tuic_outbound(local(port), &pki);
     interop_quic_to_sing_box(inbound, port, outbound).await;
+}
+
+#[tokio::test]
+async fn interop_sing_box_tuic_to_rust_box() {
+    let pki = pki();
+    interop_from_sing_box(tuic_inbound(0, &pki), |server| tuic_outbound(server, &pki), true).await;
 }
 
 #[tokio::test]

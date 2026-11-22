@@ -116,10 +116,34 @@ async fn connect_with_options_inner(
 
 /// Builds a Quinn server configuration from the shared TLS and QUIC options.
 pub fn server_config(tls: Arc<rustls::ServerConfig>, options: &QuicOptions) -> io::Result<quinn::ServerConfig> {
+    server_config_inner(tls, options, false)
+}
+
+/// Builds TUIC's QUIC server configuration, including its very high uni-stream
+/// limit for one-stream-per-UDP-packet relay mode.
+pub fn tuic_server_config(tls: Arc<rustls::ServerConfig>, options: &QuicOptions) -> io::Result<quinn::ServerConfig> {
+    server_config_inner(tls, options, true)
+}
+
+fn server_config_inner(
+    tls: Arc<rustls::ServerConfig>,
+    options: &QuicOptions,
+    allow_many_uni_streams: bool,
+) -> io::Result<quinn::ServerConfig> {
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|error| io::Error::other(format!("QUIC TLS configuration: {error}")))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config(options)?));
+    let mut transport = transport_config(options)?;
+    let default_stream_limit = quic_varint(1 << 60, "max_concurrent_streams")?;
+    if allow_many_uni_streams && options.max_concurrent_streams <= 0 {
+        transport.max_concurrent_bidi_streams(default_stream_limit);
+    }
+    if allow_many_uni_streams {
+        transport.max_concurrent_uni_streams(default_stream_limit);
+    }
+    transport.datagram_receive_buffer_size(Some(64 * 1024));
+    transport.datagram_send_buffer_size(64 * 1024);
+    config.transport_config(Arc::new(transport));
     Ok(config)
 }
 
@@ -132,6 +156,20 @@ pub fn server_endpoint(
     options: &QuicOptions,
 ) -> io::Result<Endpoint> {
     let config = server_config(tls, options)?;
+    server_endpoint_with_config(socket, config)
+}
+
+/// Creates a TUIC server endpoint with the protocol's uni-stream limits.
+pub fn tuic_server_endpoint(
+    socket: UdpSocket,
+    tls: Arc<rustls::ServerConfig>,
+    options: &QuicOptions,
+) -> io::Result<Endpoint> {
+    let config = tuic_server_config(tls, options)?;
+    server_endpoint_with_config(socket, config)
+}
+
+fn server_endpoint_with_config(socket: UdpSocket, config: quinn::ServerConfig) -> io::Result<Endpoint> {
     Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
         Some(config),
