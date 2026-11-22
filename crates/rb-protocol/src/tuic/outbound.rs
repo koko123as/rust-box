@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use super::wire;
@@ -14,7 +16,9 @@ use rb_adapter::{
 };
 use rb_config::{QuicOptions, TuicOutbound as OutboundOptions};
 use rb_dialer::{new_outbound_dialer, Dialer, DialerEnv};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use super::wire::{TuicAddress, UdpPacket};
 
@@ -85,15 +89,33 @@ impl TuicOutbound {
     }
 
     async fn connect(&self, destination: &Socksaddr) -> io::Result<BoxStream> {
-        let (endpoint, connection) = self.open_connection().await?;
-        spawn_datagram_reader(connection.clone());
-        let (mut send, recv) =
-            connection.open_bi().await.map_err(|error| io::Error::other(format!("TUIC open TCP stream: {error}")))?;
-        send.write_all(&wire::encode_connect(destination)?).await?;
-        Ok(rb_dialer::quic::bidi_stream_with_close(endpoint, connection, send, recv))
+        let (endpoint, connection, heartbeat_task) = self.open_connection().await?;
+        let (mut send, recv) = match connection.open_bi().await {
+            Ok(streams) => streams,
+            Err(error) => {
+                close_tuic_connection(&endpoint, &connection, Some(&heartbeat_task), b"TUIC open TCP stream failed")
+                    .await;
+                return Err(io::Error::other(format!("TUIC open TCP stream: {error}")));
+            }
+        };
+        let request = match wire::encode_connect(destination) {
+            Ok(request) => request,
+            Err(error) => {
+                close_tuic_connection(&endpoint, &connection, Some(&heartbeat_task), b"TUIC CONNECT encoding failed")
+                    .await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = send.write_all(&request).await {
+            close_tuic_connection(&endpoint, &connection, Some(&heartbeat_task), b"TUIC CONNECT write failed").await;
+            return Err(error.into());
+        }
+        let datagram_reader_task = spawn_datagram_reader(connection.clone());
+        let inner = rb_dialer::quic::bidi_stream_with_close(endpoint, connection.clone(), send, recv);
+        Ok(Box::new(TuicTcpStream { inner, connection, heartbeat_task, datagram_reader_task }))
     }
 
-    async fn open_connection(&self) -> io::Result<(Endpoint, Connection)> {
+    async fn open_connection(&self) -> io::Result<(Endpoint, Connection, JoinHandle<()>)> {
         let packet_conn = self.dialer.dial_udp(&self.server).await?;
         let (endpoint, connection) = rb_dialer::quic::connect_with_datagrams(
             packet_conn,
@@ -104,21 +126,29 @@ impl TuicOutbound {
         )
         .await?;
 
-        let mut token = [0u8; 32];
-        connection
-            .export_keying_material(&mut token, &self.uuid, self.password.as_bytes())
-            .map_err(|error| io::Error::other(format!("TUIC export keying material: {error:?}")))?;
-        let mut auth_stream = connection
-            .open_uni()
-            .await
-            .map_err(|error| io::Error::other(format!("TUIC open authentication stream: {error}")))?;
-        auth_stream.write_all(&wire::encode_auth(&self.uuid, &token)).await?;
-        auth_stream
-            .finish()
-            .map_err(|error| io::Error::other(format!("TUIC finish authentication stream: {error}")))?;
+        let authentication = async {
+            let mut token = [0u8; 32];
+            connection
+                .export_keying_material(&mut token, &self.uuid, self.password.as_bytes())
+                .map_err(|error| io::Error::other(format!("TUIC export keying material: {error:?}")))?;
+            let mut auth_stream = connection
+                .open_uni()
+                .await
+                .map_err(|error| io::Error::other(format!("TUIC open authentication stream: {error}")))?;
+            auth_stream.write_all(&wire::encode_auth(&self.uuid, &token)).await?;
+            auth_stream
+                .finish()
+                .map_err(|error| io::Error::other(format!("TUIC finish authentication stream: {error}")))?;
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        if let Err(error) = authentication {
+            close_tuic_connection(&endpoint, &connection, None, b"TUIC authentication failed").await;
+            return Err(error);
+        }
 
-        spawn_heartbeat(connection.clone(), self.heartbeat);
-        Ok((endpoint, connection))
+        let heartbeat_task = spawn_heartbeat(connection.clone(), self.heartbeat);
+        Ok((endpoint, connection, heartbeat_task))
     }
 }
 
@@ -141,10 +171,17 @@ impl Outbound for TuicOutbound {
     }
 
     async fn listen_packet(&self, _context: &InboundContext) -> io::Result<SharedPacketConn> {
-        let (endpoint, connection) = self.open_connection().await?;
+        let (endpoint, connection, heartbeat_task) = self.open_connection().await?;
+        if connection.max_datagram_size().is_none() {
+            close_tuic_connection(&endpoint, &connection, Some(&heartbeat_task), b"TUIC DATAGRAM unavailable").await;
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "TUIC server did not negotiate DATAGRAM"));
+        }
         Ok(Arc::new(TuicPacketConn {
             _endpoint: endpoint,
             connection,
+            heartbeat_task,
+            // This implementation opens one QUIC connection per PacketConn,
+            // so the first upstream session ID on that connection is zero.
             session_id: 0,
             packet_id: AtomicU32::new(0),
             read_lock: Mutex::new(()),
@@ -156,6 +193,7 @@ impl Outbound for TuicOutbound {
 struct TuicPacketConn {
     _endpoint: Endpoint,
     connection: Connection,
+    heartbeat_task: JoinHandle<()>,
     session_id: u16,
     packet_id: AtomicU32,
     read_lock: Mutex<()>,
@@ -164,6 +202,7 @@ struct TuicPacketConn {
 
 impl Drop for TuicPacketConn {
     fn drop(&mut self) {
+        self.heartbeat_task.abort();
         self.connection.close(VarInt::from_u32(0), b"UDP session closed");
     }
 }
@@ -173,20 +212,35 @@ impl PacketConn for TuicPacketConn {
     async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<(usize, Socksaddr)> {
         let _read_guard = self.read_lock.lock().await;
         loop {
-            let message = self
-                .connection
-                .read_datagram()
-                .await
-                .map_err(|error| io::Error::other(format!("TUIC receive datagram: {error}")))?;
+            let message = self.connection.read_datagram().await.map_err(|error| {
+                self.connection.close(VarInt::from_u32(1), b"TUIC datagram receive failed");
+                io::Error::other(format!("TUIC receive datagram: {error}"))
+            })?;
             if message.get(1) == Some(&wire::COMMAND_HEARTBEAT) {
-                wire::decode_heartbeat(&message)?;
+                if let Err(error) = wire::decode_heartbeat(&message) {
+                    self.connection.close(VarInt::from_u32(1), b"invalid TUIC heartbeat");
+                    return Err(error);
+                }
                 continue;
             }
-            let packet = wire::decode_udp(&message)?;
+            let packet = match wire::decode_udp(&message) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    self.connection.close(VarInt::from_u32(1), b"invalid TUIC UDP datagram");
+                    return Err(error);
+                }
+            };
             if packet.session_id != self.session_id {
                 continue;
             }
-            let Some((data, destination)) = self.fragments.lock().await.feed(packet)? else { continue };
+            let result = match self.fragments.lock().await.feed(packet) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.connection.close(VarInt::from_u32(1), b"invalid TUIC UDP fragments");
+                    return Err(error);
+                }
+            };
+            let Some((data, destination)) = result else { continue };
             if data.len() > buffer.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "short buffer"));
             }
@@ -227,9 +281,10 @@ impl PacketConn for TuicPacketConn {
                 data: data[start..end].to_vec(),
             };
             let encoded = wire::encode_udp(&packet)?;
-            self.connection
-                .send_datagram(encoded.into())
-                .map_err(|error| io::Error::other(format!("TUIC send datagram: {error:?}")))?;
+            if let Err(error) = self.connection.send_datagram(encoded.into()) {
+                self.connection.close(VarInt::from_u32(1), b"TUIC UDP send failed");
+                return Err(io::Error::other(format!("TUIC send datagram: {error:?}")));
+            }
         }
         Ok(())
     }
@@ -315,7 +370,7 @@ impl TuicDefragger {
     }
 }
 
-fn spawn_datagram_reader(connection: quinn::Connection) {
+fn spawn_datagram_reader(connection: quinn::Connection) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let Ok(message) = connection.read_datagram().await else { break };
@@ -329,22 +384,71 @@ fn spawn_datagram_reader(connection: quinn::Connection) {
                 break;
             }
         }
-    });
+    })
 }
 
-fn spawn_heartbeat(connection: quinn::Connection, interval: Duration) {
+fn spawn_heartbeat(connection: quinn::Connection, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = connection.closed() => break,
                 _ = tokio::time::sleep(interval) => {
                     if connection.send_datagram(wire::encode_heartbeat().to_vec().into()).is_err() {
+                        connection.close(VarInt::from_u32(1), b"TUIC heartbeat send failed");
                         break;
                     }
                 }
             }
         }
-    });
+    })
+}
+
+async fn close_tuic_connection(
+    endpoint: &Endpoint,
+    connection: &Connection,
+    heartbeat_task: Option<&JoinHandle<()>>,
+    reason: &[u8],
+) {
+    if let Some(task) = heartbeat_task {
+        task.abort();
+    }
+    connection.close(VarInt::from_u32(0), reason);
+    endpoint.wait_idle().await;
+}
+
+struct TuicTcpStream {
+    inner: BoxStream,
+    connection: Connection,
+    heartbeat_task: JoinHandle<()>,
+    datagram_reader_task: JoinHandle<()>,
+}
+
+impl Drop for TuicTcpStream {
+    fn drop(&mut self) {
+        self.heartbeat_task.abort();
+        self.datagram_reader_task.abort();
+        self.connection.close(VarInt::from_u32(0), b"TCP stream closed");
+    }
+}
+
+impl AsyncRead for TuicTcpStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for TuicTcpStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
