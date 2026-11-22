@@ -11,16 +11,16 @@ use super::enums::{
 use super::handshake::{
     CertificateChain, CertificateEntry, CertificateExtensions, CertificatePayloadTls13,
     CertificateRequestExtensions, CertificateRequestPayload, CertificateRequestPayloadTls13,
-    CertificateStatus, CertificateStatusRequest, ClientExtensions, ClientHelloPayload,
-    ClientSessionTicket, CompressedCertificatePayload, DistinguishedName, EcParameters,
-    EncryptedClientHello, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest,
-    HelloRetryRequestExtensions, KeyShareEntry, NewSessionTicketExtensions,
-    NewSessionTicketPayload, NewSessionTicketPayloadTls13, PresharedKeyBinder,
-    PresharedKeyIdentity, PresharedKeyOffer, ProtocolName, PskKeyExchangeModes, Random,
-    ServerDhParams, ServerEcdhParams, ServerEncryptedClientHello, ServerExtensions,
-    ServerHelloPayload, ServerKeyExchange, ServerKeyExchangeParams, ServerKeyExchangePayload,
-    ServerNamePayload, SessionId, SingleProtocolName, SupportedEcPointFormats,
-    SupportedProtocolVersions,
+    CertificateStatus, CertificateStatusRequest, ClientExtensions, ClientHelloExtensionOrderEntry,
+    ClientHelloExtensionOrderError, ClientHelloPayload, ClientSessionTicket,
+    CompressedCertificatePayload, DistinguishedName, EcParameters, EncryptedClientHello,
+    HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, HelloRetryRequestExtensions,
+    KeyShareEntry, NewSessionTicketExtensions, NewSessionTicketPayload,
+    NewSessionTicketPayloadTls13, PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer,
+    ProtocolName, PskKeyExchangeModes, Random, ServerDhParams, ServerEcdhParams,
+    ServerEncryptedClientHello, ServerExtensions, ServerHelloPayload, ServerKeyExchange,
+    ServerKeyExchangeParams, ServerKeyExchangePayload, ServerNamePayload, SessionId,
+    SingleProtocolName, SupportedEcPointFormats, SupportedProtocolVersions,
 };
 use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, HandshakeType, ProtocolVersion,
@@ -385,6 +385,183 @@ fn client_extensions_application_settings_new_roundtrip() {
         ClientExtensions::default()
             .get_encoding()
             .is_empty()
+    );
+}
+
+#[test]
+fn client_extensions_explicit_order_encodes_typed_and_opaque_entries() {
+    let mut extensions = ClientExtensions {
+        extended_master_secret_request: Some(()),
+        application_settings: Some(vec![ProtocolName::from(b"h2".to_vec())]),
+        ..Default::default()
+    };
+    let first_grease = ExtensionType::from(0x0a0a);
+    let second_grease = ExtensionType::from(0x1a1a);
+    extensions
+        .set_explicit_extension_order(vec![
+            ClientHelloExtensionOrderEntry::Opaque {
+                extension_type: first_grease,
+                payload: vec![0],
+            },
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::ExtendedMasterSecret),
+            ClientHelloExtensionOrderEntry::Opaque {
+                extension_type: second_grease,
+                payload: vec![],
+            },
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::ApplicationSettings),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        extensions.used_extensions_in_encoding_order(),
+        vec![
+            first_grease,
+            ExtensionType::ExtendedMasterSecret,
+            second_grease,
+            ExtensionType::ApplicationSettings,
+        ]
+    );
+    let encoded = extensions.get_encoding();
+    assert_eq!(
+        encoded,
+        b"\x00\x16\x0a\x0a\x00\x01\x00\x00\x17\x00\x00\x1a\x1a\x00\x00\x44\xcd\x00\x05\x00\x03\x02h2"
+    );
+
+    // Unknown payloads are emitted for locally constructed hellos, but remain
+    // intentionally lossy when parsed into ClientExtensions.
+    let decoded = ClientExtensions::read_bytes(&encoded).unwrap();
+    let decoded_extensions = decoded.collect_used();
+    assert_eq!(decoded_extensions.len(), 2);
+    assert!(decoded_extensions.contains(&ExtensionType::ExtendedMasterSecret));
+    assert!(decoded_extensions.contains(&ExtensionType::ApplicationSettings));
+    assert_ne!(decoded.get_encoding(), encoded);
+}
+
+#[test]
+fn client_extensions_explicit_order_rejects_duplicates_and_incomplete_sets() {
+    let mut extensions = ClientExtensions {
+        extended_master_secret_request: Some(()),
+        ..Default::default()
+    };
+    assert_eq!(
+        extensions.set_explicit_extension_order(vec![
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::ExtendedMasterSecret),
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::ExtendedMasterSecret),
+        ]),
+        Err(ClientHelloExtensionOrderError::DuplicateExtension(0x0017))
+    );
+    assert_eq!(
+        extensions.set_explicit_extension_order(vec![]),
+        Err(ClientHelloExtensionOrderError::MissingExtension(0x0017))
+    );
+
+    let mut empty = ClientExtensions::default();
+    assert_eq!(
+        empty.set_explicit_extension_order(vec![ClientHelloExtensionOrderEntry::Typed(
+            ExtensionType::ExtendedMasterSecret,
+        )]),
+        Err(ClientHelloExtensionOrderError::UnexpectedExtension(0x0017))
+    );
+
+    let grease = ExtensionType::from(0x0a0a);
+    assert_eq!(
+        empty.set_explicit_extension_order(vec![
+            ClientHelloExtensionOrderEntry::Opaque {
+                extension_type: grease,
+                payload: vec![],
+            },
+            ClientHelloExtensionOrderEntry::Opaque {
+                extension_type: grease,
+                payload: vec![],
+            },
+        ]),
+        Err(ClientHelloExtensionOrderError::DuplicateExtension(0x0a0a))
+    );
+}
+
+#[test]
+fn client_extensions_explicit_order_rejects_opaque_collisions_and_oversize() {
+    let mut typed = ClientExtensions {
+        extended_master_secret_request: Some(()),
+        ..Default::default()
+    };
+    assert_eq!(
+        typed.set_explicit_extension_order(vec![ClientHelloExtensionOrderEntry::Opaque {
+            extension_type: ExtensionType::ExtendedMasterSecret,
+            payload: vec![],
+        }]),
+        Err(ClientHelloExtensionOrderError::UnexpectedExtension(0x0017))
+    );
+
+    let mut empty = ClientExtensions::default();
+    assert_eq!(
+        empty.set_explicit_extension_order(vec![ClientHelloExtensionOrderEntry::Opaque {
+            extension_type: ExtensionType::PreSharedKey,
+            payload: vec![],
+        }]),
+        Err(ClientHelloExtensionOrderError::OpaquePreSharedKey)
+    );
+    assert_eq!(
+        empty.set_explicit_extension_order(vec![ClientHelloExtensionOrderEntry::Opaque {
+            extension_type: ExtensionType::ServerName,
+            payload: vec![],
+        }]),
+        Err(ClientHelloExtensionOrderError::OpaqueKnownExtension(0x0000))
+    );
+    assert_eq!(
+        empty.set_explicit_extension_order(vec![ClientHelloExtensionOrderEntry::Opaque {
+            extension_type: ExtensionType::from(0x0a0a),
+            payload: vec![0; usize::from(u16::MAX) + 1],
+        }]),
+        Err(ClientHelloExtensionOrderError::OpaqueExtensionTooLong)
+    );
+
+    assert_eq!(
+        empty.set_explicit_extension_order(vec![
+            ClientHelloExtensionOrderEntry::Opaque {
+                extension_type: ExtensionType::from(0x0a0a),
+                payload: vec![0; 32_765],
+            },
+            ClientHelloExtensionOrderEntry::Opaque {
+                extension_type: ExtensionType::from(0x1a1a),
+                payload: vec![0; 32_765],
+            },
+        ]),
+        Err(ClientHelloExtensionOrderError::ExtensionBlockTooLong)
+    );
+}
+
+#[test]
+fn client_extensions_explicit_order_keeps_ech_and_psk_suffix() {
+    let mut extensions = ClientExtensions {
+        early_data_request: Some(()),
+        preshared_key_offer: Some(PresharedKeyOffer {
+            identities: vec![],
+            binders: vec![],
+        }),
+        encrypted_client_hello: Some(EncryptedClientHello::Inner),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        extensions.set_explicit_extension_order(vec![
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::EarlyData),
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::EncryptedClientHello),
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::PreSharedKey),
+        ]),
+        Ok(())
+    );
+    assert!(extensions
+        .get_encoding()
+        .ends_with(b"\xfe\x0d\x00\x01\x01\x00\x29\x00\x04\x00\x00\x00\x00"));
+
+    assert_eq!(
+        extensions.set_explicit_extension_order(vec![
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::EarlyData),
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::PreSharedKey),
+            ClientHelloExtensionOrderEntry::Typed(ExtensionType::EncryptedClientHello),
+        ]),
+        Err(ClientHelloExtensionOrderError::InvalidEchPskOrder)
     );
 }
 

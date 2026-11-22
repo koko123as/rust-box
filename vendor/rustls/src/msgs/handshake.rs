@@ -868,6 +868,47 @@ impl Codec<'_> for ServerTicketRequestHint {
     }
 }
 
+/// One entry in an explicitly ordered ClientHello extension block.
+///
+/// Opaque entries are for locally constructed extensions that do not have a
+/// typed Rustls representation. Unknown extensions received from a peer remain
+/// intentionally lossy when parsed into `ClientExtensions`.
+#[allow(dead_code)] // Staged for profile wiring; exercised by this crate's unit tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClientHelloExtensionOrderEntry {
+    Typed(ExtensionType),
+    Opaque {
+        extension_type: ExtensionType,
+        payload: Vec<u8>,
+    },
+}
+
+impl ClientHelloExtensionOrderEntry {
+    fn extension_type(&self) -> ExtensionType {
+        match self {
+            Self::Typed(extension_type) | Self::Opaque { extension_type, .. } => *extension_type,
+        }
+    }
+}
+
+#[allow(dead_code)] // Staged for profile wiring; exercised by this crate's unit tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientHelloExtensionOrderError {
+    DuplicateExtension(u16),
+    MissingExtension(u16),
+    UnexpectedExtension(u16),
+    InvalidEchPskOrder,
+    OpaquePreSharedKey,
+    OpaqueKnownExtension(u16),
+    OpaqueExtensionTooLong,
+    ExtensionBlockTooLong,
+}
+
+/// An explicit extension order that passed validation against a `ClientExtensions` value.
+#[allow(dead_code)] // Staged for profile wiring; constructed by the unit-tested setter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedClientHelloExtensionOrder(Vec<ClientHelloExtensionOrderEntry>);
+
 extension_struct! {
     /// A representation of extensions present in a `ClientHello` message
     ///
@@ -982,6 +1023,9 @@ extension_struct! {
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// Validated explicit order for a locally constructed ClientHello.
+        pub(crate) explicit_extension_order: Option<ValidatedClientHelloExtensionOrder>,
     }
 }
 
@@ -1015,6 +1059,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            explicit_extension_order,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1044,10 +1089,148 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            explicit_extension_order,
+        }
+    }
+
+    #[allow(dead_code)] // Staged for profile wiring; exercised by this crate's unit tests.
+    pub(crate) fn set_explicit_extension_order(
+        &mut self,
+        order: Vec<ClientHelloExtensionOrderEntry>,
+    ) -> Result<(), ClientHelloExtensionOrderError> {
+        self.validate_explicit_extension_order(&order)?;
+
+        let mut encoded_body = Vec::new();
+        self.encode_ordered_extension_body(&order, &mut encoded_body);
+        if encoded_body.len() > usize::from(u16::MAX) {
+            return Err(ClientHelloExtensionOrderError::ExtensionBlockTooLong);
+        }
+
+        self.explicit_extension_order = Some(ValidatedClientHelloExtensionOrder(order));
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Only called by the staged, unit-tested explicit-order setter.
+    fn validate_explicit_extension_order(
+        &self,
+        order: &[ClientHelloExtensionOrderEntry],
+    ) -> Result<(), ClientHelloExtensionOrderError> {
+        let present = self.collect_used();
+        let mut seen = Vec::with_capacity(order.len());
+        let mut typed_seen = Vec::with_capacity(present.len());
+
+        for entry in order {
+            let extension_type = entry.extension_type();
+            if seen.contains(&extension_type) {
+                return Err(ClientHelloExtensionOrderError::DuplicateExtension(u16::from(
+                    extension_type,
+                )));
+            }
+            seen.push(extension_type);
+
+            match entry {
+                ClientHelloExtensionOrderEntry::Typed(extension_type) => {
+                    if !present.contains(extension_type) {
+                        return Err(ClientHelloExtensionOrderError::UnexpectedExtension(u16::from(
+                            *extension_type,
+                        )));
+                    }
+                    typed_seen.push(*extension_type);
+                }
+                ClientHelloExtensionOrderEntry::Opaque {
+                    extension_type,
+                    payload,
+                } => {
+                    if present.contains(extension_type) {
+                        return Err(ClientHelloExtensionOrderError::UnexpectedExtension(u16::from(
+                            *extension_type,
+                        )));
+                    }
+                    if *extension_type == ExtensionType::PreSharedKey {
+                        return Err(ClientHelloExtensionOrderError::OpaquePreSharedKey);
+                    }
+                    if !matches!(*extension_type, ExtensionType::Unknown(_)) {
+                        return Err(ClientHelloExtensionOrderError::OpaqueKnownExtension(
+                            u16::from(*extension_type),
+                        ));
+                    }
+                    if payload.len() > usize::from(u16::MAX) {
+                        return Err(ClientHelloExtensionOrderError::OpaqueExtensionTooLong);
+                    }
+                }
+            }
+        }
+
+        for extension_type in present {
+            if !typed_seen.contains(&extension_type) {
+                return Err(ClientHelloExtensionOrderError::MissingExtension(u16::from(
+                    extension_type,
+                )));
+            }
+        }
+
+        let mut special_suffix = Vec::with_capacity(3);
+        if self.encrypted_client_hello_outer.is_some() {
+            special_suffix.push(ExtensionType::EncryptedClientHelloOuterExtensions);
+        }
+        if self.encrypted_client_hello.is_some() {
+            special_suffix.push(ExtensionType::EncryptedClientHello);
+        }
+        if self.preshared_key_offer.is_some() {
+            special_suffix.push(ExtensionType::PreSharedKey);
+        }
+        if !special_suffix.is_empty() {
+            if order.len() < special_suffix.len() {
+                return Err(ClientHelloExtensionOrderError::InvalidEchPskOrder);
+            }
+            let actual_suffix = &order[order.len() - special_suffix.len()..];
+            if !actual_suffix
+                .iter()
+                .zip(special_suffix)
+                .all(|(entry, expected)| {
+                    matches!(entry, ClientHelloExtensionOrderEntry::Typed(actual) if *actual == expected)
+                })
+            {
+                return Err(ClientHelloExtensionOrderError::InvalidEchPskOrder);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn encode_ordered_extension_body(
+        &self,
+        order: &[ClientHelloExtensionOrderEntry],
+        bytes: &mut Vec<u8>,
+    ) {
+        for entry in order {
+            match entry {
+                ClientHelloExtensionOrderEntry::Typed(extension_type) => {
+                    self.encode_one(*extension_type, bytes);
+                }
+                ClientHelloExtensionOrderEntry::Opaque {
+                    extension_type,
+                    payload,
+                } => {
+                    extension_type.encode(bytes);
+                    let payload_len = u16::try_from(payload.len())
+                        .expect("opaque ClientHello extension length was validated");
+                    payload_len.encode(bytes);
+                    bytes.extend_from_slice(payload);
+                }
+            }
         }
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
+        if let Some(order) = &self.explicit_extension_order {
+            return order
+                .0
+                .iter()
+                .map(|entry| entry.extension_type())
+                .collect();
+        }
+
         let mut exts = self.order_insensitive_extensions_in_random_order();
         exts.extend(&self.contiguous_extensions);
 
@@ -1103,6 +1286,16 @@ impl ClientExtensions<'_> {
 
 impl<'a> Codec<'a> for ClientExtensions<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
+        if let Some(order) = &self.explicit_extension_order {
+            if order.0.is_empty() {
+                return;
+            }
+
+            let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+            self.encode_ordered_extension_body(&order.0, body.buf);
+            return;
+        }
+
         let order = self.used_extensions_in_encoding_order();
 
         if order.is_empty() {
