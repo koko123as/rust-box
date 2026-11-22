@@ -333,6 +333,7 @@ impl TunInbound {
             ("auto_redirect_nfqueue", self.auto_redirect_nfqueue != 0),
             ("auto_redirect_iproute2_fallback_rule_index", self.auto_redirect_iproute2_fallback_rule_index != 0),
             ("exclude_mptcp", self.exclude_mptcp),
+            ("loopback_address", !self.loopback_address.is_empty()),
             ("include_mac_address", !self.include_mac_address.is_empty()),
             ("exclude_mac_address", !self.exclude_mac_address.is_empty()),
             ("route_address_set", !self.route_address_set.is_empty()),
@@ -430,6 +431,10 @@ mod tests {
             (
                 r#"{"route_address_set":["geoip"]}"#,
                 "inbounds[0].route_address_set: `route_address_set` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"loopback_address":"10.7.0.1"}"#,
+                "inbounds[0].loopback_address: `loopback_address` is not supported by rust-box yet",
             ),
             (r#"{"dns_mode":"foo"}"#, "inbounds[0].dns_mode: `dns_mode` is not supported by rust-box yet"),
         ];
