@@ -1,5 +1,5 @@
 //! HTTP/2 stream sessions over an already-established byte stream (TLS or h2c).
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -7,12 +7,13 @@ use std::task::{ready, Context, Poll};
 
 use bytes::Bytes;
 use h2::{RecvStream, SendStream};
-use http::{Request, Response};
+use http::{Request, Response, StatusCode};
 use rb_adapter::BoxStream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
 
 const MAX_FRAME_SIZE: u32 = 32 * 1024;
+type PendingResponse = Pin<Box<dyn Future<Output = Result<Response<RecvStream>, h2::Error>> + Send>>;
 
 struct ConnectionDriver(tokio::task::JoinHandle<()>);
 
@@ -39,15 +40,45 @@ fn h2_error(error: h2::Error) -> io::Error {
 /// A bidirectional HTTP/2 DATA body exposed as an ordinary byte stream.
 pub struct H2Stream {
     send: SendStream<Bytes>,
-    recv: RecvStream,
+    recv: Option<RecvStream>,
+    response: Option<PendingResponse>,
+    expected_status: Option<StatusCode>,
     buffered: Bytes,
     ended: bool,
+    read_finished: bool,
     _driver: Arc<ConnectionDriver>,
 }
 
 impl AsyncRead for H2Stream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if this.read_finished {
+            return Poll::Ready(Ok(()));
+        }
+        if this.recv.is_none() {
+            let result = ready!(this.response.as_mut().expect("pending H2 response").as_mut().poll(cx));
+            this.response = None;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    this.read_finished = true;
+                    return Poll::Ready(Err(h2_error(error)));
+                }
+            };
+            if let Some(expected) = this.expected_status.take() {
+                if response.status() != expected {
+                    let status = response.status();
+                    this.read_finished = true;
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "HTTP/2 server returned unexpected status {status}"
+                    ))));
+                }
+            }
+            this.recv = Some(response.into_body());
+        }
         loop {
             if !this.buffered.is_empty() {
                 let n = this.buffered.len().min(buf.remaining());
@@ -57,16 +88,24 @@ impl AsyncRead for H2Stream {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
-            match ready!(this.recv.poll_data(cx)) {
+            match ready!(this.recv.as_mut().expect("H2 response body").poll_data(cx)) {
                 Some(Ok(data)) => {
-                    if let Err(error) = this.recv.flow_control().release_capacity(data.len()) {
+                    if let Err(error) =
+                        this.recv.as_mut().expect("H2 response body").flow_control().release_capacity(data.len())
+                    {
                         return Poll::Ready(Err(h2_error(error)));
                     }
                     this.buffered = data;
                 }
-                Some(Err(error)) if error.reason() == Some(h2::Reason::NO_ERROR) => return Poll::Ready(Ok(())),
+                Some(Err(error)) if error.reason() == Some(h2::Reason::NO_ERROR) => {
+                    this.read_finished = true;
+                    return Poll::Ready(Ok(()));
+                }
                 Some(Err(error)) => return Poll::Ready(Err(h2_error(error))),
-                None => return Poll::Ready(Ok(())),
+                None => {
+                    this.read_finished = true;
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -150,8 +189,37 @@ impl H2Client {
         let (parts, recv) = response.into_parts();
         Ok((
             Response::from_parts(parts, ()),
-            H2Stream { send, recv, buffered: Bytes::new(), ended: false, _driver: self.driver.clone() },
+            H2Stream {
+                send,
+                recv: Some(recv),
+                response: None,
+                expected_status: None,
+                buffered: Bytes::new(),
+                ended: false,
+                read_finished: false,
+                _driver: self.driver.clone(),
+            },
         ))
+    }
+
+    /// Submit request headers and return a bidirectional stream before its response headers arrive.
+    /// This is required by streaming RPC servers that wait for request DATA before responding.
+    pub async fn open_stream(&self, request: Request<()>) -> io::Result<H2Stream> {
+        let (response, send) = {
+            let mut sender = self.sender.lock().await;
+            poll_fn(|cx| Pin::new(&mut *sender).poll_ready(cx)).await.map_err(h2_error)?;
+            sender.send_request(request, false).map_err(h2_error)?
+        };
+        Ok(H2Stream {
+            send,
+            recv: None,
+            response: Some(Box::pin(response)),
+            expected_status: Some(StatusCode::OK),
+            buffered: Bytes::new(),
+            ended: false,
+            read_finished: false,
+            _driver: self.driver.clone(),
+        })
     }
 }
 
@@ -170,7 +238,16 @@ impl H2Incoming {
         let (parts, ()) = response.into_parts();
         let response = Response::from_parts(parts, ());
         let send = self.responder.send_response(response, false).map_err(h2_error)?;
-        Ok(H2Stream { send, recv: self.recv, buffered: Bytes::new(), ended: false, _driver: self.driver })
+        Ok(H2Stream {
+            send,
+            recv: Some(self.recv),
+            response: None,
+            expected_status: None,
+            buffered: Bytes::new(),
+            ended: false,
+            read_finished: false,
+            _driver: self.driver,
+        })
     }
 }
 
@@ -276,6 +353,41 @@ mod tests {
         for (task, expected) in tasks.into_iter().zip([b"first".as_slice(), b"second".as_slice()]) {
             assert_eq!(task.await.unwrap(), expected);
         }
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_stream_can_send_before_server_response_headers() {
+        let (client_io, server_io) = duplex(1 << 20);
+        let server = H2Server::new(Box::new(server_io));
+        let client = H2Client::new(Box::new(client_io)).await.unwrap();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut incoming = server.accept().await.unwrap().unwrap();
+            assert_eq!(incoming.request.uri().path(), "/stream");
+            let mut request_body = Vec::new();
+            while let Some(result) = poll_fn(|cx| incoming.recv.poll_data(cx)).await {
+                let data = result.unwrap();
+                incoming.recv.flow_control().release_capacity(data.len()).unwrap();
+                request_body.extend_from_slice(&data);
+            }
+            assert_eq!(request_body, b"request body");
+
+            let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            let mut response_stream = incoming.respond(response).unwrap();
+            response_stream.write_all(b"response body").await.unwrap();
+            response_stream.shutdown().await.unwrap();
+            finished_rx.await.unwrap();
+        });
+
+        let request = Request::builder().method("POST").uri("https://example.test/stream").body(()).unwrap();
+        let mut stream = client.open_stream(request).await.unwrap();
+        stream.write_all(b"request body").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response_body = Vec::new();
+        stream.read_to_end(&mut response_body).await.unwrap();
+        assert_eq!(response_body, b"response body");
+        finished_tx.send(()).unwrap();
         server_task.await.unwrap();
     }
 }

@@ -25,6 +25,7 @@ pub struct GrpcLiteStream<S = H2Stream> {
     varint_len: usize,
     payload_remaining: usize,
     output: Option<(Bytes, usize)>,
+    pending_write_len: Option<usize>,
     eof: bool,
     write_closed: bool,
 }
@@ -44,6 +45,7 @@ impl<S> GrpcLiteStream<S> {
             varint_len: 0,
             payload_remaining: 0,
             output: None,
+            pending_write_len: None,
             eof: false,
             write_closed: false,
         }
@@ -226,6 +228,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for GrpcLiteStream<S> {
         if self.write_closed {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "gRPC-lite stream is closed")));
         }
+        if let Some(payload_len) = self.pending_write_len {
+            ready!(self.poll_drain(cx))?;
+            self.pending_write_len = None;
+            return Poll::Ready(Ok(payload_len));
+        }
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -244,6 +251,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for GrpcLiteStream<S> {
         frame.extend_from_slice(&varint[..varint_len]);
         frame.extend_from_slice(data);
         self.output = Some((frame.freeze(), 0));
+        self.pending_write_len = Some(data.len());
+        ready!(self.poll_drain(cx))?;
+        self.pending_write_len = None;
         Poll::Ready(Ok(data.len()))
     }
 
@@ -299,10 +309,7 @@ pub(crate) async fn client(
         .body(())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let client = H2Client::new(stream).await?;
-    let (response, body) = client.open(request).await?;
-    if response.status() != StatusCode::OK {
-        return Err(io::Error::other(format!("gRPC-lite server returned HTTP status {}", response.status())));
-    }
+    let body = client.open_stream(request).await?;
     Ok(Box::new(GrpcLiteStream::new(body)))
 }
 
@@ -488,6 +495,16 @@ mod tests {
         stream.write_all(b"Hunk").await.unwrap();
         stream.flush().await.unwrap();
         assert_eq!(stream.inner.bytes, [0, 0, 0, 0, 6, 0x0a, 4, b'H', b'u', b'n', b'k']);
+    }
+
+    #[tokio::test]
+    async fn write_sends_grpc_lite_frame_without_waiting_for_flush() {
+        let (client, mut peer) = duplex(1 << 16);
+        let mut stream = GrpcLiteStream::new(client);
+        stream.write_all(b"payload").await.unwrap();
+        let mut frame = [0; 14];
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer.read_exact(&mut frame)).await.unwrap().unwrap();
+        assert_eq!(frame, [0, 0, 0, 0, 9, 0x0a, 7, b'p', b'a', b'y', b'l', b'o', b'a', b'd']);
     }
 
     struct OneByteReader<T>(Cursor<T>);
