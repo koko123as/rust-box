@@ -8,6 +8,7 @@ use std::sync::Arc;
 mod bbr;
 mod cubic;
 mod hysteria2;
+mod hysteria2_meta2;
 mod hysteria_brutal;
 mod new_reno;
 
@@ -31,7 +32,8 @@ pub enum PacketNumberSpace {
 
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
-    /// A tracked packet was sent. `bytes_in_flight` is sampled after accounting for it.
+    /// A packet was sent. `congestion_controlled_bytes` is zero if Quinn did not
+    /// retain it in the packet-space sent map; `bytes_in_flight` is after accounting.
     #[allow(unused_variables)]
     fn on_packet_sent(
         &mut self,
@@ -39,6 +41,7 @@ pub trait Controller: Send + Sync {
         packet_number: u64,
         sent: Instant,
         bytes: u64,
+        congestion_controlled_bytes: u64,
         ack_eliciting: bool,
         bytes_in_flight: u64,
         app_limited: bool,
@@ -98,9 +101,25 @@ pub trait Controller: Send + Sync {
 
     /// End a packet-acknowledgment/loss processing batch after all per-packet
     /// ACK and loss callbacks for that event have run. `prior_in_flight` is the
-    /// byte count before any ACKs or losses in this batch were removed.
+    /// byte count before any ACKs or losses in this batch were removed;
+    /// `current_in_flight` is Quinn's actual byte count after the batch.
     #[allow(unused_variables)]
-    fn on_congestion_event_batch_end(&mut self, now: Instant, prior_in_flight: u64, space: PacketNumberSpace) {}
+    fn on_congestion_event_batch_end(
+        &mut self,
+        now: Instant,
+        prior_in_flight: u64,
+        current_in_flight: u64,
+        space: PacketNumberSpace,
+    ) {
+    }
+
+    /// Remove sampler state below this packet number in one packet-number space.
+    #[allow(unused_variables)]
+    fn on_packet_space_pruned(&mut self, space: PacketNumberSpace, least_unacked: u64) {}
+
+    /// A packet-number space was discarded and all of its tracked packet state is obsolete.
+    #[allow(unused_variables)]
+    fn on_packet_space_discarded(&mut self, space: PacketNumberSpace) {}
 
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);

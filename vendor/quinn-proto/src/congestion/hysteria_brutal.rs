@@ -170,6 +170,7 @@ impl Controller for BrutalController {
         _packet_number: u64,
         sent: Instant,
         bytes: u64,
+        _congestion_controlled_bytes: u64,
         _ack_eliciting: bool,
         _bytes_in_flight: u64,
         _app_limited: bool,
@@ -273,7 +274,7 @@ mod tests {
     fn pacer_replenishes_at_target_rate_with_minimum_delay() {
         let now = Instant::now();
         let mut controller = BrutalController::new(1_000_000, now, 1200);
-        controller.on_packet_sent(PacketNumberSpace::Data, 0, now, 12_000, true, 12_000, false);
+        controller.on_packet_sent(PacketNumberSpace::Data, 0, now, 12_000, 12_000, true, 12_000, false);
         assert_eq!(controller.pacing_delay(now, 1200, 1200), Some(Duration::from_micros(1200)));
         assert_eq!(controller.pacing_delay(now + Duration::from_millis(2), 1200, 1200), Some(Duration::ZERO));
     }

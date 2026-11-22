@@ -26,6 +26,11 @@ impl Hysteria2NegotiatedConfig {
         *lock_unpoisoned(&self.selection) = ControllerMode::Brutal { bytes_per_second };
         Ok(())
     }
+
+    /// Selects Hysteria2's pinned sing-quic BBR-meta2 standard profile.
+    pub fn select_meta2(&self) {
+        *lock_unpoisoned(&self.selection) = ControllerMode::Meta2;
+    }
 }
 
 impl Default for Hysteria2NegotiatedConfig {
@@ -48,6 +53,7 @@ impl ControllerFactory for Hysteria2NegotiatedConfig {
 enum ControllerMode {
     PreAuth,
     Brutal { bytes_per_second: u64 },
+    Meta2,
 }
 
 struct ControllerState {
@@ -81,6 +87,7 @@ fn build_controller(mode: ControllerMode, now: Instant, current_mtu: u16) -> Box
             let config = BrutalConfig::new(bytes_per_second).expect("selected Brutal rate must be non-zero");
             Arc::new(config).build(now, current_mtu)
         }
+        ControllerMode::Meta2 => Box::new(super::hysteria2_meta2::Hysteria2Meta2::new(now, current_mtu)),
     }
 }
 
@@ -95,6 +102,7 @@ impl Controller for Hysteria2NegotiatedController {
         packet_number: u64,
         sent: Instant,
         bytes: u64,
+        congestion_controlled_bytes: u64,
         ack_eliciting: bool,
         bytes_in_flight: u64,
         app_limited: bool,
@@ -104,6 +112,7 @@ impl Controller for Hysteria2NegotiatedController {
             packet_number,
             sent,
             bytes,
+            congestion_controlled_bytes,
             ack_eliciting,
             bytes_in_flight,
             app_limited,
@@ -164,8 +173,22 @@ impl Controller for Hysteria2NegotiatedController {
         self.refresh(now).inner.on_congestion_event(now, sent, persistent, lost_bytes);
     }
 
-    fn on_congestion_event_batch_end(&mut self, now: Instant, prior_in_flight: u64, space: PacketNumberSpace) {
-        self.refresh(now).inner.on_congestion_event_batch_end(now, prior_in_flight, space);
+    fn on_congestion_event_batch_end(
+        &mut self,
+        now: Instant,
+        prior_in_flight: u64,
+        current_in_flight: u64,
+        space: PacketNumberSpace,
+    ) {
+        self.refresh(now).inner.on_congestion_event_batch_end(now, prior_in_flight, current_in_flight, space);
+    }
+
+    fn on_packet_space_pruned(&mut self, space: PacketNumberSpace, least_unacked: u64) {
+        self.refresh(Instant::now()).inner.on_packet_space_pruned(space, least_unacked);
+    }
+
+    fn on_packet_space_discarded(&mut self, space: PacketNumberSpace) {
+        self.refresh(Instant::now()).inner.on_packet_space_discarded(space);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -227,6 +250,17 @@ mod tests {
         config.select_brutal(1_000_000).unwrap();
         assert_eq!(controller.initial_window(), 10_240);
         assert_eq!(controller.pacing_delay(now, 1200, 1200), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn negotiated_factory_switches_existing_controller_to_meta2_standard() {
+        let now = Instant::now();
+        let config = Arc::new(Hysteria2NegotiatedConfig::default());
+        let controller = config.clone().build(now, 1200);
+
+        config.select_meta2();
+        assert_eq!(controller.initial_window(), 32 * 1200);
+        assert_eq!(controller.metrics().congestion_window, 32 * 1200);
     }
 
     #[test]

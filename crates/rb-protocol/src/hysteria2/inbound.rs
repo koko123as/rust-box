@@ -43,7 +43,6 @@ type UdpSessions = Arc<AsyncMutex<HashMap<u32, Arc<Hysteria2UdpSession>>>>;
 #[derive(Debug)]
 enum AuthFailure {
     Rejected,
-    BbrMeta2Unsupported,
     DriverStopped,
 }
 
@@ -165,13 +164,6 @@ impl Hysteria2Inbound {
         let authentication = tokio::time::timeout(self.auth_timeout, auth_rx).await;
         let user = match authentication {
             Ok(Ok(Ok(user))) => user,
-            Ok(Ok(Err(AuthFailure::BbrMeta2Unsupported))) => {
-                debug!("{}: BBR-meta2 is not supported by rust-box yet", self.prefix());
-                connection.close(VarInt::from_u32(1), b"BBR-meta2 is not supported by rust-box yet");
-                h3_driver.abort();
-                let _ = h3_driver.await;
-                return;
-            }
             Ok(Ok(Err(AuthFailure::Rejected))) => {
                 debug!("{}: authentication rejected", self.prefix());
                 connection.close(VarInt::from_u32(1), b"authentication failed");
@@ -567,8 +559,7 @@ fn authenticate_request(
         let rate = if send_bps > 0 && client_rx > send_bps { send_bps } else { client_rx };
         controller.select_brutal(rate).map_err(|_| AuthFailure::Rejected)?;
     } else {
-        // sing-quic selects BBR-meta2 here. Do not silently substitute Quinn BBR/Cubic.
-        return Err(AuthFailure::BbrMeta2Unsupported);
+        controller.select_meta2();
     }
     Ok((!user.is_empty()).then(|| user.clone()))
 }
@@ -979,15 +970,17 @@ mod udp_mtu_tests {
     }
 
     #[test]
-    fn auth_explicitly_rejects_the_unimplemented_meta2_branch() {
+    fn auth_selects_pinned_meta2_standard_profile_when_brutal_is_not_selected() {
         let request = auth_request("alice-secret", None);
         let users = HashMap::from([("alice-secret".to_string(), "alice".to_string())]);
-        let controller = quinn::congestion::Hysteria2NegotiatedConfig::default();
+        let controller = Arc::new(quinn::congestion::Hysteria2NegotiatedConfig::default());
 
-        assert!(matches!(
-            authenticate_request(&request, &users, 0, 0, false, &controller),
-            Err(AuthFailure::BbrMeta2Unsupported)
-        ));
+        assert_eq!(
+            authenticate_request(&request, &users, 0, 0, false, &controller).unwrap(),
+            Some("alice".to_string())
+        );
+        let selected = quinn::congestion::ControllerFactory::build(controller.clone(), Instant::now(), 1200);
+        assert_eq!(selected.initial_window(), 32 * 1200);
     }
 
     #[test]

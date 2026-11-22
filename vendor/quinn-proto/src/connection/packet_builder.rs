@@ -187,6 +187,7 @@ impl PacketBuilder {
             true => packet_bytes as u16,
             false => 0,
         };
+        let congestion_controlled_bytes = if sent.is_some() { u64::from(size) } else { 0 };
 
         if let Some(sent) = sent {
             let packet = SentPacket {
@@ -210,6 +211,7 @@ impl PacketBuilder {
             exact_number,
             now,
             packet_bytes as u64,
+            congestion_controlled_bytes,
             ack_eliciting,
             conn.path.in_flight.bytes,
             conn.app_limited,

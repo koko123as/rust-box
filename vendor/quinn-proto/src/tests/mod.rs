@@ -508,7 +508,7 @@ enum PacketCallbackEvent {
     EndAcks(usize),
     Lost(crate::congestion::PacketNumberSpace, u64, bool, u64, u64),
     CongestionEvent(u64),
-    BatchEnd(u64, crate::congestion::PacketNumberSpace),
+    BatchEnd(u64, u64, crate::congestion::PacketNumberSpace),
 }
 
 #[derive(Default)]
@@ -537,6 +537,7 @@ impl crate::congestion::Controller for PacketCallbackController {
         packet_number: u64,
         _sent: Instant,
         _bytes: u64,
+        _congestion_controlled_bytes: u64,
         _ack_eliciting: bool,
         _bytes_in_flight: u64,
         _app_limited: bool,
@@ -599,9 +600,15 @@ impl crate::congestion::Controller for PacketCallbackController {
         &mut self,
         _now: Instant,
         prior_in_flight: u64,
+        current_in_flight: u64,
         space: crate::congestion::PacketNumberSpace,
     ) {
-        self.0 .0.lock().unwrap().events.push(PacketCallbackEvent::BatchEnd(prior_in_flight, space));
+        self.0
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .push(PacketCallbackEvent::BatchEnd(prior_in_flight, current_in_flight, space));
     }
 
     fn on_mtu_update(&mut self, _new_mtu: u16) {}
@@ -714,17 +721,20 @@ fn packet_callbacks_track_real_pair_stream_packets_and_acks() {
         .skip(loss_position + 1)
         .find_map(|(position, event)| matches!(event, PacketCallbackEvent::CongestionEvent(bytes) if *bytes > 0).then_some(position))
         .expect("loss batch must report its aggregate congestion event");
-    let (batch_end_position, prior_in_flight) = events
+    let (batch_end_position, prior_in_flight, current_in_flight) = events
         .iter()
         .enumerate()
         .skip(congestion_position + 1)
         .find_map(|(position, event)| match event {
-            PacketCallbackEvent::BatchEnd(prior, space) if *space == lost_space => Some((position, *prior)),
+            PacketCallbackEvent::BatchEnd(prior, current, space) if *space == lost_space => {
+                Some((position, *prior, *current))
+            }
             _ => None,
         })
         .expect("packet processing must close the ACK/loss batch after congestion callbacks");
     assert!(loss_position < congestion_position && congestion_position < batch_end_position);
     assert!(prior_in_flight >= lost_bytes, "batch prior-in-flight must include the packet later declared lost");
+    assert!(current_in_flight < prior_in_flight, "batch end must report actual bytes-in-flight after packet removal");
 }
 
 #[test]

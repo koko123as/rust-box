@@ -1462,12 +1462,14 @@ impl Connection {
         self.path.congestion.on_congestion_event_batch_end(
             now,
             prior_in_flight,
+            self.path.in_flight.bytes,
             match space {
                 SpaceId::Initial => PacketNumberSpace::Initial,
                 SpaceId::Handshake => PacketNumberSpace::Handshake,
                 SpaceId::Data => PacketNumberSpace::Data,
             },
         );
+        self.prune_congestion_packet_spaces();
 
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
@@ -1578,12 +1580,14 @@ impl Connection {
             self.path.congestion.on_congestion_event_batch_end(
                 now,
                 prior_in_flight,
+                self.path.in_flight.bytes,
                 match pn_space {
                     SpaceId::Initial => PacketNumberSpace::Initial,
                     SpaceId::Handshake => PacketNumberSpace::Handshake,
                     SpaceId::Data => PacketNumberSpace::Data,
                 },
             );
+            self.prune_congestion_packet_spaces();
             self.set_loss_detection_timer(now);
             return;
         }
@@ -2086,6 +2090,11 @@ impl Connection {
     fn discard_space(&mut self, now: Instant, space_id: SpaceId) {
         debug_assert!(space_id != SpaceId::Data);
         trace!("discarding {:?} keys", space_id);
+        self.path.congestion.on_packet_space_discarded(match space_id {
+            SpaceId::Initial => PacketNumberSpace::Initial,
+            SpaceId::Handshake => PacketNumberSpace::Handshake,
+            SpaceId::Data => PacketNumberSpace::Data,
+        });
         if space_id == SpaceId::Initial {
             // No longer needed
             if let ConnectionSide::Client { token, .. } = &mut self.side {
@@ -2101,6 +2110,26 @@ impl Connection {
             self.remove_in_flight(&packet);
         }
         self.set_loss_detection_timer(now)
+    }
+
+    fn prune_congestion_packet_spaces(&mut self) {
+        let boundaries = [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data].map(|space_id| {
+            let least_unacked = self.spaces[space_id]
+                .sent_packets
+                .keys()
+                .copied()
+                .min()
+                .unwrap_or(self.spaces[space_id].next_packet_number);
+            let space = match space_id {
+                SpaceId::Initial => PacketNumberSpace::Initial,
+                SpaceId::Handshake => PacketNumberSpace::Handshake,
+                SpaceId::Data => PacketNumberSpace::Data,
+            };
+            (space, least_unacked)
+        });
+        for (space, least_unacked) in boundaries {
+            self.path.congestion.on_packet_space_pruned(space, least_unacked);
+        }
     }
 
     fn handle_coalesced(&mut self, now: Instant, remote: SocketAddr, ecn: Option<EcnCodepoint>, data: BytesMut) {
@@ -2380,6 +2409,7 @@ impl Connection {
                 self.spaces[SpaceId::Initial].pending.crypto.push_back(frame::Crypto { offset: 0, data: client_hello });
 
                 // Retransmit all 0-RTT data
+                self.path.congestion.on_packet_space_discarded(PacketNumberSpace::Data);
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
                 for info in zero_rtt.into_values() {
                     self.remove_in_flight(&info);
@@ -2435,6 +2465,7 @@ impl Connection {
                             self.spaces[SpaceId::Data].pending = Retransmits::default();
 
                             // Discard 0-RTT packets
+                            self.path.congestion.on_packet_space_discarded(PacketNumberSpace::Data);
                             let sent_packets = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
                             for packet in sent_packets.into_values() {
                                 self.remove_in_flight(&packet);
