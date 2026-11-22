@@ -76,6 +76,21 @@ impl ClientHelloExtensionProfile {
         Ok(Self { entries })
     }
 
+    /// Shuffles ordinary entries using the pinned uTLS Go 1.20 small-n algorithm.
+    #[allow(dead_code)] // Called only by the staged, disabled uTLS profile builder.
+    pub(crate) fn shuffle_utls_extensions(&mut self, seed: i64) {
+        let reserved_slots = self
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                ClientHelloExtensionProfileEntry::Grease { .. }
+                | ClientHelloExtensionProfileEntry::Typed(ExtensionType::Padding | ExtensionType::PreSharedKey) => true,
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        super::go_math_rand::shuffle_with_reserved_slots(&mut self.entries, &reserved_slots, seed);
+    }
+
     pub(crate) fn grease_count(&self) -> usize {
         self.entries.iter().filter(|entry| matches!(entry, ClientHelloExtensionProfileEntry::Grease { .. })).count()
     }
@@ -252,6 +267,30 @@ mod tests {
                 ClientHelloExtensionOrderEntry::Typed(ExtensionType::KeyShare),
             ]
         );
+    }
+
+    #[test]
+    fn utls_shuffle_matches_go_and_keeps_grease_padding_and_psk_slots_fixed() {
+        let mut entries = Vec::new();
+        for slot in 0..18 {
+            entries.push(match slot {
+                0 | 17 => ClientHelloExtensionProfileEntry::Grease { payload: vec![slot as u8] },
+                3 => ClientHelloExtensionProfileEntry::Typed(ExtensionType::Padding),
+                14 => ClientHelloExtensionProfileEntry::Typed(ExtensionType::PreSharedKey),
+                _ => ClientHelloExtensionProfileEntry::Opaque {
+                    extension_type: ExtensionType::Unknown(0x1200 + slot as u16),
+                    payload: vec![slot as u8],
+                },
+            });
+        }
+        let original_entries = entries.clone();
+        let mut profile = ClientHelloExtensionProfile::new(entries).unwrap();
+
+        profile.shuffle_utls_extensions(1);
+
+        const GO_SHUFFLE_ORDER: [usize; 18] = [0, 12, 7, 3, 6, 16, 13, 4, 2, 9, 1, 11, 8, 5, 14, 10, 15, 17];
+        let expected_entries = GO_SHUFFLE_ORDER.map(|slot| original_entries[slot].clone());
+        assert_eq!(profile.entries, expected_entries);
     }
 
     #[test]

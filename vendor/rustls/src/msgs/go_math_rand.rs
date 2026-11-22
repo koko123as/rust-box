@@ -837,3 +837,8 @@ mod tests {
         }
     }
 }
+
+/// Applies the small-n Go shuffle with a caller-computed positional reservation mask.
+pub(super) fn shuffle_with_reserved_slots<T>(values: &mut [T], reserved_slots: &[bool], seed: i64) {
+    GoMathRand::shuffle_with_reserved_slots(values, reserved_slots, seed);
+}

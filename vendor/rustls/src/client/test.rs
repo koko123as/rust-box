@@ -53,7 +53,7 @@ mod tests {
     use crate::{DigitallySignedStruct, DistinguishedName, KeyLog, version};
 
     #[test]
-    fn client_hello_profile_orders_wire_extensions_and_reuses_grease_after_hrr() {
+    fn client_hello_profile_utls_shuffle_orders_wire_extensions_and_reuses_grease_after_hrr() {
         let mut config = ClientConfig::builder_with_provider(super::provider::default_provider().into())
             .with_protocol_versions(&[&version::TLS13])
             .unwrap()
@@ -81,8 +81,22 @@ mod tests {
                 .copied()
                 .map(ClientHelloExtensionProfileEntry::Typed),
         );
-        config.client_hello_extension_profile =
-            Some(ClientHelloExtensionProfile::new(profile_entries).unwrap());
+        assert!(profile_entries.len() <= 17);
+        let mut dummy_extension = 0x1300;
+        while profile_entries.len() < 17 {
+            profile_entries.push(ClientHelloExtensionProfileEntry::Opaque {
+                extension_type: ExtensionType::Unknown(dummy_extension),
+                payload: vec![0xf0],
+            });
+            dummy_extension += 1;
+        }
+        profile_entries.push(ClientHelloExtensionProfileEntry::Grease { payload: vec![0x42] });
+        assert_eq!(profile_entries.len(), 18);
+
+        let template_entries = profile_entries.clone();
+        let mut profile = ClientHelloExtensionProfile::new(profile_entries).unwrap();
+        profile.shuffle_utls_extensions(1);
+        config.client_hello_extension_profile = Some(profile);
 
         let mut conn =
             ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
@@ -90,25 +104,48 @@ mod tests {
         let mut first_bytes = Vec::new();
         conn.write_tls(&mut first_bytes).unwrap();
         let first_extensions = client_hello_extensions_from_wire(&first_bytes);
-        assert_eq!(
-            first_extensions[1],
-            (ExtensionType::Unknown(0x1234), vec![0xaa, 0xbb])
-        );
+        let first_grease_extension = first_extensions[0].0;
+        let last_grease_extension = first_extensions.last().unwrap().0;
+        let expected_types_for = |include_cookie: bool| {
+            const GO_SHUFFLE_ORDER: [usize; 18] =
+                [0, 12, 3, 7, 14, 16, 13, 4, 2, 9, 1, 11, 8, 5, 6, 10, 15, 17];
+            GO_SHUFFLE_ORDER
+                .into_iter()
+                .filter_map(|slot| match &template_entries[slot] {
+                    ClientHelloExtensionProfileEntry::Grease { .. } if slot == 0 => {
+                        Some(first_grease_extension)
+                    }
+                    ClientHelloExtensionProfileEntry::Grease { .. } => Some(last_grease_extension),
+                    ClientHelloExtensionProfileEntry::Typed(ExtensionType::Cookie) if !include_cookie => None,
+                    ClientHelloExtensionProfileEntry::Typed(extension_type) => Some(*extension_type),
+                    ClientHelloExtensionProfileEntry::Opaque { extension_type, .. } => Some(*extension_type),
+                })
+                .collect::<Vec<_>>()
+        };
+        let first_extension_types = first_extensions
+            .iter()
+            .map(|(extension_type, _)| *extension_type)
+            .collect::<Vec<_>>();
+        assert_eq!(first_extension_types, expected_types_for(false));
+        assert_eq!(first_extensions[0].1, vec![0x41]);
+        assert_eq!(first_extensions.last().unwrap().1.as_slice(), &[0x42]);
+        let opaque_extension = first_extensions
+            .iter()
+            .find(|(extension_type, _)| *extension_type == ExtensionType::Unknown(0x1234))
+            .unwrap();
+        assert_eq!(opaque_extension.1.as_slice(), &[0xaa, 0xbb]);
         let application_settings = first_extensions
             .iter()
             .find(|(extension_type, _)| *extension_type == ExtensionType::ApplicationSettings)
             .unwrap();
         assert_eq!(u16::from(application_settings.0), 0x44cd);
         assert_eq!(application_settings.1.as_slice(), b"\x00\x03\x02h2");
-        let first_extension_types = first_extensions
-            .iter()
-            .map(|(extension_type, _)| *extension_type)
-            .collect::<Vec<_>>();
-        assert_eq!(&first_extension_types[2..], typed_extensions.as_slice());
-        let grease_extension = first_extensions[0].0;
-        let grease_codepoint = u16::from(grease_extension);
-        assert_eq!((grease_codepoint >> 8) as u8, grease_codepoint as u8);
-        assert_eq!(grease_codepoint as u8 & 0x0f, 0x0a);
+        for grease_extension in [first_grease_extension, last_grease_extension] {
+            let grease_codepoint = u16::from(grease_extension);
+            assert_eq!((grease_codepoint >> 8) as u8, grease_codepoint as u8);
+            assert_eq!(grease_codepoint as u8 & 0x0f, 0x0a);
+        }
+        assert_ne!(first_grease_extension, last_grease_extension);
 
         let first_hello = client_hello_from_wire(&first_bytes);
         let first_key_share = first_hello.extensions.key_shares.as_ref().unwrap()[0].group;
@@ -133,6 +170,11 @@ mod tests {
         let mut retry_bytes = Vec::new();
         conn.write_tls(&mut retry_bytes).unwrap();
         let retry_extensions = client_hello_extensions_from_wire(&retry_bytes);
+        let retry_extension_types = retry_extensions
+            .iter()
+            .map(|(extension_type, _)| *extension_type)
+            .collect::<Vec<_>>();
+        assert_eq!(retry_extension_types, expected_types_for(true));
         assert_eq!(
             retry_extensions
                 .iter()
@@ -141,17 +183,11 @@ mod tests {
                 .iter()
                 .find(|(extension_type, _)| *extension_type == ExtensionType::ApplicationSettings)
         );
-        assert_eq!(retry_extensions[0].0, grease_extension);
-        assert_eq!(
-            retry_extensions[1],
-            (ExtensionType::Unknown(0x1234), vec![0xaa, 0xbb])
-        );
-        assert_eq!(retry_extensions[2].0, ExtensionType::Cookie);
-        let retry_extension_types = retry_extensions
-            .iter()
-            .map(|(extension_type, _)| *extension_type)
-            .collect::<Vec<_>>();
-        assert_eq!(&retry_extension_types[3..], typed_extensions.as_slice());
+        assert_eq!(retry_extensions[0].0, first_grease_extension);
+        assert_eq!(retry_extensions.last().unwrap().0, last_grease_extension);
+        assert_eq!(retry_extensions[0].1, vec![0x41]);
+        assert_eq!(retry_extensions.last().unwrap().1.as_slice(), &[0x42]);
+        assert!(retry_extensions.iter().any(|(extension_type, _)| *extension_type == ExtensionType::Cookie));
         let retry_hello = client_hello_from_wire(&retry_bytes);
         assert_eq!(
             retry_hello.extensions.key_shares.as_ref().unwrap()[0].group,
