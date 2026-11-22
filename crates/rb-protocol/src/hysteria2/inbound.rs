@@ -479,6 +479,7 @@ async fn drive_h3<C>(
             );
             match result {
                 Ok(user) => {
+                    authenticated.store(true, Ordering::Release);
                     let response = match auth_response(
                         auth.receive_bps,
                         auth.receive_bps == 0 && auth.ignore_client_bandwidth,
@@ -500,7 +501,6 @@ async fn drive_h3<C>(
                         debug!("Hysteria2 finish auth response: {error}");
                         return;
                     }
-                    authenticated.store(true, Ordering::Release);
                     let _ = auth_tx.send(Ok(user));
                 }
                 Err(error) => {
