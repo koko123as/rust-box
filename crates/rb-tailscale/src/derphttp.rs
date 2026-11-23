@@ -390,6 +390,14 @@ pub fn derp_url_port_from_parsed_parts<'a>(
     })
 }
 
+/// Selects the pinned fork's TLS branch from already-parsed URL and debug settings.
+///
+/// Only the exact lowercase `http` scheme or `TS_DEBUG_USE_DERP_HTTP` disables TLS;
+/// this does not parse a URL or perform a handshake.
+pub fn derp_use_https(explicit_url_scheme: Option<&str>, debug_use_derp_http: bool) -> bool {
+    explicit_url_scheme != Some("http") && !debug_use_derp_http
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -773,10 +781,10 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_region_tls_server_name, derp_region_url_string, derp_url_port_from_parsed_parts, ping_deadline,
-        DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpUrlPortError,
-        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
-        DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_region_tls_server_name, derp_region_url_string, derp_url_port_from_parsed_parts, derp_use_https,
+        ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError,
+        DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient,
+        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -928,6 +936,18 @@ mod tests {
         assert_eq!(derp_url_port_from_parsed_parts("ftp", None), Ok(None));
         assert_eq!(derp_url_port_from_parsed_parts("HTTPS", None), Ok(None));
         assert_eq!(derp_url_port_from_parsed_parts("https", Some("443x")), Err(DerpUrlPortError::InvalidPortText));
+    }
+
+    #[test]
+    fn use_https_matches_fixed_fork_scheme_and_debug_override() {
+        assert!(derp_use_https(None, false));
+        assert!(derp_use_https(Some("https"), false));
+        assert!(!derp_use_https(Some("http"), false));
+        assert!(derp_use_https(Some("HTTP"), false));
+        assert!(derp_use_https(Some("ftp"), false));
+        assert!(!derp_use_https(None, true));
+        assert!(!derp_use_https(Some("https"), true));
+        assert!(!derp_use_https(Some("http"), true));
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
