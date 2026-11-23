@@ -1,7 +1,7 @@
 //! Tailscale-specific address classification from the fork pinned by sing-box v1.14.4.
 //!
-//! This module ports `IsTailscaleIP`, `IsTailscaleIPv4`, `Tailscale4To6`, and
-//! `Tailscale6to4`. Other route helpers and endpoint behavior remain out of scope.
+//! This module ports Tailscale address classification/translation, service IPs,
+//! and `UnmapVia`; other route helpers and endpoint behavior remain out of scope.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -11,6 +11,17 @@ const CHROMEOS_VM_START: u32 = u32::from_be_bytes([100, 115, 92, 0]);
 const CHROMEOS_VM_END: u32 = u32::from_be_bytes([100, 115, 93, 255]);
 const TAILSCALE_ULA_PREFIX: [u16; 3] = [0xfd7a, 0x115c, 0xa1e0];
 const TAILSCALE_4TO6_PREFIX: [u8; 13] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0xab, 0x12, 0x48, 0x43, 0xcd, 0x96, 0x62];
+const TAILSCALE_VIA_PREFIX: [u8; 8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a];
+
+/// Returns the IPv4 Tailscale service address (`100.100.100.100`).
+pub const fn tailscale_service_ip() -> Ipv4Addr {
+    Ipv4Addr::new(100, 100, 100, 100)
+}
+
+/// Returns the IPv6 Tailscale service address (`fd7a:115c:a1e0::53`).
+pub const fn tailscale_service_ipv6() -> Ipv6Addr {
+    Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53)
+}
 
 /// Reports whether an address belongs to a range Tailscale assigns from.
 ///
@@ -71,6 +82,29 @@ pub fn tailscale6_to4(ip: IpAddr) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(100, octets[13], octets[14], octets[15]))
 }
 
+/// Reports whether an IPv6 address is in the Tailscale IPv4-via-IPv6 `/64` range.
+pub fn is_via_ip(ip: IpAddr) -> bool {
+    let IpAddr::V6(ipv6) = ip else {
+        return false;
+    };
+    ipv6.octets()[..8] == TAILSCALE_VIA_PREFIX
+}
+
+/// Unmaps an address in the Tailscale IPv4-via-IPv6 `/64` using its final 32 bits.
+///
+/// The pinned fork does not validate the resulting IPv4 address; addresses outside
+/// the `/64` are returned unchanged.
+pub fn unmap_via(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(ipv6) = ip else {
+        return ip;
+    };
+    let octets = ipv6.octets();
+    if octets[..8] != TAILSCALE_VIA_PREFIX {
+        return ip;
+    }
+    IpAddr::V4(Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+}
+
 fn is_tailscale_ipv6_ula(ipv6: Ipv6Addr) -> bool {
     ipv6.segments()[..3] == TAILSCALE_ULA_PREFIX
 }
@@ -123,6 +157,26 @@ mod tests {
             let address = ip(address);
             assert_eq!(is_tailscale_ip(address), expected, "general predicate for {address}");
             assert!(!is_tailscale_ipv4(address), "IPv4 predicate for {address}");
+        }
+    }
+
+    #[test]
+    fn service_addresses_and_via_range_match_pinned_go_oracle() {
+        assert_eq!(super::tailscale_service_ip().to_string(), "100.100.100.100");
+        assert_eq!(super::tailscale_service_ipv6().to_string(), "fd7a:115c:a1e0::53");
+
+        for (address, expected_is_via, expected_unmapped) in [
+            ("fd7a:115c:a1e0:b19:ffff:ffff:ffff:ffff", false, "fd7a:115c:a1e0:b19:ffff:ffff:ffff:ffff"),
+            ("fd7a:115c:a1e0:b1a::", true, "0.0.0.0"),
+            ("fd7a:115c:a1e0:b1a:ffff:ffff:ffff:ffff", true, "255.255.255.255"),
+            ("fd7a:115c:a1e0:b1b::", false, "fd7a:115c:a1e0:b1b::"),
+            ("fd7a:115c:a1e0:b1a:ffff:ffff:c000:201", true, "192.0.2.1"),
+            ("::ffff:100.64.0.1", false, "::ffff:100.64.0.1"),
+            ("100.64.0.1", false, "100.64.0.1"),
+        ] {
+            let address = ip(address);
+            assert_eq!(super::is_via_ip(address), expected_is_via, "via-range predicate for {address}");
+            assert_eq!(super::unmap_via(address), ip(expected_unmapped), "UnmapVia for {address}");
         }
     }
 
