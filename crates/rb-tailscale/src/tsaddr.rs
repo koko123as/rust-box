@@ -3,6 +3,7 @@
 //! This module ports Tailscale address classification/translation, service IPs,
 //! and via-route mapping helpers; other route helpers and endpoint behavior remain out of scope.
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -96,6 +97,68 @@ pub fn prefix_is4(prefix: IpPrefix) -> bool {
 /// Reports whether the prefix retains an IPv6 address, including invalid prefixes.
 pub fn prefix_is6(prefix: IpPrefix) -> bool {
     prefix.is_ipv6()
+}
+
+/// Returns the canonical IPv4 default route `0.0.0.0/0`.
+pub fn all_ipv4() -> IpPrefix {
+    IpPrefix::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
+}
+
+/// Returns the canonical IPv6 default route `::/0`.
+pub fn all_ipv6() -> IpPrefix {
+    IpPrefix::new(IpAddr::V6(Ipv6Addr::from(0u128)), 0)
+}
+
+/// Returns the canonical IPv4 and IPv6 default routes, in that order.
+pub fn exit_routes() -> [IpPrefix; 2] {
+    [all_ipv4(), all_ipv6()]
+}
+
+/// Reports whether `prefix` is exactly one of the canonical default routes.
+pub fn is_exit_route(prefix: IpPrefix) -> bool {
+    prefix == all_ipv4() || prefix == all_ipv6()
+}
+
+/// Reports whether both canonical IPv4 and IPv6 default routes are present.
+pub fn contains_exit_routes(routes: &[IpPrefix]) -> bool {
+    let mut has_ipv4 = false;
+    let mut has_ipv6 = false;
+    for route in routes {
+        if *route == all_ipv4() {
+            has_ipv4 = true;
+        } else if *route == all_ipv6() {
+            has_ipv6 = true;
+        }
+    }
+    has_ipv4 && has_ipv6
+}
+
+/// Reports whether any route has a zero-length prefix, regardless of its address.
+pub fn contains_exit_route(routes: &[IpPrefix]) -> bool {
+    routes.iter().any(|route| route.prefix_len() == 0)
+}
+
+/// Reports whether any route has a nonzero bit length, including invalid prefixes.
+pub fn contains_non_exit_subnet_routes(routes: &[IpPrefix]) -> bool {
+    routes.iter().any(|route| route.prefix_len() != 0)
+}
+
+/// Removes all zero-length routes when both canonical default routes are present.
+/// Otherwise, borrows and returns the original slice without copying.
+pub fn without_exit_routes(routes: &[IpPrefix]) -> Cow<'_, [IpPrefix]> {
+    if !contains_exit_routes(routes) {
+        return Cow::Borrowed(routes);
+    }
+    Cow::Owned(routes.iter().copied().filter(|route| route.prefix_len() > 0).collect())
+}
+
+/// Removes all zero-length routes when at least one is present.
+/// Otherwise, borrows and returns the original slice without copying.
+pub fn without_exit_route(routes: &[IpPrefix]) -> Cow<'_, [IpPrefix]> {
+    if !contains_exit_route(routes) {
+        return Cow::Borrowed(routes);
+    }
+    Cow::Owned(routes.iter().copied().filter(|route| route.prefix_len() > 0).collect())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +292,7 @@ fn is_tailscale_ipv6_ula(ipv6: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::net::IpAddr;
 
     use super::{is_tailscale_ip, is_tailscale_ipv4, IpPrefix, MapViaError};
@@ -379,6 +443,57 @@ mod tests {
                 "PrefixesContainsIP for {address}"
             );
         }
+    }
+
+    #[test]
+    fn exit_route_helpers_and_filters_match_pinned_go_oracle() {
+        assert_eq!(super::exit_routes(), [prefix("0.0.0.0/0"), prefix("::/0")]);
+        assert!(super::is_exit_route(prefix("0.0.0.0/0")));
+        assert!(super::is_exit_route(prefix("::/0")));
+        assert!(!super::is_exit_route(prefix("10.0.0.1/0")));
+
+        let no_routes = [prefix("10.0.0.1/24"), prefix("fd00::1/64")];
+        assert!(!super::contains_exit_routes(&no_routes));
+        assert!(!super::contains_exit_route(&no_routes));
+        assert!(super::contains_non_exit_subnet_routes(&no_routes));
+        assert!(matches!(super::without_exit_routes(&no_routes), Cow::Borrowed(_)));
+        assert!(matches!(super::without_exit_route(&no_routes), Cow::Borrowed(_)));
+
+        let v4_only = [prefix("0.0.0.0/0"), prefix("10.0.0.1/24"), prefix("10.0.0.1/0")];
+        assert!(!super::contains_exit_routes(&v4_only));
+        assert!(super::contains_exit_route(&v4_only));
+        assert!(super::contains_non_exit_subnet_routes(&v4_only));
+        assert!(matches!(super::without_exit_routes(&v4_only), Cow::Borrowed(_)));
+        assert_eq!(super::without_exit_route(&v4_only).as_ref(), [prefix("10.0.0.1/24")].as_slice());
+
+        let both = [
+            prefix("0.0.0.0/0"),
+            prefix("::/0"),
+            prefix("10.0.0.1/24"),
+            prefix("fd00::1/64"),
+            prefix("10.0.0.1/0"),
+            IpPrefix::new(ip("192.0.2.1"), 33),
+        ];
+        assert!(super::contains_exit_routes(&both));
+        assert!(super::contains_exit_route(&both));
+        assert!(super::contains_non_exit_subnet_routes(&both));
+        let expected_filtered = [prefix("10.0.0.1/24"), prefix("fd00::1/64")];
+        assert_eq!(super::without_exit_routes(&both).as_ref(), expected_filtered.as_slice());
+        assert_eq!(super::without_exit_route(&both).as_ref(), expected_filtered.as_slice());
+
+        let noncanonical_zero = [prefix("10.0.0.1/0")];
+        assert!(!super::contains_exit_routes(&noncanonical_zero));
+        assert!(super::contains_exit_route(&noncanonical_zero));
+        assert!(!super::contains_non_exit_subnet_routes(&noncanonical_zero));
+        assert!(matches!(super::without_exit_routes(&noncanonical_zero), Cow::Borrowed(_)));
+        assert!(super::without_exit_route(&noncanonical_zero).is_empty());
+
+        let invalid_only = [IpPrefix::new(ip("192.0.2.1"), 33)];
+        assert!(!super::contains_exit_routes(&invalid_only));
+        assert!(!super::contains_exit_route(&invalid_only));
+        assert!(super::contains_non_exit_subnet_routes(&invalid_only));
+        assert!(matches!(super::without_exit_route(&invalid_only), Cow::Borrowed(_)));
+        assert_eq!(super::without_exit_routes(&invalid_only).as_ref(), invalid_only.as_slice());
     }
 
     #[test]
