@@ -1,8 +1,8 @@
-//! Pure-Rust codecs for the implemented Tailscale disco plaintext messages.
+//! Pure-Rust codecs for Tailscale disco plaintext messages and encrypted envelopes.
 //!
 //! The pinned Tailscale fork supports more disco types than this module. The
 //! UDP relay codecs for types 0x04 through 0x09 are implemented. The module does
-//! not implement the outer packet runtime or endpoint discovery.
+//! not implement peer/key lookup, optional Geneve transport wrapping, or endpoint discovery.
 
 use std::{
     fmt,
@@ -13,8 +13,10 @@ use crate::NodePublic;
 
 /// The six-byte Tailscale disco packet magic (`TS💬`).
 pub const MAGIC: [u8; 6] = [0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac];
+/// Length of the magic and sender-key prefix, where magicsock starts the sealed box.
+pub const DISCO_HEADER_LEN: usize = 6 + 32;
 /// Minimum outer wrapper length: magic, sender disco public key, and nonce.
-pub const OUTER_HEADER_LEN: usize = 6 + 32 + 24;
+pub const OUTER_HEADER_LEN: usize = DISCO_HEADER_LEN + 24;
 
 const PING: u8 = 0x01;
 const PONG: u8 = 0x02;
@@ -121,6 +123,40 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// An error while sealing or opening a complete encrypted disco packet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PacketError {
+    /// The input does not have the 38-byte magicsock disco prefix and exact magic.
+    NotDiscoPacket,
+    /// NaCl-compatible box sealing/opening failed.
+    Crypto(crate::disco_crypto::Error),
+    /// Authenticated plaintext could not be parsed as a supported disco message.
+    Plaintext(Error),
+    /// Checked output sizing or a fallible allocation failed.
+    Resource,
+}
+
+impl fmt::Display for PacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDiscoPacket => f.write_str("not a magicsock disco packet"),
+            Self::Crypto(error) => error.fmt(f),
+            Self::Plaintext(error) => error.fmt(f),
+            Self::Resource => f.write_str("disco packet size or allocation failure"),
+        }
+    }
+}
+
+impl std::error::Error for PacketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Crypto(error) => Some(error),
+            Self::Plaintext(error) => Some(error),
+            Self::NotDiscoPacket | Self::Resource => None,
+        }
+    }
+}
+
 /// Returns true only when `packet` has the complete 62-byte outer header and
 /// the exact magic, matching the pinned fork's `LooksLikeDiscoWrapper`.
 pub fn looks_like_wrapper(packet: &[u8]) -> bool {
@@ -129,7 +165,61 @@ pub fn looks_like_wrapper(packet: &[u8]) -> bool {
 
 /// Returns the sender's 32-byte disco public key only for a valid outer wrapper.
 pub fn source(packet: &[u8]) -> Option<&[u8]> {
-    looks_like_wrapper(packet).then(|| &packet[6..38])
+    looks_like_wrapper(packet).then(|| &packet[MAGIC.len()..DISCO_HEADER_LEN])
+}
+
+/// Matches magicsock's lower-level packet classifier: 38-byte magic + sender key.
+/// This is intentionally less strict than [`looks_like_wrapper`], which mirrors
+/// the exported `disco.LooksLikeDiscoWrapper` helper and requires a nonce too.
+pub fn packet_looks_like_disco(packet: &[u8]) -> bool {
+    packet.len() >= DISCO_HEADER_LEN && packet.starts_with(&MAGIC)
+}
+
+/// Seals and wraps a plaintext message as `magic || sender key || NaCl box`.
+///
+/// This returns only the disco packet. The optional 8-byte Geneve header used by
+/// some magicsock relay paths is a separate transport layer. The caller must
+/// provide the sender identity and matching precomputed shared key consistently.
+pub fn seal_packet(
+    sender: &crate::DiscoPublic,
+    shared: &crate::disco_crypto::DiscoShared,
+    message: &Message,
+) -> Result<Vec<u8>, PacketError> {
+    let plaintext = encode(message).map_err(PacketError::Plaintext)?;
+    let sealed = shared.seal(&plaintext).map_err(PacketError::Crypto)?;
+    wrap_sealed(sender, &sealed)
+}
+
+/// Opens a magicsock disco packet and parses its authenticated plaintext.
+///
+/// As in the pinned fork, callers select `shared` using trusted peer/relay state;
+/// the sender key in the packet is not independently authenticated or looked up
+/// here. A 38–61 byte disco-looking packet proceeds to `DiscoShared::open` and
+/// fails there as a short sealed box, matching magicsock's receive sequence.
+pub fn open_packet(
+    shared: &crate::disco_crypto::DiscoShared,
+    packet: &[u8],
+) -> Result<(crate::DiscoPublic, Message), PacketError> {
+    if !packet_looks_like_disco(packet) {
+        return Err(PacketError::NotDiscoPacket);
+    }
+
+    let mut sender_bytes = [0; 32];
+    sender_bytes.copy_from_slice(&packet[MAGIC.len()..DISCO_HEADER_LEN]);
+    let sender = crate::DiscoPublic::from_raw32(sender_bytes);
+    let plaintext = shared.open(&packet[DISCO_HEADER_LEN..]).map_err(PacketError::Crypto)?;
+    let message = parse(&plaintext).map_err(PacketError::Plaintext)?;
+    Ok((sender, message))
+}
+
+fn wrap_sealed(sender: &crate::DiscoPublic, sealed: &[u8]) -> Result<Vec<u8>, PacketError> {
+    let total_len = DISCO_HEADER_LEN.checked_add(sealed.len()).ok_or(PacketError::Resource)?;
+    let mut packet = Vec::new();
+    packet.try_reserve_exact(total_len).map_err(|_| PacketError::Resource)?;
+    packet.extend_from_slice(&MAGIC);
+    packet.extend_from_slice(&sender.raw_bytes());
+    packet.extend_from_slice(sealed);
+    Ok(packet)
 }
 
 /// Parses plaintext inside an authenticated NaCl box.
@@ -422,6 +512,27 @@ mod tests {
         pairs.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()
     }
 
+    const ALICE_PRIVATE_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const BOB_PUBLIC_HEX: &str = "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466";
+
+    fn decode_hex32(input: &str) -> [u8; 32] {
+        let decoded = decode_hex(input);
+        let mut output = [0; 32];
+        assert_eq!(decoded.len(), output.len());
+        output.copy_from_slice(&decoded);
+        output
+    }
+
+    fn wrapper_shared_and_sender() -> (crate::disco_crypto::DiscoShared, crate::DiscoPublic) {
+        let alice = crate::DiscoPrivate::from_raw32(decode_hex32(ALICE_PRIVATE_HEX));
+        let sender = crate::DiscoPublic::from_raw32(decode_hex32(BOB_PUBLIC_HEX));
+        (alice.shared(&sender).unwrap(), sender)
+    }
+
+    fn hex(input: &[u8]) -> String {
+        input.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     #[test]
     fn marshal_matches_real_pinned_go_fork_vectors() {
         // Generated by disco.Message.AppendMarshal in the actual Go module
@@ -663,15 +774,99 @@ mod tests {
     fn wrapper_requires_full_outer_header_and_exact_magic() {
         let mut packet = vec![0; OUTER_HEADER_LEN];
         packet[..6].copy_from_slice(&MAGIC);
-        for (index, byte) in packet[6..38].iter_mut().enumerate() {
+        for (index, byte) in packet[MAGIC.len()..DISCO_HEADER_LEN].iter_mut().enumerate() {
             *byte = (index + 6) as u8;
         }
         assert!(!looks_like_wrapper(&packet[..OUTER_HEADER_LEN - 1]));
         assert!(looks_like_wrapper(&packet));
-        assert_eq!(source(&packet), Some(&packet[6..38]));
+        assert_eq!(source(&packet), Some(&packet[MAGIC.len()..DISCO_HEADER_LEN]));
         packet[0] = 0;
         assert!(!looks_like_wrapper(&packet));
         assert_eq!(source(&packet), None);
+    }
+
+    #[test]
+    fn packet_classifier_matches_magicsock_38_byte_prefix_not_62_byte_helper() {
+        let mut packet = vec![0; OUTER_HEADER_LEN - 1];
+        packet[..MAGIC.len()].copy_from_slice(&MAGIC);
+        assert!(!packet_looks_like_disco(&packet[..DISCO_HEADER_LEN - 1]));
+        assert!(packet_looks_like_disco(&packet[..DISCO_HEADER_LEN]));
+        assert!(packet_looks_like_disco(&packet));
+        assert!(!looks_like_wrapper(&packet));
+        packet[0] ^= 1;
+        assert!(!packet_looks_like_disco(&packet));
+    }
+
+    #[test]
+    fn rust_packet_seal_and_open_use_go_outer_envelope_layout() {
+        let (shared, sender) = wrapper_shared_and_sender();
+        let message =
+            Message::Ping { tx_id: core::array::from_fn(|index| index as u8), node_key: key(0x5a), padding: 3 };
+        let packet = seal_packet(&sender, &shared, &message).unwrap();
+        assert!(packet_looks_like_disco(&packet));
+        assert!(looks_like_wrapper(&packet));
+        assert_eq!(&packet[..MAGIC.len()], &MAGIC);
+        assert_eq!(&packet[MAGIC.len()..DISCO_HEADER_LEN], &sender.raw_bytes());
+        assert_eq!(source(&packet), Some(&packet[MAGIC.len()..DISCO_HEADER_LEN]));
+        assert_eq!(open_packet(&shared, &packet), Ok((sender, message)));
+
+        if std::env::var_os("RB_TAILSCALE_PRINT_DISCO_PACKET").is_some() {
+            println!("RUST_PACKET_HEX={}", hex(&packet));
+        }
+    }
+
+    #[test]
+    fn rust_opens_a_fixed_nonce_packet_emitted_by_the_pinned_go_fork() {
+        // Generated by Go disco.Message.AppendMarshal + box.SealAfterPrecomputation
+        // from the exact pinned fork; sender public key and shared key match the fixture above.
+        const GO_PACKET_HEX: &str = "5453f09f92ac64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d484660a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021451806653df2bd27698a0983b8d93c88b3b47fd33ad5008f63b0b477b0852b4bb49f8a03c4ddf1e78df98c14558f02f077a1996cade7aef28d78e76c13493659b3";
+        let (shared, expected_sender) = wrapper_shared_and_sender();
+        let packet = decode_hex(GO_PACKET_HEX);
+        let (sender, message) = open_packet(&shared, &packet).unwrap();
+        assert_eq!(sender, expected_sender);
+        assert_eq!(
+            message,
+            Message::Ping { tx_id: core::array::from_fn(|index| index as u8), node_key: key(0x5a), padding: 3 }
+        );
+    }
+
+    #[test]
+    fn packet_open_matches_go_short_box_and_authentication_failure_order() {
+        let (shared, _) = wrapper_shared_and_sender();
+        let mut not_packet = vec![0; DISCO_HEADER_LEN - 1];
+        not_packet[..MAGIC.len()].copy_from_slice(&MAGIC);
+        assert_eq!(open_packet(&shared, &not_packet), Err(PacketError::NotDiscoPacket));
+
+        for (length, got) in [(DISCO_HEADER_LEN, 0), (OUTER_HEADER_LEN - 1, 23)] {
+            let mut short = vec![0; length];
+            short[..MAGIC.len()].copy_from_slice(&MAGIC);
+            assert_eq!(
+                open_packet(&shared, &short),
+                Err(PacketError::Crypto(crate::disco_crypto::Error::ShortCiphertext { got, want: 24 }))
+            );
+        }
+
+        let mut nonce_only = vec![0; OUTER_HEADER_LEN];
+        nonce_only[..MAGIC.len()].copy_from_slice(&MAGIC);
+        assert_eq!(
+            open_packet(&shared, &nonce_only),
+            Err(PacketError::Crypto(crate::disco_crypto::Error::Authentication))
+        );
+    }
+
+    #[test]
+    fn packet_open_parses_only_after_authentication() {
+        let (shared, sender) = wrapper_shared_and_sender();
+        let sealed_unknown = shared.seal(&[0x63, 0]).unwrap();
+        let packet = wrap_sealed(&sender, &sealed_unknown).unwrap();
+        assert_eq!(open_packet(&shared, &packet), Err(PacketError::Plaintext(Error::UnknownType(0x63))));
+
+        let mut tampered = packet;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            open_packet(&shared, &tampered),
+            Err(PacketError::Crypto(crate::disco_crypto::Error::Authentication))
+        );
     }
 
     #[test]

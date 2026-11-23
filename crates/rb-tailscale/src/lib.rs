@@ -1,8 +1,8 @@
 //! Pure Rust primitives ported from the Tailscale fork pinned by sing-box v1.14.4.
 //!
-//! This crate implements machine, node, and disco X25519 key primitives, plus a
-//! fail-closed plaintext codec for Disco Ping, Pong, and CallMeMaybe messages.
-//! It is not yet a Tailscale control-plane or endpoint runtime.
+//! This crate implements machine, node, and disco X25519 key primitives, DiscoShared
+//! encryption, Go-oracle-tested plaintext codecs for disco types 0x01 through 0x09,
+//! and encrypted packet-envelope helpers. It is not a Tailscale endpoint runtime.
 
 pub mod disco;
 pub mod disco_crypto;
@@ -287,8 +287,7 @@ impl fmt::Display for NodePublic {
 /// A Tailscale DiscoPrivate key used for peer path discovery.
 ///
 /// The pinned fork has no text encoding for this private key; its raw form is
-/// exactly 32 bytes. Shared-secret computation and NaCl box encryption are not
-/// implemented by this type yet.
+/// exactly 32 bytes. Shared-secret derivation is provided by `disco_crypto`.
 #[derive(Clone)]
 pub struct DiscoPrivate(StaticSecret);
 
