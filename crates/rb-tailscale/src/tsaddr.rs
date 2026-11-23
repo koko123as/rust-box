@@ -83,6 +83,21 @@ impl fmt::Display for IpPrefix {
     }
 }
 
+/// Reports whether any prefix in `prefixes` contains `ip`.
+pub fn prefixes_contains_ip(prefixes: &[IpPrefix], ip: IpAddr) -> bool {
+    prefixes.iter().any(|prefix| prefix.contains(ip))
+}
+
+/// Reports whether the prefix retains an IPv4 address, including invalid prefixes.
+pub fn prefix_is4(prefix: IpPrefix) -> bool {
+    prefix.is_ipv4()
+}
+
+/// Reports whether the prefix retains an IPv6 address, including invalid prefixes.
+pub fn prefix_is6(prefix: IpPrefix) -> bool {
+    prefix.is_ipv6()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MapViaError;
 
@@ -334,6 +349,35 @@ mod tests {
             ("192.0.2.1/24", false),
         ] {
             assert_eq!(super::is_via_prefix(prefix(input)), expected, "IsViaPrefix for {input}");
+        }
+    }
+
+    #[test]
+    fn prefix_family_and_set_queries_match_pinned_go_oracle() {
+        for (address, bits, expected_v4, expected_v6) in [
+            ("192.0.2.1", 24, true, false),
+            ("100.64.0.1", 33, true, false),
+            ("fd7a:115c:a1e0:b1a::1", 64, false, true),
+            ("fd7a:115c:a1e0:b1a::1", 129, false, true),
+        ] {
+            let prefix = IpPrefix::new(ip(address), bits);
+            assert_eq!(super::prefix_is4(prefix), expected_v4, "PrefixIs4 for {address}/{bits}");
+            assert_eq!(super::prefix_is6(prefix), expected_v6, "PrefixIs6 for {address}/{bits}");
+        }
+
+        let prefixes = [prefix("10.0.0.1/24"), prefix("fd7a:115c:a1e0:b1a::1/64"), IpPrefix::new(ip("192.0.2.1"), 33)];
+        for (address, expected) in [
+            ("10.0.0.255", true),
+            ("10.0.1.0", false),
+            ("fd7a:115c:a1e0:b1a::2", true),
+            ("192.0.2.1", false),
+            ("fd00::1", false),
+        ] {
+            assert_eq!(
+                super::prefixes_contains_ip(&prefixes, ip(address)),
+                expected,
+                "PrefixesContainsIP for {address}"
+            );
         }
     }
 
