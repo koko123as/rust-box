@@ -6,9 +6,10 @@
 //! blocking-stream greeting and ClientInfo write path, ServerInfo parsing, and
 //! bounded blocking-stream routing for pinned-fork received-message frames. A
 //! receive-session helper requests the pinned 120-second read deadline and latches
-//! the first error. Node-key box primitives live in `disco_crypto`; shared write
-//! serialization, automatic Ping replies, limiter execution, and server
-//! authentication remain unimplemented.
+//! the first error. A pure Rust model of the pinned `rate.Limiter.AllowN` state
+//! transition is oracle-tested. Node-key box primitives live in `disco_crypto`;
+//! shared write serialization, `Client.Send` integration, automatic Ping replies,
+//! and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
@@ -847,6 +848,74 @@ pub struct SendRateLimiterConfig {
     pub burst: i64,
 }
 
+/// Pure Rust model of the pinned `golang.org/x/time/rate@v0.15.0` limiter.
+///
+/// The owning DERP send path must serialize calls, as the Go client does with
+/// its writer mutex. This object models `NewLimiter`'s initial burst and
+/// `AllowN` only; callers still supply the exact request size and monotonic time.
+#[derive(Clone, Debug)]
+pub struct DerpSendRateLimiter {
+    bytes_per_second: f64,
+    burst: i64,
+    tokens: f64,
+    last: Option<Instant>,
+}
+
+impl DerpSendRateLimiter {
+    /// Creates a limiter with the pinned Go implementation's initial token count.
+    pub fn new(config: SendRateLimiterConfig) -> Self {
+        Self {
+            bytes_per_second: config.bytes_per_second as f64,
+            burst: config.burst,
+            tokens: config.burst as f64,
+            last: None,
+        }
+    }
+
+    /// Mirrors `AllowN(now, n)` for non-negative request sizes.
+    ///
+    /// The Go implementation leaves state unchanged on a denied request,
+    /// clamps elapsed duration to `time.Duration`'s maximum, and truncates a
+    /// positive wait shorter than one nanosecond to zero. Those details are
+    /// observable at burst and very-high-rate boundaries.
+    pub fn allow_n(&mut self, now: Instant, n: usize) -> bool {
+        let mut tokens = self.tokens;
+        if let Some(last) = self.last {
+            let effective_last = if now < last { now } else { last };
+            let elapsed_nanos = now.duration_since(effective_last).as_nanos().min(i64::MAX as u128) as i64;
+            if self.bytes_per_second > 0.0 {
+                let elapsed_seconds = elapsed_nanos as f64 / 1_000_000_000.0;
+                tokens += elapsed_seconds * self.bytes_per_second;
+            }
+        }
+
+        let burst_as_tokens = self.burst as f64;
+        if tokens > burst_as_tokens {
+            tokens = burst_as_tokens;
+        }
+        let within_burst = i64::try_from(n).is_ok_and(|request| request <= self.burst);
+        let tokens_after_request = tokens - n as f64;
+        let wait_is_zero = if tokens_after_request < 0.0 {
+            if self.bytes_per_second <= 0.0 {
+                false
+            } else {
+                let wait_nanos = (-tokens_after_request / self.bytes_per_second) * 1_000_000_000.0;
+                wait_nanos < 1.0
+            }
+        } else {
+            true
+        };
+
+        if !within_burst || !wait_is_zero {
+            return false;
+        }
+
+        self.last = Some(now);
+        self.tokens = tokens_after_request;
+        true
+    }
+}
+
 impl ServerInfo {
     /// Drops the JSON version field and produces the `Client.Recv` message.
     pub fn into_message(self) -> ServerInfoMessage {
@@ -860,7 +929,8 @@ impl ServerInfo {
 impl ServerInfoMessage {
     /// Mirrors `setSendRateLimiter`: zero rate disables the limiter; any nonzero
     /// rate creates a limiter with the exact supplied rate and burst values.
-    /// This returns configuration only and is not a token-bucket implementation.
+    /// This accessor maps configuration only; it does not instantiate
+    /// [`DerpSendRateLimiter`].
     pub fn rate_limiter_config(self) -> Option<SendRateLimiterConfig> {
         if self.token_bucket_bytes_per_second == 0 {
             None
@@ -1414,7 +1484,7 @@ mod tests {
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
     use std::io::{self, Read, Write};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     struct ChunkedReader {
         bytes: Vec<u8>,
@@ -1743,6 +1813,61 @@ mod tests {
             negative.rate_limiter_config(),
             Some(super::SendRateLimiterConfig { bytes_per_second: -1, burst: -7 })
         );
+    }
+
+    #[test]
+    fn send_rate_limiter_allow_n_matches_fixed_go_x_time_rate_oracle() {
+        use super::{DerpSendRateLimiter, SendRateLimiterConfig};
+
+        let base = Instant::now();
+        let mut refill = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 10, burst: 20 });
+        let refill_results = [
+            refill.allow_n(base, 12),
+            refill.allow_n(base, 9),
+            refill.allow_n(base + Duration::from_millis(100), 1),
+            refill.allow_n(base + Duration::from_millis(150), 1),
+            refill.allow_n(base + Duration::from_secs(1), 20),
+            refill.allow_n(base + Duration::from_secs(3), 20),
+        ];
+        assert_eq!(refill_results, [true, false, true, true, false, true]);
+
+        let mut burst = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 10, burst: 20 });
+        assert!(!burst.allow_n(base, 21));
+        assert!(burst.allow_n(base, 20));
+        assert!(!burst.allow_n(base, 1));
+
+        let mut negative_rate = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: -1, burst: 12 });
+        assert!(negative_rate.allow_n(base, 12));
+        assert!(!negative_rate.allow_n(base + Duration::from_secs(86_400), 1));
+
+        let mut zero_rate = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 0, burst: 2 });
+        assert!(zero_rate.allow_n(base, 2));
+        assert!(!zero_rate.allow_n(base + Duration::from_secs(3_600), 1));
+
+        let mut zero_burst = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 10, burst: 0 });
+        assert!(zero_burst.allow_n(base, 0));
+        assert!(!zero_burst.allow_n(base, 1));
+
+        let mut negative_burst = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 10, burst: -1 });
+        assert!(!negative_burst.allow_n(base, 0));
+        assert!(!negative_burst.allow_n(base, 1));
+
+        let mut backwards = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 10, burst: 10 });
+        assert!(backwards.allow_n(base, 10));
+        assert!(backwards.allow_n(base - Duration::from_secs(1), 0));
+        assert!(backwards.allow_n(base + Duration::from_millis(500), 10));
+
+        let mut large_rate = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: i64::MAX, burst: 10 });
+        assert!(large_rate.allow_n(base, 10));
+        assert!(large_rate.allow_n(base + Duration::from_nanos(1), 10));
+        assert!(large_rate.allow_n(base + Duration::from_nanos(2), 10));
+
+        let mut subnanosecond =
+            DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 2_000_000_000, burst: 10 });
+        assert!(subnanosecond.allow_n(base, 10));
+        assert!(subnanosecond.allow_n(base + Duration::from_nanos(1), 3));
+        assert!(!subnanosecond.allow_n(base + Duration::from_nanos(1), 1));
+        assert!(subnanosecond.allow_n(base + Duration::from_nanos(2), 1));
     }
 
     #[test]
