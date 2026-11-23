@@ -12,16 +12,21 @@
 //! frame types with a session helper for 120-second read-deadline requests and
 //! permanent first-error latching, plus a shared writer that applies decoded
 //! ServerInfo rate settings and serializes Send/ForwardPacket, Ping/Pong,
-//! NotePreferred, WatchConnectionChanges, and ClosePeer operations. Send and
-//! ForwardPacket size, wire, error, and lock behavior are covered. The ForwardPacket
-//! five-second connection-close timeout, other DERP writer methods, automatic Ping
-//! responses, and the complete Tailscale endpoint runtime are not yet implemented.
+//! NotePreferred, WatchConnectionChanges, and ClosePeer operations. A separate
+//! magicsock receive-loop slice consumes DERP Ping messages, schedules best-effort
+//! Pong writes through an injected asynchronous task spawner (using detached Rust
+//! threads by default), reports failures through a caller-provided logger, and
+//! continues receiving. Targeted tests cover individual protocol slices; they do
+//! not constitute full endpoint compatibility or Go scheduler parity. The
+//! ForwardPacket five-second connection-close watchdog, derphttp closed-state
+//! behavior, and the complete Tailscale endpoint runtime remain unimplemented.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
 pub mod disco;
 pub mod disco_crypto;
 pub mod geneve;
+pub mod magicsock;
 pub mod packet_classifier;
 pub mod stun;
 pub mod tsaddr;
