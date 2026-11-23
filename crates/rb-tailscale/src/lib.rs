@@ -4,7 +4,8 @@
 //! encryption, Go-oracle-tested plaintext codecs for disco types 0x01 through 0x09,
 //! encrypted packet-envelope helpers, the fixed Geneve header, and source-derived
 //! magicsock packet classification, STUN binding request/response helpers, and
-//! Tailscale address-range predicates. This crate is not a full Tailscale endpoint runtime.
+//! Tailscale address classification and 4-to-6/6-to-4 mapping helpers. This crate is not a
+//! full Tailscale endpoint runtime.
 
 pub mod disco;
 pub mod disco_crypto;
