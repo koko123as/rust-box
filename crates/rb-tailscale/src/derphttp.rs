@@ -2,9 +2,10 @@
 //!
 //! This module gates `SendPing` and `SendPong` on caller-supplied connection state,
 //! dispatches registered Pong responses, and filters only matching Pong messages
-//! from an already-created DERP receive session. It does not connect or reconnect,
-//! assign connection generations, close transports, or implement the complete
-//! `derphttp.Client` lifecycle.
+//! from an already-created DERP receive session. Its bounded Ping helper models a
+//! five-second maximum deadline but not arbitrary context cancellation. It does not
+//! connect or reconnect, assign connection generations, close transports, or
+//! implement the complete `derphttp.Client` lifecycle.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -13,9 +14,15 @@ use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use rand::rand_core::OsRng;
+use rand::TryRngCore;
+
 use crate::derp::{
     DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError, StreamWriteFrameError,
 };
+
+/// Maximum wait in the pinned fork's high-level `derphttp.Client.Ping` operation.
+pub const DERP_PING_MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// Caller-owned connection state checked by the pinned fork's lower-level send methods.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +88,35 @@ impl Error for DerpPingSendError {
         match self {
             Self::Write(error) => Some(error),
             Self::ClientClosed | Self::ClientNotConnected => None,
+        }
+    }
+}
+
+/// Failure from the bounded, deadline-only high-level Ping helper.
+#[derive(Debug)]
+pub enum DerphttpPingError {
+    Entropy(String),
+    Send(DerpPingSendError),
+    DeadlineExceeded,
+    DeadlineOverflow,
+}
+
+impl fmt::Display for DerphttpPingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entropy(error) => write!(f, "DERP Ping randomness unavailable: {error}"),
+            Self::Send(error) => fmt::Display::fmt(error, f),
+            Self::DeadlineExceeded => f.write_str("context deadline exceeded"),
+            Self::DeadlineOverflow => f.write_str("DERP Ping deadline overflow"),
+        }
+    }
+}
+
+impl Error for DerphttpPingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Send(error) => Some(error),
+            Self::Entropy(_) | Self::DeadlineExceeded | Self::DeadlineOverflow => None,
         }
     }
 }
@@ -163,6 +199,13 @@ impl<W: Write> DerphttpSendGate<W> {
 
 /// Compatibility alias for the previously introduced SendPong-only gate.
 pub type DerpPongSendGate<W> = DerphttpSendGate<W>;
+
+/// Computes the high-level Ping deadline: the earlier of the caller deadline and
+/// the pinned fork's fixed five-second maximum.
+fn ping_deadline(start: Instant, caller_deadline: Option<Instant>) -> Option<Instant> {
+    let maximum = start.checked_add(DERP_PING_MAX_WAIT)?;
+    Some(caller_deadline.map_or(maximum, |deadline| deadline.min(maximum)))
+}
 
 struct PongSignal {
     ready: Mutex<bool>,
@@ -274,6 +317,17 @@ impl DerpPongResponseRegistry {
     }
 }
 
+struct PingRegistrationGuard {
+    registry: Arc<DerpPongResponseRegistry>,
+    data: [u8; 8],
+}
+
+impl Drop for PingRegistrationGuard {
+    fn drop(&mut self) {
+        self.registry.unregister_ping(self.data);
+    }
+}
+
 /// Filters registered matching Pongs from an already-created DERP receive session.
 ///
 /// Matching Pongs wake their registered waiter and are consumed; unmatched Pongs
@@ -282,17 +336,73 @@ impl DerpPongResponseRegistry {
 /// lifecycle around it.
 pub struct DerphttpPongFilter<R, W> {
     receiver: DerpClientRecvSession<R, W>,
-    pong_responses: DerpPongResponseRegistry,
+    pong_responses: Arc<DerpPongResponseRegistry>,
 }
 
 impl<R, W> DerphttpPongFilter<R, W> {
     pub fn new(receiver: DerpClientRecvSession<R, W>) -> Self {
-        Self { receiver, pong_responses: DerpPongResponseRegistry::new() }
+        Self { receiver, pong_responses: Arc::new(DerpPongResponseRegistry::new()) }
     }
 
     /// Returns the registry used by this receive filter.
     pub fn pong_responses(&self) -> &DerpPongResponseRegistry {
         &self.pong_responses
+    }
+
+    /// Creates a Ping helper sharing this receive filter's response registry.
+    ///
+    /// A separate receive loop must call `recv_next` while Ping is waiting, and the
+    /// supplied send gate must target the same DERP client. The helper accepts
+    /// deadlines only; it does not model context cancellation.
+    pub fn ping_client<S>(&self, send_gate: Arc<DerphttpSendGate<S>>) -> DerphttpPingClient<S> {
+        DerphttpPingClient { send_gate, pong_responses: Arc::clone(&self.pong_responses) }
+    }
+}
+
+/// A bounded high-level Ping sender sharing the receive filter's Pong registry.
+///
+/// `ping_until` registers an OS-random eight-byte identifier before sending, then
+/// waits until the matching Pong or the earlier of the caller deadline and the
+/// pinned five-second maximum. It does not support arbitrary cancellation, and a
+/// separate receive loop must dispatch incoming Pongs through the paired filter.
+pub struct DerphttpPingClient<W> {
+    send_gate: Arc<DerphttpSendGate<W>>,
+    pong_responses: Arc<DerpPongResponseRegistry>,
+}
+
+impl<W: Write> DerphttpPingClient<W> {
+    /// Sends one Ping and waits for its matching Pong until the capped deadline.
+    ///
+    /// This deadline-only slice does not emulate `context.Context` cancellation.
+    /// As in the pinned Go path, the connection must already be active and another
+    /// receive loop must be processing the paired Pong filter concurrently.
+    pub fn ping_until(&self, caller_deadline: Option<Instant>) -> Result<(), DerphttpPingError> {
+        let mut rng = OsRng;
+        self.ping_until_with_rng(caller_deadline, &mut rng)
+    }
+
+    fn ping_until_with_rng<R: TryRngCore>(
+        &self,
+        caller_deadline: Option<Instant>,
+        rng: &mut R,
+    ) -> Result<(), DerphttpPingError>
+    where
+        R::Error: fmt::Display,
+    {
+        let deadline = ping_deadline(Instant::now(), caller_deadline).ok_or(DerphttpPingError::DeadlineOverflow)?;
+        let mut data = [0u8; 8];
+        rng.try_fill_bytes(&mut data).map_err(|error| DerphttpPingError::Entropy(error.to_string()))?;
+
+        let waiter = self.pong_responses.register_ping(data);
+        let _registration = PingRegistrationGuard { registry: Arc::clone(&self.pong_responses), data };
+        self.send_gate.send_ping(data).map_err(DerphttpPingError::Send)?;
+
+        let acknowledged = waiter.wait_timeout(deadline.saturating_duration_since(Instant::now()));
+        if acknowledged {
+            Ok(())
+        } else {
+            Err(DerphttpPingError::DeadlineExceeded)
+        }
     }
 }
 
@@ -311,8 +421,10 @@ impl<R: RecvDeadlineReader, W: Write> DerphttpPongFilter<R, W> {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Cursor, Read, Write};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    use rand::TryRngCore;
 
     use crate::derp::{
         write_frame, DerpClientRecvSession, DerpSendWriter, FrameHeader, ReceivedMessage, RecvDeadlineReader,
@@ -320,7 +432,10 @@ mod tests {
     };
     use crate::{NodePrivate, NodePublic};
 
-    use super::{DerpClientState, DerpPongResponseRegistry, DerphttpPongFilter, DerphttpSendGate};
+    use super::{
+        ping_deadline, DerpClientState, DerpPongResponseRegistry, DerphttpPingClient, DerphttpPongFilter,
+        DerphttpSendGate, DERP_PING_MAX_WAIT,
+    };
 
     struct MemoryReader(Cursor<Vec<u8>>);
 
@@ -367,6 +482,75 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingWriter(Arc<(Mutex<Vec<u8>>, Condvar)>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let (bytes, changed) = &*self.0;
+            bytes.lock().unwrap().extend_from_slice(input);
+            changed.notify_one();
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn wait_for_wire(shared: &Arc<(Mutex<Vec<u8>>, Condvar)>, expected_len: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (bytes, changed) = &**shared;
+        let mut bytes = bytes.lock().unwrap();
+        while bytes.len() < expected_len {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "Ping frame was not fully written before test deadline");
+            let (next, result) = changed.wait_timeout(bytes, remaining).unwrap();
+            bytes = next;
+            assert!(!result.timed_out() || bytes.len() >= expected_len);
+        }
+        bytes.clone()
+    }
+
+    struct FixedPingRng([u8; 8]);
+
+    impl TryRngCore for FixedPingRng {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(u32::from_le_bytes(self.0[..4].try_into().unwrap()))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(u64::from_le_bytes(self.0))
+        }
+
+        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
+            for (index, byte) in destination.iter_mut().enumerate() {
+                *byte = self.0[index % self.0.len()];
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingPingRng;
+
+    impl TryRngCore for FailingPingRng {
+        type Error = io::Error;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err(io::Error::other("entropy unavailable"))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err(io::Error::other("entropy unavailable"))
+        }
+
+        fn try_fill_bytes(&mut self, _destination: &mut [u8]) -> Result<(), Self::Error> {
+            Err(io::Error::other("entropy unavailable"))
+        }
+    }
+
     struct FailingWriter;
 
     impl Write for FailingWriter {
@@ -381,6 +565,88 @@ mod tests {
 
     fn make_send_gate(state: DerpClientState, bytes: Arc<Mutex<Vec<u8>>>) -> DerphttpSendGate<SharedWriter> {
         DerphttpSendGate::new(Arc::new(DerpSendWriter::new(SharedWriter(bytes), None)), state)
+    }
+
+    fn make_ping_client(
+        filter: &DerphttpPongFilter<MemoryReader, Vec<u8>>,
+        state: DerpClientState,
+        writer: impl Write + 'static,
+    ) -> DerphttpPingClient<impl Write + 'static> {
+        let send_gate = Arc::new(DerphttpSendGate::new(Arc::new(DerpSendWriter::new(writer, None)), state));
+        filter.ping_client(send_gate)
+    }
+
+    #[test]
+    fn high_level_ping_waits_for_pong_received_by_the_paired_filter() {
+        let challenge = *b"fixed123";
+        let mut wire = pong_wire(challenge);
+        write_frame(&mut wire, FRAME_KEEP_ALIVE, &[]).unwrap();
+        let mut filter = make_filter(wire);
+        let output = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let ping_client = make_ping_client(&filter, DerpClientState::Connected, RecordingWriter(Arc::clone(&output)));
+
+        let ping_task = std::thread::spawn(move || {
+            let mut rng = FixedPingRng(challenge);
+            ping_client.ping_until_with_rng(None, &mut rng)
+        });
+        let bytes = wait_for_wire(&output, 13);
+        let mut expected = FrameHeader { frame_type: FRAME_PING, frame_len: 8 }.encode().to_vec();
+        expected.extend_from_slice(&challenge);
+        assert_eq!(bytes, expected);
+        assert_eq!(filter.recv_next().unwrap(), ReceivedMessage::KeepAlive);
+        assert!(ping_task.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn high_level_ping_deadline_returns_context_deadline_error_and_unregisters() {
+        let challenge = *b"fixed123";
+        let filter = make_filter(Vec::new());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let ping_client = make_ping_client(&filter, DerpClientState::Connected, SharedWriter(Arc::clone(&output)));
+        let mut rng = FixedPingRng(challenge);
+
+        let error = ping_client.ping_until_with_rng(Some(Instant::now()), &mut rng).unwrap_err();
+        assert_eq!(error.to_string(), "context deadline exceeded");
+        assert!(!filter.pong_responses().handle_pong(challenge));
+        let mut expected = FrameHeader { frame_type: FRAME_PING, frame_len: 8 }.encode().to_vec();
+        expected.extend_from_slice(&challenge);
+        assert_eq!(*output.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn high_level_ping_entropy_failure_is_closed_before_registration_or_write() {
+        let filter = make_filter(Vec::new());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let ping_client = make_ping_client(&filter, DerpClientState::Connected, SharedWriter(Arc::clone(&output)));
+
+        let error = ping_client.ping_until_with_rng(None, &mut FailingPingRng).unwrap_err();
+        assert_eq!(error.to_string(), "DERP Ping randomness unavailable: entropy unavailable");
+        assert!(output.lock().unwrap().is_empty());
+        assert!(!filter.pong_responses().handle_pong([0; 8]));
+    }
+
+    #[test]
+    fn high_level_ping_send_error_is_preserved_and_registration_removed() {
+        let challenge = *b"fixed123";
+        let filter = make_filter(Vec::new());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let ping_client = make_ping_client(&filter, DerpClientState::Disconnected, SharedWriter(Arc::clone(&output)));
+        let mut rng = FixedPingRng(challenge);
+
+        let error = ping_client.ping_until_with_rng(None, &mut rng).unwrap_err();
+        assert_eq!(error.to_string(), "client not connected");
+        assert!(output.lock().unwrap().is_empty());
+        assert!(!filter.pong_responses().handle_pong(challenge));
+    }
+
+    #[test]
+    fn high_level_ping_deadline_is_capped_at_five_seconds_and_respects_earlier_deadline() {
+        let start = Instant::now();
+        let maximum = start + DERP_PING_MAX_WAIT;
+        assert_eq!(ping_deadline(start, None), Some(maximum));
+        assert_eq!(ping_deadline(start, Some(maximum + Duration::from_secs(1))), Some(maximum));
+        let earlier = start + Duration::from_secs(3);
+        assert_eq!(ping_deadline(start, Some(earlier)), Some(earlier));
     }
 
     #[test]

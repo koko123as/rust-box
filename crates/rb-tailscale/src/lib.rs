@@ -20,9 +20,10 @@
 //! disconnected, and closed states without implicit reconnect; it does not own or
 //! close the transport, and callers must synchronize its state with their lifecycle.
 //! A separate `derphttp` slice implements the lower-level SendPing/SendPong state
-//! gates and consumes only registered matching Pong responses from an already-created
-//! receive session; it does not implement connection setup, generation tracking, or
-//! reconnect handling.
+//! gates, a high-level Ping wait with a five-second maximum deadline, and registered
+//! matching Pong dispatch from an already-created receive session; arbitrary context
+//! cancellation, connection setup, generation tracking, and reconnect handling are
+//! not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
 //! endpoint compatibility or Go scheduler parity. The shared writer's ForwardPacket
 //! path now requires a connection-close handle and arms the pinned five-second
