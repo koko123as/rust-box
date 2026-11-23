@@ -79,9 +79,73 @@ pub fn read_frame_type_header(input: &mut &[u8], want: FrameType) -> Result<u32,
     Ok(header.frame_len)
 }
 
+/// The result of the pinned fork's bounded frame read on a byte slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadFrameError {
+    /// The complete header was unavailable; no input was consumed.
+    IncompleteHeader,
+    /// The header was consumed but no payload bytes were consumed.
+    ExceedsLimit { frame_len: u32, max_size: u32 },
+    /// A payload read started with no available bytes, or a discard ended early.
+    EndOfInput,
+    /// A payload read received some, but not all, required bytes.
+    UnexpectedEndOfInput,
+    /// The whole payload was consumed, but only the output prefix was copied.
+    ShortBuffer { header: FrameHeader },
+}
+
+impl fmt::Display for ReadFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::IncompleteHeader | Self::EndOfInput => f.write_str("EOF"),
+            Self::UnexpectedEndOfInput => f.write_str("unexpected EOF"),
+            Self::ExceedsLimit { frame_len, max_size } => {
+                write!(f, "frame header size {frame_len} exceeds reader limit of {max_size}")
+            }
+            Self::ShortBuffer { .. } => f.write_str("short buffer"),
+        }
+    }
+}
+
+impl Error for ReadFrameError {}
+
+/// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
+/// when the output is shorter than the advertised frame, matching Go `readFrame`.
+///
+/// Missing bytes are treated as end-of-input; this slice interface cannot model
+/// arbitrary I/O errors or wait for more data. An over-limit error consumes only
+/// the header; callers must not continue parsing that payload as a fresh frame.
+pub fn read_frame(input: &mut &[u8], max_size: u32, output: &mut [u8]) -> Result<FrameHeader, ReadFrameError> {
+    let header = read_frame_header(input).map_err(|_| ReadFrameError::IncompleteHeader)?;
+    if header.frame_len > max_size {
+        return Err(ReadFrameError::ExceedsLimit { frame_len: header.frame_len, max_size });
+    }
+
+    let frame_len = header.frame_len as usize;
+    let copy_len = frame_len.min(output.len());
+    let available = copy_len.min(input.len());
+    output[..available].copy_from_slice(&input[..available]);
+    *input = &input[available..];
+    if available < copy_len {
+        return Err(if available == 0 { ReadFrameError::EndOfInput } else { ReadFrameError::UnexpectedEndOfInput });
+    }
+    let discard = frame_len - copy_len;
+    if input.len() < discard {
+        *input = &[];
+        return Err(ReadFrameError::EndOfInput);
+    }
+    *input = &input[discard..];
+    if discard != 0 {
+        return Err(ReadFrameError::ShortBuffer { header });
+    }
+    Ok(header)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{read_frame_header, read_frame_type_header, FrameHeader, FrameHeaderError, FrameType};
+    use super::{
+        read_frame, read_frame_header, read_frame_type_header, FrameHeader, FrameHeaderError, FrameType, ReadFrameError,
+    };
 
     #[test]
     fn header_bytes_match_pinned_go_source_oracle() {
@@ -128,5 +192,78 @@ mod tests {
         );
         assert_eq!(err.to_string(), "bad frame type 0x12, want 0x13");
         assert_eq!(input, &[0xaa]);
+    }
+
+    #[test]
+    fn bounded_read_matches_pinned_go_source_oracle() {
+        let header3 = FrameHeader { frame_type: FrameType(0x12), frame_len: 3 };
+        let header0 = FrameHeader { frame_type: FrameType(0x12), frame_len: 0 };
+        type Case<'a> = (&'a str, &'a [u8], u32, usize, Result<FrameHeader, ReadFrameError>, &'a [u8], &'a [u8]);
+        let cases: &[Case<'_>] = &[
+            (
+                "short_header",
+                &[0x12, 0, 0, 0],
+                4,
+                4,
+                Err(ReadFrameError::IncompleteHeader),
+                &[0xee; 4],
+                &[0x12, 0, 0, 0],
+            ),
+            ("empty", &[0x12, 0, 0, 0, 0, 0xaa], 0, 0, Ok(header0), &[], &[0xaa]),
+            ("full", &[0x12, 0, 0, 0, 3, 1, 2, 3, 0xaa], 3, 3, Ok(header3), &[1, 2, 3], &[0xaa]),
+            (
+                "short_buffer",
+                &[0x12, 0, 0, 0, 3, 1, 2, 3, 0xaa],
+                3,
+                1,
+                Err(ReadFrameError::ShortBuffer { header: header3 }),
+                &[1],
+                &[0xaa],
+            ),
+            (
+                "zero_buffer",
+                &[0x12, 0, 0, 0, 3, 1, 2, 3, 0xaa],
+                3,
+                0,
+                Err(ReadFrameError::ShortBuffer { header: header3 }),
+                &[],
+                &[0xaa],
+            ),
+            (
+                "too_large",
+                &[0x12, 0, 0, 0, 3, 1, 2, 3, 0xaa],
+                2,
+                3,
+                Err(ReadFrameError::ExceedsLimit { frame_len: 3, max_size: 2 }),
+                &[0xee; 3],
+                &[1, 2, 3, 0xaa],
+            ),
+            ("body_empty", &[0x12, 0, 0, 0, 3], 3, 3, Err(ReadFrameError::EndOfInput), &[0xee; 3], &[]),
+            (
+                "body_partial",
+                &[0x12, 0, 0, 0, 3, 1, 2],
+                3,
+                3,
+                Err(ReadFrameError::UnexpectedEndOfInput),
+                &[1, 2, 0xee],
+                &[],
+            ),
+            ("discard_empty", &[0x12, 0, 0, 0, 3, 1], 3, 1, Err(ReadFrameError::EndOfInput), &[1], &[]),
+            ("discard_partial", &[0x12, 0, 0, 0, 3, 1, 2], 3, 1, Err(ReadFrameError::EndOfInput), &[1], &[]),
+        ];
+        for &(name, data, max, output_len, expected, expected_output, expected_remaining) in cases {
+            let mut input = data;
+            let mut output = vec![0xee; output_len];
+            assert_eq!(read_frame(&mut input, max, &mut output), expected, "{name}");
+            assert_eq!(output, expected_output, "{name} output");
+            assert_eq!(input, expected_remaining, "{name} remaining input");
+        }
+        assert_eq!(
+            ReadFrameError::ExceedsLimit { frame_len: 3, max_size: 2 }.to_string(),
+            "frame header size 3 exceeds reader limit of 2"
+        );
+        assert_eq!(ReadFrameError::EndOfInput.to_string(), "EOF");
+        assert_eq!(ReadFrameError::UnexpectedEndOfInput.to_string(), "unexpected EOF");
+        assert_eq!(ReadFrameError::ShortBuffer { header: header3 }.to_string(), "short buffer");
     }
 }
