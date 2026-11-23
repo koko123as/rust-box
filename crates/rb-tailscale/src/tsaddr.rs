@@ -172,6 +172,48 @@ impl fmt::Display for MapViaError {
 
 impl Error for MapViaError {}
 
+pub const TAILSCALE_SERVICE_IP_STRING: &str = "100.100.100.100";
+pub const TAILSCALE_SERVICE_IPV6_STRING: &str = "fd7a:115c:a1e0::53";
+
+/// Returns the ChromeOS host/container VM range excluded from Tailscale allocation.
+pub fn chromeos_vm_range() -> IpPrefix {
+    IpPrefix::new(IpAddr::V4(Ipv4Addr::new(100, 115, 92, 0)), 23)
+}
+
+/// Returns the IPv4 CGNAT range from which Tailscale allocates addresses.
+pub fn cgnat_range() -> IpPrefix {
+    IpPrefix::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10)
+}
+
+/// Returns the Tailscale IPv6 unique-local address supernet.
+pub fn tailscale_ula_range() -> IpPrefix {
+    IpPrefix::new(IpAddr::V6(Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0)), 48)
+}
+
+/// Returns the IPv6 `/64` reserved for IPv4-via-IPv6 Tailscale routes.
+pub fn tailscale_via_range() -> IpPrefix {
+    let mut address = [0; 16];
+    address[..8].copy_from_slice(&TAILSCALE_VIA_PREFIX);
+    IpPrefix::new(IpAddr::V6(Ipv6Addr::from(address)), 64)
+}
+
+/// Returns the IPv6 `/104` used for automatic Tailscale IPv4-to-IPv6 mapping.
+pub fn tailscale4_to6_range() -> IpPrefix {
+    IpPrefix::new(IpAddr::V6(tailscale4_to6_placeholder()), 104)
+}
+
+/// Returns the IPv6 `/64` used for ephemeral IPv6-only Tailscale nodes.
+pub fn tailscale_ephemeral6_range() -> IpPrefix {
+    IpPrefix::new(IpAddr::V6(Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0xefe3, 0, 0, 0, 0)), 64)
+}
+
+/// Returns the first address in the Tailscale IPv4-to-IPv6 mapping range.
+pub fn tailscale4_to6_placeholder() -> Ipv6Addr {
+    let mut address = [0; 16];
+    address[..13].copy_from_slice(&TAILSCALE_4TO6_PREFIX);
+    Ipv6Addr::from(address)
+}
+
 /// Returns the IPv4 Tailscale service address (`100.100.100.100`).
 pub const fn tailscale_service_ip() -> Ipv4Addr {
     Ipv4Addr::new(100, 100, 100, 100)
@@ -371,6 +413,15 @@ mod tests {
     fn service_addresses_and_via_range_match_pinned_go_oracle() {
         assert_eq!(super::tailscale_service_ip().to_string(), "100.100.100.100");
         assert_eq!(super::tailscale_service_ipv6().to_string(), "fd7a:115c:a1e0::53");
+        assert_eq!(super::TAILSCALE_SERVICE_IP_STRING, "100.100.100.100");
+        assert_eq!(super::TAILSCALE_SERVICE_IPV6_STRING, "fd7a:115c:a1e0::53");
+        assert_eq!(super::cgnat_range(), prefix("100.64.0.0/10"));
+        assert_eq!(super::chromeos_vm_range(), prefix("100.115.92.0/23"));
+        assert_eq!(super::tailscale_ula_range(), prefix("fd7a:115c:a1e0::/48"));
+        assert_eq!(super::tailscale_via_range(), prefix("fd7a:115c:a1e0:b1a::/64"));
+        assert_eq!(super::tailscale4_to6_range(), prefix("fd7a:115c:a1e0:ab12:4843:cd96:6200::/104"));
+        assert_eq!(super::tailscale_ephemeral6_range(), prefix("fd7a:115c:a1e0:efe3::/64"));
+        assert_eq!(super::tailscale4_to6_placeholder().to_string(), "fd7a:115c:a1e0:ab12:4843:cd96:6200:0");
 
         for (address, expected_is_via, expected_unmapped) in [
             ("fd7a:115c:a1e0:b19:ffff:ffff:ffff:ffff", false, "fd7a:115c:a1e0:b19:ffff:ffff:ffff:ffff"),
