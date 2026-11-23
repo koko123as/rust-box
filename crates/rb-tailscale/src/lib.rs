@@ -26,9 +26,11 @@
 //! Its region-derived DERP URL formatter and raw TLS ServerName selector cover the
 //! pinned scheme/default-port, host/port, and node-hostname branches with fail-closed
 //! input validation. Pure `useHTTPS` selection and the explicit-URL `urlPort` fallback
-//! operate only on already-parsed scheme/port and debug inputs; explicit-URL parsing,
-//! TLS handshakes, network dialing, socket setup, reconnect retry handling, and Go
-//! scheduler parity are not implemented.
+//! operate only on already-parsed scheme/port and debug inputs. A separate pure
+//! region dial-port selector models the 443/3340 fallback and nonzero DERPPort
+//! override, rejecting values outside the TCP port range; it does not open sockets.
+//! Explicit-URL parsing, TLS handshakes, network dialing, socket setup, reconnect
+//! retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
 //! endpoint compatibility or Go scheduler parity. The shared writer's ForwardPacket
 //! path now requires a connection-close handle and arms the pinned five-second

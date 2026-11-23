@@ -398,6 +398,25 @@ pub fn derp_use_https(explicit_url_scheme: Option<&str>, debug_use_derp_http: bo
     explicit_url_scheme != Some("http") && !debug_use_derp_http
 }
 
+/// Chooses the pinned region `dialNode` port string without opening a socket.
+///
+/// A nonzero DERP port overrides the HTTPS (443) or debug-HTTP (3340) default.
+/// Values outside the TCP port range fail closed rather than reaching `net.Dial`.
+pub fn derp_region_dial_port(derp_port: isize, use_https: bool) -> Result<String, DerpRegionUrlError> {
+    let port = if derp_port == 0 {
+        if use_https {
+            443
+        } else {
+            3340
+        }
+    } else if (1..=u16::MAX as isize).contains(&derp_port) {
+        derp_port as u16
+    } else {
+        return Err(DerpRegionUrlError::PortOutOfRange);
+    };
+    Ok(port.to_string())
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -781,10 +800,10 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_region_tls_server_name, derp_region_url_string, derp_url_port_from_parsed_parts, derp_use_https,
-        ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError,
-        DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient,
-        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_region_dial_port, derp_region_tls_server_name, derp_region_url_string, derp_url_port_from_parsed_parts,
+        derp_use_https, ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry,
+        DerpRegionUrlError, DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError,
+        DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -948,6 +967,17 @@ mod tests {
         assert!(!derp_use_https(None, true));
         assert!(!derp_use_https(Some("https"), true));
         assert!(!derp_use_https(Some("http"), true));
+    }
+
+    #[test]
+    fn region_dial_port_matches_fixed_default_and_nonzero_override_order() {
+        assert_eq!(derp_region_dial_port(0, true).unwrap(), "443");
+        assert_eq!(derp_region_dial_port(0, false).unwrap(), "3340");
+        assert_eq!(derp_region_dial_port(8443, true).unwrap(), "8443");
+        assert_eq!(derp_region_dial_port(8443, false).unwrap(), "8443");
+        assert_eq!(derp_region_dial_port(u16::MAX as isize, true).unwrap(), "65535");
+        assert_eq!(derp_region_dial_port(-1, true), Err(DerpRegionUrlError::PortOutOfRange));
+        assert_eq!(derp_region_dial_port(u16::MAX as isize + 1, true), Err(DerpRegionUrlError::PortOutOfRange));
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
