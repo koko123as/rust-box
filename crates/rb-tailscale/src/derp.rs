@@ -7,10 +7,16 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::NodePublic;
+
 /// A DERP frame header contains a type byte and a big-endian u32 payload length.
 pub const FRAME_HEADER_LEN: usize = 5;
 /// Maximum payload length accepted by the pinned fork's `WriteFrame`.
 pub const MAX_FRAME_WRITE_SIZE: usize = 10 << 20;
+/// Magic prefix of a DERP server-key greeting.
+pub const MAGIC: [u8; 8] = *b"DERP\xf0\x9f\x94\x91";
+/// The server-key frame type.
+pub const FRAME_SERVER_KEY: FrameType = FrameType(0x01);
 
 /// A raw DERP frame type. Unknown values are preserved, as in Go's `FrameType`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,11 +185,49 @@ pub fn read_frame(input: &mut &[u8], max_size: u32, output: &mut [u8]) -> Result
     Ok(header)
 }
 
+/// Failure to parse a DERP server-key greeting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerGreetingError {
+    Read(ReadFrameError),
+    Invalid,
+}
+
+impl fmt::Display for ServerGreetingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(err) => err.fmt(f),
+            Self::Invalid => f.write_str("invalid server greeting"),
+        }
+    }
+}
+
+impl Error for ServerGreetingError {}
+
+/// Parses the server-key greeting using the fork's 1024-byte frame limit.
+/// Extra payload bytes are consumed and ignored, as in `recvServerKey`.
+///
+/// This parser accepts a zero public key like the fork's parser. It does not
+/// authenticate the server, establish encryption, or authorize a connection.
+pub fn read_server_greeting(input: &mut &[u8]) -> Result<NodePublic, ServerGreetingError> {
+    let mut body = [0u8; 40];
+    let header = match read_frame(input, 1 << 10, &mut body) {
+        Ok(header) | Err(ReadFrameError::ShortBuffer { header }) => header,
+        Err(err) => return Err(ServerGreetingError::Read(err)),
+    };
+    if header.frame_len < body.len() as u32 || header.frame_type != FRAME_SERVER_KEY || body[..MAGIC.len()] != MAGIC {
+        return Err(ServerGreetingError::Invalid);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&body[MAGIC.len()..]);
+    Ok(NodePublic::from_raw32(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, read_frame_header, read_frame_type_header, write_frame, FrameHeader, FrameHeaderError, FrameType,
-        ReadFrameError, WriteFrameError, MAX_FRAME_WRITE_SIZE,
+        read_frame, read_frame_header, read_frame_type_header, read_server_greeting, write_frame, FrameHeader,
+        FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, WriteFrameError, FRAME_SERVER_KEY, MAGIC,
+        MAX_FRAME_WRITE_SIZE,
     };
 
     #[test]
@@ -322,5 +366,61 @@ mod tests {
         assert_eq!(ReadFrameError::EndOfInput.to_string(), "EOF");
         assert_eq!(ReadFrameError::UnexpectedEndOfInput.to_string(), "unexpected EOF");
         assert_eq!(ReadFrameError::ShortBuffer { header: header3 }.to_string(), "short buffer");
+    }
+
+    #[test]
+    fn server_greeting_matches_source_derived_go_oracle() {
+        for len in [40usize, 41, 1024] {
+            let mut body = vec![0x5a; len];
+            body[..8].copy_from_slice(&MAGIC);
+            let mut wire = Vec::new();
+            write_frame(&mut wire, FRAME_SERVER_KEY, &body).unwrap();
+            wire.push(0xaa);
+            let mut input = wire.as_slice();
+            assert_eq!(read_server_greeting(&mut input).unwrap().raw_bytes(), [0x5a; 32]);
+            assert_eq!(input, &[0xaa]);
+        }
+
+        let mut body = [0x5a; 40];
+        body[..8].copy_from_slice(&MAGIC);
+        for (kind, payload) in [(FrameType(0x12), body.as_slice()), (FRAME_SERVER_KEY, &body[..39])] {
+            let mut wire = Vec::new();
+            write_frame(&mut wire, kind, payload).unwrap();
+            wire.push(0xaa);
+            let mut input = wire.as_slice();
+            assert_eq!(read_server_greeting(&mut input), Err(ServerGreetingError::Invalid));
+            assert_eq!(input, &[0xaa]);
+        }
+        body[0] ^= 1;
+        let mut wire = Vec::new();
+        write_frame(&mut wire, FRAME_SERVER_KEY, &body).unwrap();
+        let mut input = wire.as_slice();
+        assert_eq!(read_server_greeting(&mut input).unwrap_err().to_string(), "invalid server greeting");
+
+        body[..8].copy_from_slice(&MAGIC);
+        body[8..].fill(0);
+        wire.clear();
+        write_frame(&mut wire, FRAME_SERVER_KEY, &body).unwrap();
+        let mut input = wire.as_slice();
+        assert!(read_server_greeting(&mut input).unwrap().is_zero());
+
+        wire = FrameHeader { frame_type: FRAME_SERVER_KEY, frame_len: 1025 }.encode().to_vec();
+        wire.extend_from_slice(&[0x5a; 1025]);
+        wire.push(0xaa);
+        let mut input = wire.as_slice();
+        assert_eq!(
+            read_server_greeting(&mut input),
+            Err(ServerGreetingError::Read(ReadFrameError::ExceedsLimit { frame_len: 1025, max_size: 1024 }))
+        );
+        assert_eq!(input.len(), 1026);
+
+        wire = FrameHeader { frame_type: FRAME_SERVER_KEY, frame_len: 40 }.encode().to_vec();
+        wire.extend_from_slice(&body[..39]);
+        let mut input = wire.as_slice();
+        assert_eq!(
+            read_server_greeting(&mut input),
+            Err(ServerGreetingError::Read(ReadFrameError::UnexpectedEndOfInput))
+        );
+        assert!(input.is_empty());
     }
 }
