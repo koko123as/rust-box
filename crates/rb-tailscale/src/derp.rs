@@ -2,10 +2,11 @@
 //!
 //! This module provides header codecs, bounded frame slice and blocking-stream
 //! reads/writes, a server-greeting parser, ClientInfo JSON encoding and in-memory
-//! encrypted frame construction, an in-memory client key-exchange state machine,
-//! and bounded in-memory ServerInfo frame/payload parsing. Node-key box primitives
-//! live in `disco_crypto`; a complete streaming DERP client/server, transport
-//! lifecycle, and server authentication remain unimplemented.
+//! encrypted frame construction, a client key-exchange state machine with a
+//! blocking-stream greeting and ClientInfo write path, and bounded in-memory
+//! ServerInfo frame/payload parsing. Node-key box primitives live in
+//! `disco_crypto`; ongoing DERP message processing, complete connection lifecycle,
+//! and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
@@ -507,6 +508,37 @@ impl Error for DerpClientHandshakeError {
     }
 }
 
+/// Errors from the blocking DERP client key exchange over a stream.
+#[derive(Debug)]
+pub enum DerpClientStreamHandshakeError {
+    Handshake(DerpClientHandshakeError),
+    ServerGreetingRead(StreamReadFrameError),
+    InvalidServerGreeting,
+    StreamWrite(StreamWriteFrameError),
+}
+
+impl fmt::Display for DerpClientStreamHandshakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Handshake(error) => error.fmt(f),
+            Self::ServerGreetingRead(error) => error.fmt(f),
+            Self::InvalidServerGreeting => f.write_str("invalid server greeting"),
+            Self::StreamWrite(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for DerpClientStreamHandshakeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Handshake(error) => Some(error),
+            Self::ServerGreetingRead(error) => Some(error),
+            Self::StreamWrite(error) => Some(error),
+            Self::InvalidServerGreeting => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DerpClientHandshakePhase {
     AwaitingServerKey,
@@ -524,8 +556,9 @@ enum DerpClientHandshakePhase {
 /// [`PROTOCOL_VERSION`], as the Go client does rather than exposing it as an
 /// option. After obtaining the ClientInfo frame, callers must fully write and
 /// flush it before calling [`Self::client_info_sent`]. Drop this value if that
-/// transport operation fails. This state machine does not authenticate the
-/// server, create a socket, perform streaming reads/writes, or receive messages.
+/// transport operation fails. The stream helpers below perform only this initial
+/// key exchange; they do not authenticate the server, create a socket, receive
+/// messages, or manage the ongoing connection lifecycle.
 pub struct DerpClientHandshake {
     private_key: NodePrivate,
     client_info: ClientInfo,
@@ -619,6 +652,67 @@ impl DerpClientHandshake {
         };
         self.phase = DerpClientHandshakePhase::Ready(server_key);
         Ok(())
+    }
+
+    /// Reads a server greeting from a blocking stream when the server key is not
+    /// already configured.
+    pub fn receive_server_greeting_from<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<(), DerpClientStreamHandshakeError> {
+        if !matches!(self.phase, DerpClientHandshakePhase::AwaitingServerKey) {
+            return Err(DerpClientStreamHandshakeError::Handshake(DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::AwaitingServerKey,
+                actual: self.state(),
+            }));
+        }
+        let mut body = [0; 40];
+        let header = match read_frame_from(reader, 1 << 10, &mut body) {
+            Ok(header) | Err(StreamReadFrameError::ShortBuffer { header }) => header,
+            Err(error) => return Err(DerpClientStreamHandshakeError::ServerGreetingRead(error)),
+        };
+        if header.frame_len < body.len() as u32 || header.frame_type != FRAME_SERVER_KEY || body[..MAGIC.len()] != MAGIC
+        {
+            return Err(DerpClientStreamHandshakeError::InvalidServerGreeting);
+        }
+        let mut key = [0; 32];
+        key.copy_from_slice(&body[MAGIC.len()..]);
+        let server_key = NodePublic::from_raw32(key);
+        if server_key.is_zero() {
+            return Err(DerpClientStreamHandshakeError::Handshake(DerpClientHandshakeError::ZeroServerPublicKey));
+        }
+        self.phase = DerpClientHandshakePhase::ReadyToSendClientInfo(server_key);
+        Ok(())
+    }
+
+    /// Writes and flushes the encrypted ClientInfo frame to a blocking stream.
+    ///
+    /// If writing or flushing fails, the stage remains pending and this
+    /// handshake must be dropped rather than retried on a possibly partial
+    /// stream.
+    pub fn send_client_info_to<W: Write>(&mut self, writer: &mut W) -> Result<(), DerpClientStreamHandshakeError> {
+        let frame = self.build_client_info_frame().map_err(DerpClientStreamHandshakeError::Handshake)?;
+        writer
+            .write_all(&frame)
+            .map_err(|error| DerpClientStreamHandshakeError::StreamWrite(StreamWriteFrameError::Io(error)))?;
+        writer
+            .flush()
+            .map_err(|error| DerpClientStreamHandshakeError::StreamWrite(StreamWriteFrameError::Io(error)))?;
+        self.client_info_sent().map_err(DerpClientStreamHandshakeError::Handshake)
+    }
+
+    /// Performs the initial pinned-fork DERP key exchange on one blocking
+    /// read/write stream: optionally reads ServerKey, then writes and flushes
+    /// ClientInfo. It returns at the point `derp.NewClient` would return, without
+    /// receiving ServerInfo or starting packet/message processing.
+    pub fn perform_key_exchange<RW: Read + Write>(
+        &mut self,
+        stream: &mut RW,
+    ) -> Result<(), DerpClientStreamHandshakeError> {
+        if matches!(self.phase, DerpClientHandshakePhase::AwaitingServerKey) {
+            self.receive_server_greeting_from(stream)?;
+        }
+        self.send_client_info_to(stream)
     }
 }
 
@@ -928,9 +1022,10 @@ mod tests {
     use super::{
         build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_from, read_frame_header,
         read_frame_type_header, read_server_greeting, write_frame, write_frame_to, ClientInfo, ClientInfoFrameError,
-        DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState, FrameHeader, FrameHeaderError,
-        FrameType, ReadFrameError, ServerGreetingError, StreamReadFrameError, StreamWriteFrameError, WriteFrameError,
-        FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
+        DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState, DerpClientStreamHandshakeError,
+        FrameHeader, FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, StreamReadFrameError,
+        StreamWriteFrameError, WriteFrameError, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE,
+        PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
     use std::io::{self, Read, Write};
@@ -970,6 +1065,43 @@ mod tests {
         fn write(&mut self, input: &[u8]) -> io::Result<usize> {
             let count = input.len().min(self.max_chunk);
             self.bytes.extend_from_slice(&input[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct ChunkedDuplex {
+        incoming: Vec<u8>,
+        read_position: usize,
+        written: Vec<u8>,
+        max_read: usize,
+        max_write: usize,
+        flushes: usize,
+    }
+
+    impl ChunkedDuplex {
+        fn new(incoming: Vec<u8>, max_read: usize, max_write: usize) -> Self {
+            Self { incoming, read_position: 0, written: Vec::new(), max_read, max_write, flushes: 0 }
+        }
+    }
+
+    impl Read for ChunkedDuplex {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let count = output.len().min(self.max_read).min(self.incoming.len() - self.read_position);
+            output[..count].copy_from_slice(&self.incoming[self.read_position..self.read_position + count]);
+            self.read_position += count;
+            Ok(count)
+        }
+    }
+
+    impl Write for ChunkedDuplex {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let count = input.len().min(self.max_write);
+            self.written.extend_from_slice(&input[..count]);
             Ok(count)
         }
 
@@ -1634,5 +1766,63 @@ mod tests {
         ));
         assert!(untouched.bytes.is_empty());
         assert_eq!(untouched.flushes, 0);
+    }
+
+    #[test]
+    fn blocking_client_key_exchange_reads_greeting_then_writes_and_flushes_client_info() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let mut greeting_body = vec![0; 45];
+        greeting_body[..MAGIC.len()].copy_from_slice(&MAGIC);
+        greeting_body[MAGIC.len()..MAGIC.len() + 32].copy_from_slice(&bob_public.raw_bytes());
+        greeting_body[40..].fill(0xa5);
+        let mut greeting = Vec::new();
+        write_frame(&mut greeting, FRAME_SERVER_KEY, &greeting_body).unwrap();
+
+        let mut stream = ChunkedDuplex::new(greeting.clone(), 3, 2);
+        let mut client = DerpClientHandshake::new(
+            alice.clone(),
+            None,
+            ClientInfo { version: 99, can_ack_pings: true, ..ClientInfo::default() },
+        )
+        .unwrap();
+        client.perform_key_exchange(&mut stream).unwrap();
+        assert_eq!(client.state(), DerpClientHandshakeState::Ready);
+        assert_eq!(client.server_public_key(), Some(bob_public));
+        assert_eq!(stream.read_position, greeting.len());
+        assert_eq!(stream.flushes, 1);
+
+        let mut remaining = stream.written.as_slice();
+        let mut payload = vec![0; stream.written.len() - super::FRAME_HEADER_LEN];
+        let header = read_frame(&mut remaining, MAX_FRAME_WRITE_SIZE as u32, &mut payload).unwrap();
+        assert_eq!(header.frame_type, FRAME_CLIENT_INFO);
+        assert!(remaining.is_empty());
+        let alice_public = alice.public().unwrap();
+        assert_eq!(bob.open_from(&alice_public, &payload[32..]).unwrap(), br#"{"version":2,"CanAckPings":true}"#);
+
+        let mut known_key_stream = ChunkedDuplex::new(Vec::new(), 2, 3);
+        let mut known_key_client = DerpClientHandshake::new(
+            alice.clone(),
+            Some(bob_public),
+            ClientInfo { can_ack_pings: true, ..ClientInfo::default() },
+        )
+        .unwrap();
+        known_key_client.perform_key_exchange(&mut known_key_stream).unwrap();
+        assert_eq!(known_key_stream.read_position, 0);
+        assert_eq!(known_key_stream.flushes, 1);
+        assert_eq!(known_key_client.state(), DerpClientHandshakeState::Ready);
+
+        let mut truncated_stream = ChunkedDuplex::new(greeting[..3].to_vec(), 2, 2);
+        let mut truncated_client = DerpClientHandshake::new(alice, None, ClientInfo::default()).unwrap();
+        assert!(matches!(
+            truncated_client.perform_key_exchange(&mut truncated_stream),
+            Err(DerpClientStreamHandshakeError::ServerGreetingRead(StreamReadFrameError::UnexpectedEndOfInput))
+        ));
+        assert_eq!(truncated_client.state(), DerpClientHandshakeState::AwaitingServerKey);
+        assert!(truncated_stream.written.is_empty());
+        assert_eq!(truncated_stream.flushes, 0);
     }
 }
