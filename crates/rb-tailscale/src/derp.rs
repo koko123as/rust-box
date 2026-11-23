@@ -2,7 +2,7 @@
 //!
 //! This module provides header codecs, bounded frame slice reads/writes, a
 //! server-greeting parser, ClientInfo JSON encoding and in-memory encrypted frame
-//! construction, and bounded ServerInfo payload decryption/JSON parsing. Node-key
+//! construction, and bounded in-memory ServerInfo frame/payload parsing. Node-key
 //! box primitives live in `disco_crypto`; a streaming DERP client/server,
 //! transport lifecycle, and server authentication remain unimplemented.
 
@@ -18,12 +18,16 @@ use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
 pub const FRAME_HEADER_LEN: usize = 5;
 /// Maximum payload length accepted by the pinned fork's `WriteFrame`.
 pub const MAX_FRAME_WRITE_SIZE: usize = 10 << 20;
+/// Maximum single frame payload accepted by the pinned fork's `Client.Recv`.
+pub const MAX_CLIENT_RECV_FRAME_LEN: usize = 1 << 20;
 /// Magic prefix of a DERP server-key greeting.
 pub const MAGIC: [u8; 8] = *b"DERP\xf0\x9f\x94\x91";
 /// The server-key frame type.
 pub const FRAME_SERVER_KEY: FrameType = FrameType(0x01);
 /// The client-info frame type.
 pub const FRAME_CLIENT_INFO: FrameType = FrameType(0x02);
+/// The server-info frame type.
+pub const FRAME_SERVER_INFO: FrameType = FrameType(0x03);
 /// DERP protocol version advertised by the pinned fork.
 pub const PROTOCOL_VERSION: isize = 2;
 
@@ -471,6 +475,77 @@ pub fn parse_server_info_payload(
     serde_json::from_slice(&plaintext).map_err(ServerInfoError::Json)
 }
 
+/// Failures while decoding one complete in-memory ServerInfo DERP frame.
+#[derive(Debug)]
+pub enum ServerInfoFrameError {
+    IncompleteHeader,
+    Oversized { frame_len: u32, max_size: usize },
+    IncompletePayload { expected: usize, got: usize },
+    UnexpectedType { got: FrameType },
+    Payload(ServerInfoError),
+}
+
+impl fmt::Display for ServerInfoFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteHeader => f.write_str("EOF"),
+            Self::Oversized { frame_len, .. } => write!(f, "unexpectedly large frame of {frame_len} bytes returned"),
+            Self::IncompletePayload { got: 0, .. } => f.write_str("EOF"),
+            Self::IncompletePayload { .. } => f.write_str("unexpected EOF"),
+            Self::UnexpectedType { got } => {
+                write!(f, "bad frame type 0x{:X}, want 0x{:X}", got.0, FRAME_SERVER_INFO.0)
+            }
+            Self::Payload(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for ServerInfoFrameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Payload(error) => Some(error),
+            Self::IncompleteHeader
+            | Self::Oversized { .. }
+            | Self::IncompletePayload { .. }
+            | Self::UnexpectedType { .. } => None,
+        }
+    }
+}
+
+/// Parses one complete ServerInfo frame from an in-memory byte slice.
+///
+/// The returned `usize` is the number of bytes consumed, so a following frame
+/// can remain in the same input. This applies the pinned fork's `Client.Recv`
+/// 1 MiB frame limit before payload processing and then delegates to
+/// [`parse_server_info_payload`]. Unlike `Client.Recv`, this strict helper
+/// returns an error for a non-ServerInfo frame instead of skipping it, and it
+/// does not implement stream I/O, buffering, connection state, or flushing.
+pub fn parse_server_info_frame(
+    client_private: &NodePrivate,
+    server_public: &NodePublic,
+    frame: &[u8],
+) -> Result<(ServerInfo, usize), ServerInfoFrameError> {
+    let mut after_header = frame;
+    let header = read_frame_header(&mut after_header).map_err(|_| ServerInfoFrameError::IncompleteHeader)?;
+    if header.frame_len > MAX_CLIENT_RECV_FRAME_LEN as u32 {
+        return Err(ServerInfoFrameError::Oversized {
+            frame_len: header.frame_len,
+            max_size: MAX_CLIENT_RECV_FRAME_LEN,
+        });
+    }
+    let payload_len = header.frame_len as usize;
+    let available = after_header.len().min(payload_len);
+    if available < payload_len {
+        return Err(ServerInfoFrameError::IncompletePayload { expected: payload_len, got: available });
+    }
+    if header.frame_type != FRAME_SERVER_INFO {
+        return Err(ServerInfoFrameError::UnexpectedType { got: header.frame_type });
+    }
+    let info = parse_server_info_payload(client_private, server_public, &after_header[..payload_len])
+        .map_err(ServerInfoFrameError::Payload)?;
+    Ok((info, FRAME_HEADER_LEN + payload_len))
+}
+
 fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
     if !*first {
         output.push(',');
@@ -624,6 +699,75 @@ mod tests {
         assert!(matches!(
             super::parse_server_info_payload(&alice, &NodePublic::from_raw32([0; 32]), &[0; 24]),
             Err(super::ServerInfoError::Box(NodeBoxError::ZeroPeerPublicKey))
+        ));
+    }
+
+    #[test]
+    fn server_info_frame_consumes_one_bounded_frame_and_preserves_the_next() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let payload = decode_hex("808182838485868788898a8b8c8d8e8f90919293949596972a5043cecfb67d977e3a71109462311a38a15b673d7b2bf55da90ef8f0d0c5313f73665a84fefee88e79c04d9f28b8eedadcd657528c5f0c7a08671cf92cd641f0e77fae5c0817566ac2b69be71d61523ec54dd49e137aaa9e0e19cb487e0f7557d9");
+        let mut wire = Vec::new();
+        write_frame(&mut wire, super::FRAME_SERVER_INFO, &payload).unwrap();
+        let consumed = wire.len();
+        wire.extend_from_slice(&[0x06, 0, 0, 0, 0]);
+
+        let (info, frame_len) = super::parse_server_info_frame(&alice, &bob.public().unwrap(), &wire).unwrap();
+        assert_eq!(frame_len, consumed);
+        assert_eq!(&wire[frame_len..], &[0x06, 0, 0, 0, 0]);
+        assert_eq!(info.version, 2);
+        assert_eq!(info.token_bucket_bytes_per_second, 16_777_216);
+        assert_eq!(info.token_bucket_bytes_burst, 4_194_304);
+    }
+
+    #[test]
+    fn server_info_frame_matches_client_recv_header_and_size_failure_order() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+
+        for len in 0..super::FRAME_HEADER_LEN {
+            assert!(matches!(
+                super::parse_server_info_frame(&alice, &bob_public, &[0; 5][..len]),
+                Err(super::ServerInfoFrameError::IncompleteHeader)
+            ));
+        }
+        let too_large = FrameHeader {
+            frame_type: super::FRAME_SERVER_INFO,
+            frame_len: (super::MAX_CLIENT_RECV_FRAME_LEN + 1) as u32,
+        }
+        .encode();
+        let oversized_error = super::parse_server_info_frame(&alice, &bob_public, &too_large).unwrap_err();
+        assert_eq!(
+            oversized_error.to_string(),
+            format!("unexpectedly large frame of {} bytes returned", super::MAX_CLIENT_RECV_FRAME_LEN + 1)
+        );
+        assert!(matches!(
+            oversized_error,
+            super::ServerInfoFrameError::Oversized { frame_len, max_size }
+                if frame_len == (super::MAX_CLIENT_RECV_FRAME_LEN + 1) as u32
+                    && max_size == super::MAX_CLIENT_RECV_FRAME_LEN
+        ));
+
+        let short = FrameHeader { frame_type: super::FRAME_SERVER_INFO, frame_len: 4 }
+            .encode()
+            .into_iter()
+            .chain([1, 2])
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            super::parse_server_info_frame(&alice, &bob_public, &short),
+            Err(super::ServerInfoFrameError::IncompletePayload { expected: 4, got: 2 })
+        ));
+
+        let mut wrong_type = Vec::new();
+        write_frame(&mut wrong_type, FRAME_CLIENT_INFO, &[0; 24]).unwrap();
+        assert!(matches!(
+            super::parse_server_info_frame(&alice, &bob_public, &wrong_type),
+            Err(super::ServerInfoFrameError::UnexpectedType { got: FRAME_CLIENT_INFO })
         ));
     }
 

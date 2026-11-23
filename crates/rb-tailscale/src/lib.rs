@@ -6,7 +6,7 @@
 //! header, and source-derived magicsock packet classification, STUN binding
 //! request/response helpers, and Tailscale address classification and 4-to-6/6-to-4
 //! mapping helpers, plus bounded DERP frame slice codecs, in-memory encrypted
-//! ClientInfo frame construction, and bounded ServerInfo payload decryption/parsing.
+//! ClientInfo frame construction, and bounded in-memory ServerInfo frame/payload parsing.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
