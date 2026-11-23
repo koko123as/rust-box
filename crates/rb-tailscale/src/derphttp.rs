@@ -466,12 +466,14 @@ impl Error for DerpUnsupportedDialAddressText {}
 /// Classifies a deliberately limited subset of a DERP IP address field.
 ///
 /// Empty text, canonical dotted IPv4, and IPv6 whose address part contains only
-/// ASCII hexadecimal digits and colons are supported. IPv6 may have a nonempty
-/// UTF-8 zone after the first `%`; it is discarded in the returned family-only
-/// value, so callers must retain the original text for any later operation.
-/// Embedded dotted IPv4 in IPv6, invalid addresses, and hostnames return an error
-/// rather than being classified as a Go parse failure. This is not a general Go
-/// `netip.ParseAddr` replacement and does not produce a usable dial address.
+/// ASCII hexadecimal digits, colons, and an optional embedded dotted-IPv4 tail
+/// are supported. IPv6 may have a nonempty UTF-8 zone after the first `%`; it is
+/// discarded in the returned family-only value, so callers must retain the
+/// original text for any later operation. The standard IPv6 parser enforces the
+/// final-32-bit placement and strict four-octet form for an embedded IPv4 tail.
+/// Invalid addresses and hostnames return an error rather than being classified
+/// as a Go parse failure. This is not a general Go `netip.ParseAddr` replacement
+/// and does not produce a usable dial address.
 pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialField, DerpUnsupportedDialAddressText> {
     if text.is_empty() {
         return Ok(DerpParsedDialField::Empty);
@@ -484,7 +486,9 @@ pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialF
         Some(_) => return Err(DerpUnsupportedDialAddressText),
         None => text,
     };
-    if address_text.contains(':') && address_text.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':') {
+    if address_text.contains(':')
+        && address_text.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.')
+    {
         return address_text
             .parse::<std::net::Ipv6Addr>()
             .map(|address| DerpParsedDialField::Address(address.into()))
@@ -1150,6 +1154,12 @@ mod tests {
             ("1:2:3:4:5:6:7::", false, true),
             ("2001:db8::1", false, true),
             ("::ffff:c000:201", false, true),
+            ("::ffff:192.0.2.1", false, true),
+            ("::192.0.2.1", false, true),
+            ("2001:db8::192.0.2.1", false, true),
+            ("1:2:3:4:5:6:192.0.2.1", false, true),
+            ("fe80::192.0.2.1%eth0", false, true),
+            ("::ffff:192.0.2.1%z", false, true),
             ("fe80::1%eth0", false, true),
             ("fe80::%eth0", false, true),
             ("fe80::1%a%b", false, true),
@@ -1167,8 +1177,14 @@ mod tests {
             "192.0.2",
             "fe80::1%",
             "fe80::g%eth0",
-            "::ffff:192.0.2.1%z",
-            "::ffff:192.0.2.1",
+            "::ffff:192.00.2.1",
+            "::ffff:192.0.2.256",
+            "::ffff:192.0.2",
+            "::ffff:192.0.2.1.4",
+            "::ffff:192.00.2.1%eth0",
+            "1:2:3:4:5:6:7:192.0.2.1",
+            "1:2:3:4:5:6::192.0.2.1",
+            "1:2:3:4:5:6:7::192.0.2.1",
             "192.0.2.1%eth0",
             "bad host",
             "0000:0000:0000:0000:0000:0000:0000:000g",
@@ -1206,6 +1222,7 @@ mod tests {
         let ipv6 = target("2001:db8::1", Some("2001:db8::1".parse().unwrap()));
         let mapped = target("::ffff:192.0.2.1", Some("::ffff:192.0.2.1".parse().unwrap()));
         let zoned = target("fe80::1%eth0", Some("fe80::1".parse().unwrap()));
+        let dotted_zoned = target("::ffff:192.0.2.1%eth0", Some("::ffff:192.0.2.1".parse().unwrap()));
         let invalid = target("bad ip text", None);
 
         assert_eq!(derp_start_dial_target_from_parsed(ipv4, hostname, Tcp4), Some("192.0.2.1"));
@@ -1215,7 +1232,7 @@ mod tests {
         assert_eq!(derp_start_dial_target_from_parsed(empty, hostname, Tcp4), Some("derp.example"));
         assert_eq!(derp_start_dial_target_from_parsed(invalid, hostname, Tcp4), Some("bad ip text"));
         assert_eq!(derp_start_dial_target_from_parsed(empty, empty, Tcp6), Some(""));
-        for ipv6_target in [mapped, zoned] {
+        for ipv6_target in [mapped, zoned, dotted_zoned] {
             assert_eq!(derp_start_dial_target_from_parsed(ipv6_target, hostname, Tcp4), None);
             assert_eq!(derp_start_dial_target_from_parsed(ipv6_target, hostname, Tcp6), Some(ipv6_target.text));
         }
