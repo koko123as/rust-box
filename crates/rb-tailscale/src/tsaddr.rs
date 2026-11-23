@@ -19,7 +19,7 @@ const TAILSCALE_VIA_PREFIX: [u8; 8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b,
 /// An IP prefix preserving the supplied address and Go's invalid-prefix state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpPrefix {
-    address: IpAddr,
+    address: Option<IpAddr>,
     prefix_len: i32,
 }
 
@@ -31,10 +31,15 @@ impl IpPrefix {
             IpAddr::V6(_) => 128,
         };
         let prefix_len = if (0..=max_bits).contains(&prefix_len) { prefix_len } else { -1 };
-        Self { address, prefix_len }
+        Self { address: Some(address), prefix_len }
     }
 
-    pub fn address(self) -> IpAddr {
+    /// Returns the invalid zero-value prefix, which has no address and `-1` bits.
+    pub const fn invalid() -> Self {
+        Self { address: None, prefix_len: -1 }
+    }
+
+    pub fn address(self) -> Option<IpAddr> {
         self.address
     }
 
@@ -44,15 +49,15 @@ impl IpPrefix {
     }
 
     pub fn is_valid(self) -> bool {
-        self.prefix_len >= 0
+        self.address.is_some() && self.prefix_len >= 0
     }
 
     pub fn is_ipv4(self) -> bool {
-        matches!(self.address, IpAddr::V4(_))
+        matches!(self.address, Some(IpAddr::V4(_)))
     }
 
     pub fn is_ipv6(self) -> bool {
-        matches!(self.address, IpAddr::V6(_))
+        matches!(self.address, Some(IpAddr::V6(_)))
     }
 
     /// Tests prefix membership without normalizing the stored address.
@@ -60,7 +65,10 @@ impl IpPrefix {
         if !self.is_valid() {
             return false;
         }
-        match (self.address, address) {
+        let Some(prefix) = self.address else {
+            return false;
+        };
+        match (prefix, address) {
             (IpAddr::V4(prefix), IpAddr::V4(address)) => {
                 let mask = if self.prefix_len == 0 { 0 } else { u32::MAX << (32 - self.prefix_len as u32) };
                 u32::from(prefix) & mask == u32::from(address) & mask
@@ -74,12 +82,17 @@ impl IpPrefix {
     }
 }
 
+impl Default for IpPrefix {
+    fn default() -> Self {
+        Self::invalid()
+    }
+}
+
 impl fmt::Display for IpPrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_valid() {
-            write!(f, "{}/{}", self.address, self.prefix_len)
-        } else {
-            f.write_str("invalid Prefix")
+        match (self.is_valid(), self.address) {
+            (true, Some(address)) => write!(f, "{address}/{}", self.prefix_len),
+            _ => f.write_str("invalid Prefix"),
         }
     }
 }
@@ -257,7 +270,9 @@ pub fn is_tailscale_ipv4(ip: IpAddr) -> bool {
 pub fn first_tailscale_addrs(addresses: &[IpPrefix]) -> (Option<IpAddr>, Option<IpAddr>) {
     let (mut ipv4, mut ipv6) = (None, None);
     for prefix in addresses {
-        let address = prefix.address();
+        let Some(address) = prefix.address() else {
+            continue;
+        };
         match address {
             IpAddr::V4(_) if ipv4.is_none() && is_tailscale_ip(address) => ipv4 = Some(address),
             IpAddr::V6(_) if ipv6.is_none() && is_tailscale_ip(address) => ipv6 = Some(address),
@@ -315,7 +330,7 @@ pub fn is_via_ip(ip: IpAddr) -> bool {
 ///
 /// As in the pinned fork, the prefix length is ignored; only its address is tested.
 pub fn is_via_prefix(prefix: IpPrefix) -> bool {
-    is_via_ip(prefix.address())
+    prefix.address().is_some_and(is_via_ip)
 }
 
 /// Maps an IPv4 prefix into the Tailscale via range for `site_id`.
@@ -323,7 +338,7 @@ pub fn is_via_prefix(prefix: IpPrefix) -> bool {
 /// The source address is retained as-is (including host bits), and the IPv4 prefix
 /// length is extended by 96 bits. Non-IPv4 prefixes return the pinned error.
 pub fn map_via(site_id: u32, ipv4_prefix: IpPrefix) -> Result<IpPrefix, MapViaError> {
-    let IpAddr::V4(ipv4) = ipv4_prefix.address() else {
+    let Some(IpAddr::V4(ipv4)) = ipv4_prefix.address() else {
         return Err(MapViaError);
     };
     let mut address = [0; 16];
@@ -451,7 +466,7 @@ mod tests {
             assert!(!invalid_v4.is_valid());
             assert!(invalid_v4.is_ipv4());
             assert_eq!(invalid_v4.prefix_len(), -1);
-            assert_eq!(invalid_v4.address(), ip("100.64.0.1"));
+            assert_eq!(invalid_v4.address(), Some(ip("100.64.0.1")));
             assert_eq!(invalid_v4.to_string(), "invalid Prefix");
             assert!(!invalid_v4.contains(ip("100.64.0.1")));
             assert_eq!(super::map_via(7, invalid_v4).unwrap().to_string(), "fd7a:115c:a1e0:b1a:0:7:6440:1/95");
@@ -460,9 +475,19 @@ mod tests {
         assert!(!invalid_v6.is_valid());
         assert!(invalid_v6.is_ipv6());
         assert_eq!(invalid_v6.prefix_len(), -1);
-        assert_eq!(invalid_v6.address(), ip("fd7a:115c:a1e0:b1a::1"));
+        assert_eq!(invalid_v6.address(), Some(ip("fd7a:115c:a1e0:b1a::1")));
         assert_eq!(super::map_via(7, invalid_v6).unwrap_err().to_string(), "want IPv4 CIDR with a site ID");
         assert!(super::is_via_prefix(invalid_v6));
+        let invalid_zero = IpPrefix::invalid();
+        assert!(!invalid_zero.is_valid());
+        assert_eq!(invalid_zero.prefix_len(), -1);
+        assert_eq!(invalid_zero.address(), None);
+        assert_eq!(invalid_zero.to_string(), "invalid Prefix");
+        assert!(!invalid_zero.is_ipv4());
+        assert!(!invalid_zero.is_ipv6());
+        assert!(!invalid_zero.contains(ip("fd7a:115c:a1e0:b1a::1")));
+        assert!(!super::is_via_prefix(invalid_zero));
+        assert_eq!(super::map_via(7, invalid_zero).unwrap_err().to_string(), "want IPv4 CIDR with a site ID");
 
         for (site_id, input, expected) in [
             (7, "100.64.0.1/32", "fd7a:115c:a1e0:b1a:0:7:6440:1/128"),
@@ -499,6 +524,9 @@ mod tests {
             assert_eq!(super::prefix_is4(prefix), expected_v4, "PrefixIs4 for {address}/{bits}");
             assert_eq!(super::prefix_is6(prefix), expected_v6, "PrefixIs6 for {address}/{bits}");
         }
+        assert!(!super::prefix_is4(IpPrefix::invalid()));
+        assert!(!super::prefix_is6(IpPrefix::invalid()));
+        assert_eq!(IpPrefix::default(), IpPrefix::invalid());
 
         let prefixes = [prefix("10.0.0.1/24"), prefix("fd7a:115c:a1e0:b1a::1/64"), IpPrefix::new(ip("192.0.2.1"), 33)];
         for (address, expected) in [
@@ -531,6 +559,8 @@ mod tests {
 
         let invalid_v4 = [IpPrefix::new(ip("100.64.0.1"), 33), prefix("100.64.0.2/32")];
         assert_eq!(super::first_tailscale_addrs(&invalid_v4), (Some(ip("100.64.0.1")), None));
+        let zero_prefix = [IpPrefix::invalid(), prefix("100.64.0.1/32")];
+        assert_eq!(super::first_tailscale_addrs(&zero_prefix), (Some(ip("100.64.0.1")), None));
 
         let chromeos_only = [prefix("100.115.92.1/32")];
         assert_eq!(super::first_tailscale_addrs(&chromeos_only), (None, None));
@@ -585,6 +615,14 @@ mod tests {
         assert!(super::contains_non_exit_subnet_routes(&invalid_only));
         assert!(matches!(super::without_exit_route(&invalid_only), Cow::Borrowed(_)));
         assert_eq!(super::without_exit_routes(&invalid_only).as_ref(), invalid_only.as_slice());
+
+        let zero_prefix = [IpPrefix::invalid()];
+        assert!(!super::contains_exit_route(&zero_prefix));
+        assert!(super::contains_non_exit_subnet_routes(&zero_prefix));
+        assert!(matches!(super::without_exit_route(&zero_prefix), Cow::Borrowed(_)));
+        assert!(!super::is_exit_route(zero_prefix[0]));
+        assert!(!super::contains_exit_routes(&zero_prefix));
+        assert!(matches!(super::without_exit_routes(&zero_prefix), Cow::Borrowed(_)));
     }
 
     #[test]
