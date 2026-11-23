@@ -1544,6 +1544,49 @@ impl<R: RecvDeadlineReader> DerpRecvSession<R> {
     }
 }
 
+/// Joins the pinned fork's DERP read-session behavior to its shared send writer.
+///
+/// When a successfully parsed ServerInfo message is received, its send-rate
+/// settings are applied under the writer lock before the message is returned,
+/// matching `Client.Recv` calling `setSendRateLimiter`. This still does not own a
+/// network connection or implement the complete DERP client lifecycle.
+pub struct DerpClientRecvSession<R, W> {
+    receiver: DerpRecvSession<R>,
+    send_writer: Arc<DerpSendWriter<W>>,
+}
+
+impl<R: RecvDeadlineReader, W> DerpClientRecvSession<R, W> {
+    /// Joins a reader, client/server keys, and a shared serialized send writer.
+    pub fn new(
+        reader: R,
+        client_private: NodePrivate,
+        server_public: NodePublic,
+        send_writer: Arc<DerpSendWriter<W>>,
+    ) -> Self {
+        Self { receiver: DerpRecvSession::new(reader, client_private, server_public), send_writer }
+    }
+}
+
+impl<R, W> DerpClientRecvSession<R, W> {
+    /// Returns the shared writer used for sends and ServerInfo rate updates.
+    pub fn send_writer(&self) -> &Arc<DerpSendWriter<W>> {
+        &self.send_writer
+    }
+}
+
+impl<R: RecvDeadlineReader, W: Write> DerpClientRecvSession<R, W> {
+    /// Reads the next message and applies ServerInfo rate changes before returning.
+    pub fn recv_next(&mut self) -> Result<ReceivedMessage, RecvSessionError> {
+        match self.receiver.recv_next()? {
+            ReceivedMessage::ServerInfo(server_info) => {
+                self.send_writer.set_rate_limiter_from_server_info(server_info);
+                Ok(ReceivedMessage::ServerInfo(server_info))
+            }
+            message => Ok(message),
+        }
+    }
+}
+
 /// Parses one complete ServerInfo frame from an in-memory byte slice.
 ///
 /// The returned `usize` is the number of bytes consumed, so a following frame
@@ -1747,10 +1790,10 @@ mod tests {
         build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_from, read_frame_header,
         read_frame_type_header, read_server_greeting, write_frame, write_frame_to, write_ping_to, write_pong_to,
         ClientInfo, ClientInfoFrameError, DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState,
-        DerpClientStreamHandshakeError, DerpRecvSession, DerpSendWriter, FrameHeader, FrameHeaderError, FrameType,
-        ReadFrameError, RecvDeadlineReader, ServerGreetingError, StreamReadFrameError, StreamWriteFrameError,
-        WriteFrameError, CLIENT_RECV_TIMEOUT, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE,
-        PROTOCOL_VERSION,
+        DerpClientRecvSession, DerpClientStreamHandshakeError, DerpRecvSession, DerpSendWriter, FrameHeader,
+        FrameHeaderError, FrameType, ReadFrameError, RecvDeadlineReader, ServerGreetingError, StreamReadFrameError,
+        StreamWriteFrameError, WriteFrameError, CLIENT_RECV_TIMEOUT, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC,
+        MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
     use std::io::{self, Read, Write};
@@ -3114,6 +3157,43 @@ mod tests {
         assert!(Arc::ptr_eq(&first_inner, &second_error.inner));
         assert_eq!(session.reader().read_calls, reads_after_error);
         assert_eq!(session.reader().deadlines.len(), deadlines_after_error);
+    }
+
+    #[test]
+    fn client_recv_session_applies_server_info_rate_before_returning_it() {
+        let client =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let server =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let client_public = client.public().unwrap();
+        let server_public = server.public().unwrap();
+        let payload =
+            server.seal_to(&client_public, br#"{"TokenBucketBytesPerSecond":1,"TokenBucketBytesBurst":47}"#).unwrap();
+        let mut wire = Vec::new();
+        write_frame(&mut wire, super::FRAME_SERVER_INFO, &payload).unwrap();
+        let reader = DeadlineReader {
+            inner: ChunkedReader::new(wire, 3),
+            deadlines: Vec::new(),
+            read_calls: 0,
+            fail_deadline: false,
+        };
+
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = Arc::new(DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None));
+        let mut session = DerpClientRecvSession::new(reader, client, server_public, Arc::clone(&writer));
+        assert_eq!(
+            session.recv_next().unwrap(),
+            super::ReceivedMessage::ServerInfo(super::ServerInfoMessage {
+                token_bucket_bytes_per_second: 1,
+                token_bucket_bytes_burst: 47,
+            })
+        );
+
+        let destination = NodePublic::from_raw32([0x73; 32]);
+        let packet = [0x29; 10];
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Sent);
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Dropped);
+        assert_eq!(observation.lock().unwrap().flushes, 1);
     }
 
     #[test]
