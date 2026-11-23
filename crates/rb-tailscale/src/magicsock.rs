@@ -2,8 +2,8 @@
 //!
 //! The low-level DERP receiver continues to return Ping messages unchanged. This
 //! wrapper models the higher-level magicsock branch: asynchronously schedule
-//! `SendPong`, gate it on the caller-supplied connected/closed state without
-//! implicit reconnect, report errors through the caller's logging hook, and
+//! `SendPong`, gate it on caller-supplied connected/disconnected/closed state
+//! without implicit reconnect, report errors through the caller's logging hook, and
 //! continue receiving without returning Ping to the caller. The narrow gate models
 //! only `derphttp.Client.SendPong`; it does not own or close the transport. A
 //! task-spawner interface keeps this protocol layer independent of a particular
@@ -12,14 +12,11 @@
 //! rest of magicsock, the full `derphttp.Client` lifecycle, or the complete Tailscale
 //! endpoint runtime.
 
-use std::error::Error;
-use std::fmt;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
-use crate::derp::{
-    DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError, StreamWriteFrameError,
-};
+use crate::derp::{DerpClientRecvSession, ReceivedMessage, RecvDeadlineReader, RecvSessionError};
+pub use crate::derphttp::{DerpPongClientState, DerpPongSendError, DerpPongSendGate};
 
 /// A detached task scheduled for a best-effort DERP Pong reply.
 pub type MagicsockTask = Box<dyn FnOnce() + Send + 'static>;
@@ -44,119 +41,6 @@ impl MagicsockTaskSpawner for StdThreadPongSpawner {
         // goroutine behavior at this call site.
         drop(handle);
         Ok(())
-    }
-}
-
-/// The caller-owned connection state relevant to `derphttp.Client.SendPong`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DerpPongClientState {
-    /// A current DERP client is available for a best-effort Pong write.
-    Connected,
-    /// No current DERP client is available; sending does not connect or reconnect.
-    Disconnected,
-    /// The higher-level client was permanently closed.
-    Closed,
-}
-
-/// A `SendPong` availability or frame-write failure.
-#[derive(Debug)]
-pub enum DerpPongSendError {
-    /// The higher-level DERP client has been closed.
-    ClientClosed,
-    /// No current DERP client is connected; `SendPong` will not reconnect it.
-    NotConnected,
-    /// The underlying DERP Pong frame write failed.
-    Write(StreamWriteFrameError),
-}
-
-impl fmt::Display for DerpPongSendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ClientClosed => f.write_str("derphttp.Client closed"),
-            Self::NotConnected => f.write_str("not connected"),
-            Self::Write(error) => fmt::Display::fmt(error, f),
-        }
-    }
-}
-
-impl Error for DerpPongSendError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Write(error) => Some(error),
-            Self::ClientClosed | Self::NotConnected => None,
-        }
-    }
-}
-
-/// A narrow gate for the pinned fork's `derphttp.Client.SendPong` state checks.
-///
-/// It never dials or reconnects. The owner supplies the initial state and must
-/// update it as its connection lifecycle changes. `mark_closed` only changes this
-/// gate; the owner remains responsible for canceling work and closing the actual
-/// transport, which this slice does not own.
-pub struct DerpPongSendGate<W> {
-    writer: Arc<DerpSendWriter<W>>,
-    state: Mutex<DerpPongClientState>,
-}
-
-impl<W> DerpPongSendGate<W> {
-    /// Wraps a shared DERP writer and the owner's current connection state.
-    pub fn new(writer: Arc<DerpSendWriter<W>>, state: DerpPongClientState) -> Self {
-        Self { writer, state: Mutex::new(state) }
-    }
-
-    fn lock_state(&self) -> MutexGuard<'_, DerpPongClientState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Returns the current state used for best-effort Pong gating.
-    pub fn state(&self) -> DerpPongClientState {
-        *self.lock_state()
-    }
-
-    /// Marks a live connection available, unless the client was permanently closed.
-    pub fn mark_connected(&self) -> Result<(), DerpPongSendError> {
-        let mut state = self.lock_state();
-        if *state == DerpPongClientState::Closed {
-            return Err(DerpPongSendError::ClientClosed);
-        }
-        *state = DerpPongClientState::Connected;
-        Ok(())
-    }
-
-    /// Marks the current connection unavailable without implicitly reconnecting.
-    pub fn mark_disconnected(&self) {
-        let mut state = self.lock_state();
-        if *state != DerpPongClientState::Closed {
-            *state = DerpPongClientState::Disconnected;
-        }
-    }
-
-    /// Permanently closes this gate; repeated close attempts report the fork error.
-    pub fn mark_closed(&self) -> Result<(), DerpPongSendError> {
-        let mut state = self.lock_state();
-        if *state == DerpPongClientState::Closed {
-            return Err(DerpPongSendError::ClientClosed);
-        }
-        *state = DerpPongClientState::Closed;
-        Ok(())
-    }
-}
-
-impl<W: Write> DerpPongSendGate<W> {
-    /// Sends a Pong only when a current client is connected and not closed.
-    ///
-    /// The state lock is released before writing, matching the pinned fork's
-    /// `SendPong` critical-section boundary.
-    pub fn send_pong(&self, data: [u8; 8]) -> Result<(), DerpPongSendError> {
-        let state = self.lock_state();
-        match *state {
-            DerpPongClientState::Connected => {}
-            DerpPongClientState::Disconnected => return Err(DerpPongSendError::NotConnected),
-            DerpPongClientState::Closed => return Err(DerpPongSendError::ClientClosed),
-        }
-        drop(state);
-        self.writer.send_pong(data).map_err(DerpPongSendError::Write)
     }
 }
 

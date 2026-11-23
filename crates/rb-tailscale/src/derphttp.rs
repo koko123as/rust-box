@@ -1,16 +1,168 @@
-//! Narrow pure-Rust behavior from the pinned fork's `derphttp.Client.RecvDetail`.
+//! Narrow pure-Rust slices from the pinned fork's `derphttp.Client`.
 //!
-//! This module dispatches registered Pong responses and filters only matching
-//! Pong messages from an already-created DERP receive session. It does not connect
-//! or reconnect, assign connection generations, close transports, or implement the
-//! complete `derphttp.Client` lifecycle.
+//! This module gates `SendPing` and `SendPong` on caller-supplied connection state,
+//! dispatches registered Pong responses, and filters only matching Pong messages
+//! from an already-created DERP receive session. It does not connect or reconnect,
+//! assign connection generations, close transports, or implement the complete
+//! `derphttp.Client` lifecycle.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::derp::{DerpClientRecvSession, ReceivedMessage, RecvDeadlineReader, RecvSessionError};
+use crate::derp::{
+    DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError, StreamWriteFrameError,
+};
+
+/// Caller-owned connection state checked by the pinned fork's lower-level send methods.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpClientState {
+    /// A current DERP client is available for frame writes.
+    Connected,
+    /// No current DERP client is available; these methods do not reconnect.
+    Disconnected,
+    /// The higher-level DERP client was permanently closed.
+    Closed,
+}
+
+/// Compatibility name for the state used by the magicsock SendPong slice.
+pub type DerpPongClientState = DerpClientState;
+
+/// A closed-client, disconnected-client, or frame-write failure from SendPong.
+#[derive(Debug)]
+pub enum DerpPongSendError {
+    ClientClosed,
+    NotConnected,
+    Write(StreamWriteFrameError),
+}
+
+impl fmt::Display for DerpPongSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientClosed => f.write_str("derphttp.Client closed"),
+            Self::NotConnected => f.write_str("not connected"),
+            Self::Write(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for DerpPongSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            Self::ClientClosed | Self::NotConnected => None,
+        }
+    }
+}
+
+/// A closed-client, disconnected-client, or frame-write failure from SendPing.
+#[derive(Debug)]
+pub enum DerpPingSendError {
+    ClientClosed,
+    ClientNotConnected,
+    Write(StreamWriteFrameError),
+}
+
+impl fmt::Display for DerpPingSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientClosed => f.write_str("derphttp.Client closed"),
+            Self::ClientNotConnected => f.write_str("client not connected"),
+            Self::Write(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for DerpPingSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            Self::ClientClosed | Self::ClientNotConnected => None,
+        }
+    }
+}
+
+/// State gate for `derphttp.Client.SendPing` and `SendPong`.
+///
+/// This gate snapshots caller-supplied state and releases its lock before writing,
+/// matching the pinned methods' state-check boundary. It never connects, reconnects,
+/// cancels work, or closes the transport; the owner remains responsible for keeping
+/// state synchronized with the actual client lifecycle.
+pub struct DerphttpSendGate<W> {
+    writer: Arc<DerpSendWriter<W>>,
+    state: Mutex<DerpClientState>,
+}
+
+impl<W> DerphttpSendGate<W> {
+    pub fn new(writer: Arc<DerpSendWriter<W>>, state: DerpClientState) -> Self {
+        Self { writer, state: Mutex::new(state) }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, DerpClientState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn state(&self) -> DerpClientState {
+        *self.lock_state()
+    }
+
+    pub fn mark_connected(&self) -> Result<(), DerpPongSendError> {
+        let mut state = self.lock_state();
+        if *state == DerpClientState::Closed {
+            return Err(DerpPongSendError::ClientClosed);
+        }
+        *state = DerpClientState::Connected;
+        Ok(())
+    }
+
+    pub fn mark_disconnected(&self) {
+        let mut state = self.lock_state();
+        if *state != DerpClientState::Closed {
+            *state = DerpClientState::Disconnected;
+        }
+    }
+
+    pub fn mark_closed(&self) -> Result<(), DerpPongSendError> {
+        let mut state = self.lock_state();
+        if *state == DerpClientState::Closed {
+            return Err(DerpPongSendError::ClientClosed);
+        }
+        *state = DerpClientState::Closed;
+        Ok(())
+    }
+
+    fn send_state(&self) -> DerpClientState {
+        self.state()
+    }
+}
+
+impl<W: Write> DerphttpSendGate<W> {
+    /// Sends a Ping only when connected; it does not connect or reconnect.
+    pub fn send_ping(&self, data: [u8; 8]) -> Result<(), DerpPingSendError> {
+        match self.send_state() {
+            DerpClientState::Connected => {}
+            DerpClientState::Disconnected => return Err(DerpPingSendError::ClientNotConnected),
+            DerpClientState::Closed => return Err(DerpPingSendError::ClientClosed),
+        }
+        self.writer.send_ping(data).map_err(DerpPingSendError::Write)
+    }
+
+    /// Sends a best-effort Pong only when connected; it does not reconnect.
+    pub fn send_pong(&self, data: [u8; 8]) -> Result<(), DerpPongSendError> {
+        match self.send_state() {
+            DerpClientState::Connected => {}
+            DerpClientState::Disconnected => return Err(DerpPongSendError::NotConnected),
+            DerpClientState::Closed => return Err(DerpPongSendError::ClientClosed),
+        }
+        self.writer.send_pong(data).map_err(DerpPongSendError::Write)
+    }
+}
+
+/// Compatibility alias for the previously introduced SendPong-only gate.
+pub type DerpPongSendGate<W> = DerphttpSendGate<W>;
 
 struct PongSignal {
     ready: Mutex<bool>,
@@ -158,17 +310,17 @@ impl<R: RecvDeadlineReader, W: Write> DerphttpPongFilter<R, W> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Cursor, Read};
-    use std::sync::Arc;
+    use std::io::{self, Cursor, Read, Write};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use crate::derp::{
-        write_frame, DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, FRAME_KEEP_ALIVE,
-        FRAME_PONG,
+        write_frame, DerpClientRecvSession, DerpSendWriter, FrameHeader, ReceivedMessage, RecvDeadlineReader,
+        FRAME_KEEP_ALIVE, FRAME_PING, FRAME_PONG,
     };
     use crate::{NodePrivate, NodePublic};
 
-    use super::{DerpPongResponseRegistry, DerphttpPongFilter};
+    use super::{DerpClientState, DerpPongResponseRegistry, DerphttpPongFilter, DerphttpSendGate};
 
     struct MemoryReader(Cursor<Vec<u8>>);
 
@@ -200,6 +352,35 @@ mod tests {
             Arc::new(DerpSendWriter::new(Vec::new(), None)),
         );
         DerphttpPongFilter::new(receiver)
+    }
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _input: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("write failed"))
+        }
+    }
+
+    fn make_send_gate(state: DerpClientState, bytes: Arc<Mutex<Vec<u8>>>) -> DerphttpSendGate<SharedWriter> {
+        DerphttpSendGate::new(Arc::new(DerpSendWriter::new(SharedWriter(bytes), None)), state)
     }
 
     #[test]
@@ -246,5 +427,47 @@ mod tests {
 
         assert!(!registry.handle_pong(ping));
         assert!(!waiter.wait_timeout(Duration::ZERO));
+    }
+
+    #[test]
+    fn send_ping_gate_returns_exact_disconnected_error_without_reconnecting() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let gate = make_send_gate(DerpClientState::Disconnected, Arc::clone(&bytes));
+
+        assert_eq!(gate.send_ping(*b"pingdata").unwrap_err().to_string(), "client not connected");
+        assert_eq!(gate.state(), DerpClientState::Disconnected);
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_ping_gate_returns_closed_error_without_writing() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let gate = make_send_gate(DerpClientState::Closed, Arc::clone(&bytes));
+
+        assert_eq!(gate.send_ping(*b"pingdata").unwrap_err().to_string(), "derphttp.Client closed");
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connected_send_ping_writes_the_exact_frame() {
+        let ping = *b"pingdata";
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let gate = make_send_gate(DerpClientState::Connected, Arc::clone(&bytes));
+
+        gate.send_ping(ping).unwrap();
+        let mut expected = FrameHeader { frame_type: FRAME_PING, frame_len: 8 }.encode().to_vec();
+        expected.extend_from_slice(&ping);
+        assert_eq!(*bytes.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn send_ping_writer_error_is_preserved_without_changing_connection_state() {
+        let writer = Arc::new(DerpSendWriter::new(FailingWriter, None));
+        let gate = DerphttpSendGate::new(writer, DerpClientState::Connected);
+        let error = gate.send_ping(*b"pingdata").unwrap_err();
+
+        assert_eq!(error.to_string(), "write failed");
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(gate.state(), DerpClientState::Connected);
     }
 }
