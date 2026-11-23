@@ -16,6 +16,7 @@ pub mod quic;
 pub mod rule;
 pub mod rule_set;
 pub mod srs;
+pub mod tailscale;
 pub mod tls;
 pub mod tun;
 pub mod types;
@@ -43,6 +44,7 @@ pub use rule_set::{
     DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,
     RuleSetKind, RuleSetOptions,
 };
+pub use tailscale::{TailscaleEndpointOptions, TailscaleSshServerOptions, TailscaleSshServerSettings};
 pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions, UtlsOptions};
 pub use types::{DomainResolveOptions, DomainStrategy, Duration, IpPrefix, Listable, QueryType, UdpTimeout, User};
 pub use wireguard::{Endpoint, WireGuardEndpointOptions, WireGuardPeer};
@@ -3024,7 +3026,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.endpoints[0].tag(), "wg0");
         assert_eq!(options.endpoints[0].kind(), "wireguard");
-        let Endpoint::WireGuard(wireguard) = &options.endpoints[0];
+        let Endpoint::WireGuard(wireguard) = &options.endpoints[0] else { panic!("expected WireGuard endpoint") };
         assert_eq!(wireguard.address.0.len(), 2);
         assert_eq!(wireguard.peers[0].address, "vpn.example");
         assert_eq!(wireguard.peers[0].port, 51820);
@@ -3039,7 +3041,7 @@ mod tests {
                 r#"{{"endpoints":[{{"type":"wireguard","private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","peers":[{{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","reserved":{reserved}}}]}}]}}"#
             );
             let options = parse(&config).unwrap();
-            let Endpoint::WireGuard(endpoint) = &options.endpoints[0];
+            let Endpoint::WireGuard(endpoint) = &options.endpoints[0] else { panic!("expected WireGuard endpoint") };
             assert_eq!(endpoint.peers[0].reserved, expected);
         }
     }

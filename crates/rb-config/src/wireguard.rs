@@ -9,6 +9,7 @@ use base64::Engine as _;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 
+use crate::tailscale::TailscaleEndpointOptions;
 use crate::tun::UdpNatBehavior;
 use crate::types::{IpPrefix, Listable, UdpTimeout};
 use crate::ConfigError;
@@ -143,30 +144,36 @@ where
 pub enum Endpoint {
     #[serde(rename = "wireguard")]
     WireGuard(WireGuardEndpointOptions),
+    #[serde(rename = "tailscale")]
+    Tailscale(TailscaleEndpointOptions),
 }
 
 impl Endpoint {
     pub fn tag(&self) -> &str {
         match self {
             Endpoint::WireGuard(options) => &options.tag,
+            Endpoint::Tailscale(options) => &options.tag,
         }
     }
 
     pub fn kind(&self) -> &'static str {
         match self {
             Endpoint::WireGuard(_) => "wireguard",
+            Endpoint::Tailscale(_) => "tailscale",
         }
     }
 
     pub fn dialer_options(&self) -> crate::DialerOptions {
         match self {
             Endpoint::WireGuard(options) => options.dialer_options(),
+            Endpoint::Tailscale(options) => options.dialer_options(),
         }
     }
 
     pub fn validate(&self, path: &str) -> Result<(), ConfigError> {
         match self {
             Endpoint::WireGuard(options) => options.validate(path),
+            Endpoint::Tailscale(options) => options.validate(path),
         }
     }
 }

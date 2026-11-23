@@ -262,6 +262,9 @@ impl RustBox {
                     outbounds.push(built.clone() as Arc<dyn Outbound>);
                     endpoints.push(built);
                 }
+                EndpointOptions::Tailscale(_) => {
+                    return Err(anyhow!("endpoints[{index}]: Tailscale endpoint runtime is not implemented yet"));
+                }
             }
         }
         if outbounds.is_empty() {
