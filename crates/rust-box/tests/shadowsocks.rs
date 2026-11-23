@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+/// `free_port` releases its probe sockets before the configured listener binds;
+/// keep network scenarios from selecting the same port concurrently.
+static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const PSK16: &str = "AAECAwQFBgcICQoLDA0ODw==";
 const UPSK16: &str = "EBESExQVFhcYGRobHB0eHw==";
 const UPSK16_B: &str = "ICEiIyQlJicoKSorLC0uLw==";
@@ -232,6 +236,7 @@ async fn rust_box_chain(outbound: Value, inbound: Value) {
 
 #[tokio::test]
 async fn rust_box_to_rust_box_every_method() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     for (method, password) in [
         ("none", ""),
         ("aes-128-gcm", "secret"),
@@ -251,6 +256,7 @@ async fn rust_box_to_rust_box_every_method() {
 
 #[tokio::test]
 async fn rust_box_to_rust_box_multi_user() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let port = free_port();
     let outbound = ss_outbound(port, "2022-blake3-aes-128-gcm", &format!("{PSK16}:{UPSK16_B}"));
     rust_box_chain(outbound, ss_multi_inbound(port)).await;
@@ -263,6 +269,7 @@ async fn rust_box_to_rust_box_multi_user() {
 
 #[tokio::test]
 async fn rust_box_to_rust_box_udp_over_tcp() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     for uot in [json!(true), json!({"enabled": true, "version": 1}), json!({"enabled": true, "version": 2})] {
         let port = free_port();
         let mut outbound = ss_outbound(port, "2022-blake3-aes-128-gcm", PSK16);
@@ -277,6 +284,7 @@ async fn rust_box_to_rust_box_udp_over_tcp() {
 /// client (iPSK:uPSK) → relay (destination: the server) → server (uPSK).
 #[tokio::test]
 async fn rust_box_relay() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let (echo, udp) = (tcp_echo().await, udp_echo().await);
     let server_port = free_port();
     let (_server, _) = start(&server_config(ss_inbound(server_port, "2022-blake3-aes-128-gcm", UPSK16))).await;
@@ -294,6 +302,7 @@ async fn rust_box_relay() {
 
 #[tokio::test]
 async fn wrong_password_carries_nothing() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let echo = tcp_echo().await;
     let port = free_port();
     let (_server, _) = start(&server_config(ss_inbound(port, "aes-128-gcm", "right"))).await;
@@ -346,6 +355,7 @@ fn interop_cases(port: u16) -> Vec<(&'static str, String, Value)> {
 
 #[tokio::test]
 async fn interop_rust_box_shadowsocks_outbound_to_sing_box_inbound() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let (echo, udp) = (tcp_echo().await, udp_echo().await);
     for index in 0..interop_cases(0).len() {
         let port = free_port();
@@ -360,6 +370,7 @@ async fn interop_rust_box_shadowsocks_outbound_to_sing_box_inbound() {
 
 #[tokio::test]
 async fn interop_sing_box_shadowsocks_outbound_to_rust_box_inbound() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let (echo, udp) = (tcp_echo().await, udp_echo().await);
     for index in 0..interop_cases(0).len() {
         let port = free_port();
@@ -380,6 +391,7 @@ async fn interop_sing_box_shadowsocks_outbound_to_rust_box_inbound() {
 
 #[tokio::test]
 async fn interop_udp_over_tcp_both_ways() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let udp = udp_echo().await;
     // rust-box UoT client → sing-box server (TCP only).
     let port = free_port();
@@ -405,6 +417,7 @@ async fn interop_udp_over_tcp_both_ways() {
 /// client → sing-box relay → rust-box server.
 #[tokio::test]
 async fn interop_relay() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
     let (echo, udp) = (tcp_echo().await, udp_echo().await);
     let relay_inbound = |port: u16, upstream: u16| {
         json!({"type": "shadowsocks", "listen": "127.0.0.1", "listen_port": port,
