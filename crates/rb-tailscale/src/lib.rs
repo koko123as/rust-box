@@ -3,14 +3,15 @@
 //! This crate implements machine, node, and disco X25519 key primitives, DiscoShared
 //! encryption, Go-oracle-tested plaintext codecs for disco types 0x01 through 0x09,
 //! encrypted packet-envelope helpers, the fixed Geneve header, and source-derived
-//! magicsock packet classification. The STUN module covers only binding requests;
-//! this crate is not a full Tailscale endpoint runtime.
+//! magicsock packet classification, STUN binding request/response helpers, and
+//! Tailscale address-range predicates. This crate is not a full Tailscale endpoint runtime.
 
 pub mod disco;
 pub mod disco_crypto;
 pub mod geneve;
 pub mod packet_classifier;
 pub mod stun;
+pub mod tsaddr;
 
 use std::error::Error;
 use std::fmt;
