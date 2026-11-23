@@ -1,8 +1,8 @@
-//! DERP frame-header primitives from the Tailscale fork pinned by sing-box v1.14.4.
+//! DERP slice primitives from the Tailscale fork pinned by sing-box v1.14.4.
 //!
-//! These are slice-based codecs, not a streaming DERP client or server. They do
-//! not validate frame types or apply a payload limit; callers must enforce their
-//! own protocol-state and resource limits before consuming untrusted payloads.
+//! This module provides header codecs, bounded frame slice reads/writes, a
+//! server-greeting parser, and ClientInfo plaintext JSON encoding. It does not
+//! provide a streaming DERP client/server, NaCl box handshake, or authentication.
 
 use std::error::Error;
 use std::fmt;
@@ -17,6 +17,10 @@ pub const MAX_FRAME_WRITE_SIZE: usize = 10 << 20;
 pub const MAGIC: [u8; 8] = *b"DERP\xf0\x9f\x94\x91";
 /// The server-key frame type.
 pub const FRAME_SERVER_KEY: FrameType = FrameType(0x01);
+/// The client-info frame type.
+pub const FRAME_CLIENT_INFO: FrameType = FrameType(0x02);
+/// DERP protocol version advertised by the pinned fork.
+pub const PROTOCOL_VERSION: isize = 2;
 
 /// A raw DERP frame type. Unknown values are preserved, as in Go's `FrameType`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,13 +226,118 @@ pub fn read_server_greeting(input: &mut &[u8]) -> Result<NodePublic, ServerGreet
     Ok(NodePublic::from_raw32(key))
 }
 
+/// Client metadata encoded by the pinned fork before NaCl box sealing.
+///
+/// This type only serializes the plaintext JSON; it does not seal or transmit a
+/// DERP ClientInfo frame. Its field omission, order, and string escaping match
+/// Go `encoding/json` for the corresponding fork `derp.ClientInfo` fields.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ClientInfo {
+    /// Zero means omitted, matching the fork's `meshKey,omitzero` tag.
+    pub mesh_key: [u8; 32],
+    /// Zero means omitted, matching the fork's `version,omitempty` tag.
+    pub version: isize,
+    /// Always emitted, matching the untagged exported Go field.
+    pub can_ack_pings: bool,
+    /// False means omitted, matching `json:",omitempty"`.
+    pub is_prober: bool,
+    /// Empty means omitted, matching `json:",omitempty"`.
+    pub app_name: String,
+}
+
+impl ClientInfo {
+    /// Encodes the plaintext exactly in the pinned Go fork's struct field order.
+    pub fn to_json(&self) -> String {
+        let mut output = String::from("{");
+        let mut first = true;
+        if self.mesh_key.iter().any(|byte| *byte != 0) {
+            push_json_field_name(&mut output, &mut first, "meshKey");
+            output.push('"');
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for byte in self.mesh_key {
+                output.push(HEX[(byte >> 4) as usize] as char);
+                output.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            output.push('"');
+        }
+        if self.version != 0 {
+            push_json_field_name(&mut output, &mut first, "version");
+            output.push_str(&self.version.to_string());
+        }
+        push_json_field_name(&mut output, &mut first, "CanAckPings");
+        output.push_str(if self.can_ack_pings { "true" } else { "false" });
+        if self.is_prober {
+            push_json_field_name(&mut output, &mut first, "IsProber");
+            output.push_str("true");
+        }
+        if !self.app_name.is_empty() {
+            push_json_field_name(&mut output, &mut first, "AppName");
+            push_go_json_string(&mut output, &self.app_name);
+        }
+        output.push('}');
+        output
+    }
+}
+
+fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
+    if !*first {
+        output.push(',');
+    }
+    *first = false;
+    output.push('"');
+    output.push_str(name);
+    output.push_str("\":");
+}
+
+fn push_go_json_string(output: &mut String, value: &str) {
+    let encoded = serde_json::to_string(value).expect("a Rust string is always JSON-serializable");
+    for character in encoded.chars() {
+        match character {
+            '<' => output.push_str("\\u003c"),
+            '>' => output.push_str("\\u003e"),
+            '&' => output.push_str("\\u0026"),
+            '\u{2028}' => output.push_str("\\u2028"),
+            '\u{2029}' => output.push_str("\\u2029"),
+            other => output.push(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, read_frame_header, read_frame_type_header, read_server_greeting, write_frame, FrameHeader,
-        FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, WriteFrameError, FRAME_SERVER_KEY, MAGIC,
-        MAX_FRAME_WRITE_SIZE,
+        read_frame, read_frame_header, read_frame_type_header, read_server_greeting, write_frame, ClientInfo,
+        FrameHeader, FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, WriteFrameError,
+        FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
+
+    #[test]
+    fn client_info_json_matches_pinned_go_encoding_json_oracle() {
+        assert_eq!(FRAME_CLIENT_INFO, FrameType(0x02));
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(ClientInfo::default().to_json(), r#"{"CanAckPings":false}"#);
+
+        let defaults = ClientInfo { version: PROTOCOL_VERSION, ..ClientInfo::default() };
+        assert_eq!(defaults.to_json(), r#"{"version":2,"CanAckPings":false}"#);
+
+        let ack = ClientInfo { version: PROTOCOL_VERSION, can_ack_pings: true, ..ClientInfo::default() };
+        assert_eq!(ack.to_json(), r#"{"version":2,"CanAckPings":true}"#);
+
+        let full = ClientInfo {
+            mesh_key: std::array::from_fn(|index| index as u8),
+            version: PROTOCOL_VERSION,
+            can_ack_pings: true,
+            is_prober: true,
+            app_name: "<>& \" \\ /\n\t\u{2028}\u{2029}é".to_owned(),
+        };
+        assert_eq!(
+            full.to_json(),
+            r#"{"meshKey":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","version":2,"CanAckPings":true,"IsProber":true,"AppName":"\u003c\u003e\u0026 \" \\ /\n\t\u2028\u2029é"}"#
+        );
+
+        let omission = ClientInfo { app_name: "cue".to_owned(), ..ClientInfo::default() };
+        assert_eq!(omission.to_json(), r#"{"CanAckPings":false,"AppName":"cue"}"#);
+    }
 
     #[test]
     fn header_bytes_match_pinned_go_source_oracle() {

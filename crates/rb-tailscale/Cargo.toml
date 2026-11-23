@@ -10,5 +10,6 @@ rust-version.workspace = true
 boringtun.workspace = true
 crypto_secretbox.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 salsa20.workspace = true
 zeroize.workspace = true
