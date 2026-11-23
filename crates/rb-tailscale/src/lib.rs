@@ -15,6 +15,7 @@ use zeroize::Zeroize;
 const PRIVATE_TEXT_PREFIX: &str = "privkey:";
 const MACHINE_PUBLIC_TEXT_PREFIX: &str = "mkey:";
 const NODE_PUBLIC_TEXT_PREFIX: &str = "nodekey:";
+const DISCO_PUBLIC_TEXT_PREFIX: &str = "discokey:";
 const NODE_PUBLIC_BINARY_PREFIX: &[u8; 2] = b"np";
 const KEY_BYTES: usize = 32;
 
@@ -279,6 +280,84 @@ impl fmt::Display for NodePublic {
     }
 }
 
+/// A Tailscale DiscoPrivate key used for peer path discovery.
+///
+/// The pinned fork has no text encoding for this private key; its raw form is
+/// exactly 32 bytes. Shared-secret computation and NaCl box encryption are not
+/// implemented by this type yet.
+#[derive(Clone)]
+pub struct DiscoPrivate(StaticSecret);
+
+impl DiscoPrivate {
+    /// Generates a clamped private key using only the operating system CSPRNG.
+    pub fn generate() -> Result<Self, KeyGenerationError> {
+        let mut rng = OsRng;
+        generate_private(&mut rng).map(Self)
+    }
+
+    pub fn from_raw32(mut bytes: [u8; KEY_BYTES]) -> Self {
+        let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
+        Self(secret)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        is_zero(self.0.as_bytes())
+    }
+
+    /// Derives the X25519 public key; a zero private key is rejected.
+    pub fn public(&self) -> Result<DiscoPublic, ZeroPrivateKey> {
+        if self.is_zero() {
+            return Err(ZeroPrivateKey);
+        }
+        Ok(DiscoPublic(X25519PublicKey::from(&self.0).to_bytes()))
+    }
+}
+
+impl fmt::Debug for DiscoPrivate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DiscoPrivate(REDACTED)")
+    }
+}
+
+/// A Tailscale DiscoPublic key, serialized as `discokey:` plus 64 hex digits.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DiscoPublic([u8; KEY_BYTES]);
+
+impl DiscoPublic {
+    pub fn from_text(input: &str) -> Result<Self, KeyParseError> {
+        decode_hex_key(input, DISCO_PUBLIC_TEXT_PREFIX).map(Self)
+    }
+
+    pub fn to_text(self) -> String {
+        encode_hex_key(DISCO_PUBLIC_TEXT_PREFIX, &self.0)
+    }
+
+    pub fn from_raw32(bytes: [u8; KEY_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn raw_bytes(self) -> [u8; KEY_BYTES] {
+        self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        is_zero(&self.0)
+    }
+}
+
+impl fmt::Debug for DiscoPublic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DiscoPublic").field(&self.to_text()).finish()
+    }
+}
+
+impl fmt::Display for DiscoPublic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_text())
+    }
+}
+
 fn parse_private(input: &str, prefix: &'static str) -> Result<StaticSecret, KeyParseError> {
     let mut bytes = decode_hex_key(input, prefix)?;
     let secret = StaticSecret::from(bytes);
@@ -360,7 +439,8 @@ mod tests {
     use rand::{TryCryptoRng, TryRngCore};
 
     use super::{
-        generate_private, KeyBinaryError, KeyParseError, MachinePrivate, NodePrivate, NodePublic, ZeroPrivateKey,
+        generate_private, DiscoPrivate, DiscoPublic, KeyBinaryError, KeyParseError, MachinePrivate, NodePrivate,
+        NodePublic, ZeroPrivateKey,
     };
 
     const ALICE_PRIVATE: &str = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
@@ -377,6 +457,25 @@ mod tests {
         let node_public = node.public().unwrap();
         assert_eq!(node_public.to_text(), format!("nodekey:{ALICE_PUBLIC}"));
         assert_eq!(NodePublic::from_text(&node_public.to_text()).unwrap(), node_public);
+    }
+
+    #[test]
+    fn disco_key_raw_public_and_text_match_pinned_fork() {
+        let raw = NodePrivate::from_text(&format!("privkey:{ALICE_PRIVATE}")).unwrap().raw_bytes();
+        let private = DiscoPrivate::from_raw32(raw);
+        assert_eq!(format!("{private:?}"), "DiscoPrivate(REDACTED)");
+        let public = private.public().unwrap();
+        assert_eq!(public.to_text(), format!("discokey:{ALICE_PUBLIC}"));
+        assert_eq!(DiscoPublic::from_text(&public.to_text()).unwrap(), public);
+        assert_eq!(DiscoPublic::from_raw32(public.raw_bytes()), public);
+        assert_eq!(DiscoPublic::from_text(&format!("discokey:{}", ALICE_PUBLIC.to_ascii_uppercase())).unwrap(), public);
+        assert_eq!(
+            DiscoPublic::from_text(&format!("Discokey:{ALICE_PUBLIC}")).unwrap_err(),
+            KeyParseError::WrongPrefix { expected: "discokey:" }
+        );
+        assert!(DiscoPublic::from_raw32([0; 32]).is_zero());
+        assert_eq!(DiscoPrivate::from_raw32([0; 32]).public(), Err(ZeroPrivateKey));
+        assert!(DiscoPublic::from_raw32([0; 32]) < public);
     }
 
     #[test]
