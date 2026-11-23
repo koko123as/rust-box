@@ -208,6 +208,26 @@ pub fn is_tailscale_ipv4(ip: IpAddr) -> bool {
     (CGNAT_START..=CGNAT_END).contains(&address) && !(CHROMEOS_VM_START..=CHROMEOS_VM_END).contains(&address)
 }
 
+/// Returns the first assignable IPv4 and IPv6 addresses among the supplied prefixes.
+///
+/// Prefix validity is not checked before examining its address, matching the pinned
+/// fork. An IPv4-mapped IPv6 address remains in the IPv6 result when selected.
+pub fn first_tailscale_addrs(addresses: &[IpPrefix]) -> (Option<IpAddr>, Option<IpAddr>) {
+    let (mut ipv4, mut ipv6) = (None, None);
+    for prefix in addresses {
+        let address = prefix.address();
+        match address {
+            IpAddr::V4(_) if ipv4.is_none() && is_tailscale_ip(address) => ipv4 = Some(address),
+            IpAddr::V6(_) if ipv6.is_none() && is_tailscale_ip(address) => ipv6 = Some(address),
+            _ => {}
+        }
+        if ipv4.is_some() && ipv6.is_some() {
+            break;
+        }
+    }
+    (ipv4, ipv6)
+}
+
 /// Returns the IPv6 address mapped from a native Tailscale IPv4 address.
 ///
 /// Unlike [`is_tailscale_ip`], this follows the pinned fork's native-v4-only
@@ -443,6 +463,26 @@ mod tests {
                 "PrefixesContainsIP for {address}"
             );
         }
+    }
+
+    #[test]
+    fn first_tailscale_addresses_match_pinned_go_oracle() {
+        assert_eq!(super::first_tailscale_addrs(&[]), (None, None));
+
+        let v4 = [prefix("192.0.2.1/32"), prefix("100.64.0.1/32"), prefix("100.64.0.2/32")];
+        assert_eq!(super::first_tailscale_addrs(&v4), (Some(ip("100.64.0.1")), None));
+
+        let v6 = [prefix("2001:db8::1/128"), prefix("fd7a:115c:a1e0::1/128"), prefix("fd7a:115c:a1e0::2/128")];
+        assert_eq!(super::first_tailscale_addrs(&v6), (None, Some(ip("fd7a:115c:a1e0::1"))));
+
+        let mapped = [prefix("::ffff:100.64.0.3/128"), prefix("fd7a:115c:a1e0::1/128")];
+        assert_eq!(super::first_tailscale_addrs(&mapped), (None, Some(ip("::ffff:100.64.0.3"))));
+
+        let invalid_v4 = [IpPrefix::new(ip("100.64.0.1"), 33), prefix("100.64.0.2/32")];
+        assert_eq!(super::first_tailscale_addrs(&invalid_v4), (Some(ip("100.64.0.1")), None));
+
+        let chromeos_only = [prefix("100.115.92.1/32")];
+        assert_eq!(super::first_tailscale_addrs(&chromeos_only), (None, None));
     }
 
     #[test]
