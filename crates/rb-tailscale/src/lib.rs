@@ -2,11 +2,13 @@
 //!
 //! This crate implements machine, node, and disco X25519 key primitives, DiscoShared
 //! encryption, Go-oracle-tested plaintext codecs for disco types 0x01 through 0x09,
-//! and encrypted packet-envelope helpers. It is not a Tailscale endpoint runtime.
+//! encrypted packet-envelope helpers, the fixed Geneve header, and source-derived
+//! magicsock packet classification. It is not a Tailscale endpoint runtime.
 
 pub mod disco;
 pub mod disco_crypto;
 pub mod geneve;
+pub mod packet_classifier;
 
 use std::error::Error;
 use std::fmt;
