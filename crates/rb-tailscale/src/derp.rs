@@ -2,9 +2,10 @@
 //!
 //! This module provides header codecs, bounded frame slice reads/writes, a
 //! server-greeting parser, ClientInfo JSON encoding and in-memory encrypted frame
-//! construction, and bounded in-memory ServerInfo frame/payload parsing. Node-key
-//! box primitives live in `disco_crypto`; a streaming DERP client/server,
-//! transport lifecycle, and server authentication remain unimplemented.
+//! construction, an in-memory client key-exchange state machine, and bounded
+//! in-memory ServerInfo frame/payload parsing. Node-key box primitives live in
+//! `disco_crypto`; a streaming DERP client/server, transport lifecycle, and server
+//! authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
@@ -324,6 +325,164 @@ pub fn build_client_info_frame(
     encode_client_info_frame(sender, &sealed)
 }
 
+/// Observable stages of the pinned fork's DERP client key exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpClientHandshakeState {
+    AwaitingServerKey,
+    ReadyToSendClientInfo,
+    AwaitingClientInfoWrite,
+    Ready,
+}
+
+/// Errors from the in-memory DERP client key-exchange state machine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DerpClientHandshakeError {
+    ZeroPrivateKey,
+    ZeroServerPublicKey,
+    InvalidState { expected: DerpClientHandshakeState, actual: DerpClientHandshakeState },
+    ServerGreeting(ServerGreetingError),
+    ClientInfo(ClientInfoFrameError),
+}
+
+impl fmt::Display for DerpClientHandshakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroPrivateKey => f.write_str("DERP client private key is zero"),
+            Self::ZeroServerPublicKey => f.write_str("DERP server public key is zero"),
+            Self::InvalidState { expected, actual } => {
+                write!(f, "invalid DERP client handshake state: expected {expected:?}, got {actual:?}")
+            }
+            Self::ServerGreeting(error) => error.fmt(f),
+            Self::ClientInfo(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for DerpClientHandshakeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ServerGreeting(error) => Some(error),
+            Self::ClientInfo(error) => Some(error),
+            Self::ZeroPrivateKey | Self::ZeroServerPublicKey | Self::InvalidState { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DerpClientHandshakePhase {
+    AwaitingServerKey,
+    ReadyToSendClientInfo(NodePublic),
+    AwaitingClientInfoWrite(NodePublic),
+    Ready(NodePublic),
+}
+
+/// Orders the key-exchange steps in the pinned fork's `derp.NewClient` without
+/// owning or performing network I/O.
+///
+/// A known nonzero server key skips the greeting; a zero configured key is a
+/// no-op, as in `ServerPublicKey`. With no configured key, callers must supply a
+/// complete greeting frame. The protocol version is fixed to
+/// [`PROTOCOL_VERSION`], as the Go client does rather than exposing it as an
+/// option. After obtaining the ClientInfo frame, callers must fully write and
+/// flush it before calling [`Self::client_info_sent`]. Drop this value if that
+/// transport operation fails. This state machine does not authenticate the
+/// server, create a socket, perform streaming reads/writes, or receive messages.
+pub struct DerpClientHandshake {
+    private_key: NodePrivate,
+    client_info: ClientInfo,
+    phase: DerpClientHandshakePhase,
+}
+
+impl DerpClientHandshake {
+    /// Starts the key exchange with an optional already-known server key.
+    pub fn new(
+        private_key: NodePrivate,
+        server_public_key: Option<NodePublic>,
+        mut client_info: ClientInfo,
+    ) -> Result<Self, DerpClientHandshakeError> {
+        if private_key.is_zero() {
+            return Err(DerpClientHandshakeError::ZeroPrivateKey);
+        }
+        client_info.version = PROTOCOL_VERSION;
+        let phase = match server_public_key.filter(|key| !key.is_zero()) {
+            Some(key) => DerpClientHandshakePhase::ReadyToSendClientInfo(key),
+            None => DerpClientHandshakePhase::AwaitingServerKey,
+        };
+        Ok(Self { private_key, client_info, phase })
+    }
+
+    /// Returns the externally observable handshake stage.
+    pub fn state(&self) -> DerpClientHandshakeState {
+        match self.phase {
+            DerpClientHandshakePhase::AwaitingServerKey => DerpClientHandshakeState::AwaitingServerKey,
+            DerpClientHandshakePhase::ReadyToSendClientInfo(_) => DerpClientHandshakeState::ReadyToSendClientInfo,
+            DerpClientHandshakePhase::AwaitingClientInfoWrite(_) => DerpClientHandshakeState::AwaitingClientInfoWrite,
+            DerpClientHandshakePhase::Ready(_) => DerpClientHandshakeState::Ready,
+        }
+    }
+
+    /// Returns the server key once configured or parsed from a greeting.
+    pub fn server_public_key(&self) -> Option<NodePublic> {
+        match self.phase {
+            DerpClientHandshakePhase::AwaitingServerKey => None,
+            DerpClientHandshakePhase::ReadyToSendClientInfo(key)
+            | DerpClientHandshakePhase::AwaitingClientInfoWrite(key)
+            | DerpClientHandshakePhase::Ready(key) => Some(key),
+        }
+    }
+
+    /// Parses the server greeting and advances to ClientInfo generation.
+    ///
+    /// This is permitted only when no nonzero server key was configured. The
+    /// parser consumes bytes according to the pinned frame reader; it cannot
+    /// wait for more bytes or represent transport errors.
+    pub fn receive_server_greeting(&mut self, input: &mut &[u8]) -> Result<(), DerpClientHandshakeError> {
+        if !matches!(self.phase, DerpClientHandshakePhase::AwaitingServerKey) {
+            return Err(DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::AwaitingServerKey,
+                actual: self.state(),
+            });
+        }
+        let key = read_server_greeting(input).map_err(DerpClientHandshakeError::ServerGreeting)?;
+        if key.is_zero() {
+            return Err(DerpClientHandshakeError::ZeroServerPublicKey);
+        }
+        self.phase = DerpClientHandshakePhase::ReadyToSendClientInfo(key);
+        Ok(())
+    }
+
+    /// Builds the ClientInfo frame once the server key is known.
+    ///
+    /// On entropy or encoding failure, the frame is not yielded and the state
+    /// remains retryable. A successful return advances the state so a second
+    /// frame cannot accidentally be generated before the first is sent.
+    pub fn build_client_info_frame(&mut self) -> Result<Vec<u8>, DerpClientHandshakeError> {
+        let DerpClientHandshakePhase::ReadyToSendClientInfo(server_key) = self.phase else {
+            return Err(DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::ReadyToSendClientInfo,
+                actual: self.state(),
+            });
+        };
+        let frame = build_client_info_frame(&self.private_key, &server_key, &self.client_info)
+            .map_err(DerpClientHandshakeError::ClientInfo)?;
+        self.phase = DerpClientHandshakePhase::AwaitingClientInfoWrite(server_key);
+        Ok(frame)
+    }
+
+    /// Marks the ClientInfo frame sent after the caller confirms full write and
+    /// flush; this performs no I/O itself.
+    pub fn client_info_sent(&mut self) -> Result<(), DerpClientHandshakeError> {
+        let DerpClientHandshakePhase::AwaitingClientInfoWrite(server_key) = self.phase else {
+            return Err(DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::AwaitingClientInfoWrite,
+                actual: self.state(),
+            });
+        };
+        self.phase = DerpClientHandshakePhase::Ready(server_key);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 fn build_client_info_frame_with_nonce(
     private: &NodePrivate,
@@ -629,9 +788,10 @@ fn push_go_json_string(output: &mut String, value: &str) {
 mod tests {
     use super::{
         build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_header,
-        read_frame_type_header, read_server_greeting, write_frame, ClientInfo, ClientInfoFrameError, FrameHeader,
-        FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, WriteFrameError, FRAME_CLIENT_INFO,
-        FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
+        read_frame_type_header, read_server_greeting, write_frame, ClientInfo, ClientInfoFrameError,
+        DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState, FrameHeader, FrameHeaderError,
+        FrameType, ReadFrameError, ServerGreetingError, WriteFrameError, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC,
+        MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
 
@@ -1110,5 +1270,110 @@ mod tests {
             Err(ServerGreetingError::Read(ReadFrameError::UnexpectedEndOfInput))
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn client_handshake_orders_server_key_and_client_info_steps() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let mut handshake = DerpClientHandshake::new(
+            alice.clone(),
+            Some(bob_public),
+            ClientInfo { version: 99, can_ack_pings: true, ..ClientInfo::default() },
+        )
+        .unwrap();
+
+        assert_eq!(handshake.state(), DerpClientHandshakeState::ReadyToSendClientInfo);
+        assert_eq!(handshake.server_public_key(), Some(bob_public));
+        let frame = handshake.build_client_info_frame().unwrap();
+        assert_eq!(handshake.state(), DerpClientHandshakeState::AwaitingClientInfoWrite);
+        assert_eq!(
+            handshake.build_client_info_frame().unwrap_err(),
+            DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::ReadyToSendClientInfo,
+                actual: DerpClientHandshakeState::AwaitingClientInfoWrite,
+            }
+        );
+
+        let mut remaining = frame.as_slice();
+        let mut payload = vec![0; frame.len() - super::FRAME_HEADER_LEN];
+        let header = read_frame(&mut remaining, MAX_FRAME_WRITE_SIZE as u32, &mut payload).unwrap();
+        assert_eq!(header.frame_type, FRAME_CLIENT_INFO);
+        assert!(remaining.is_empty());
+        let alice_public = alice.public().unwrap();
+        assert_eq!(&payload[..32], &alice_public.raw_bytes());
+        assert_eq!(bob.open_from(&alice_public, &payload[32..]).unwrap(), br#"{"version":2,"CanAckPings":true}"#);
+
+        handshake.client_info_sent().unwrap();
+        assert_eq!(handshake.state(), DerpClientHandshakeState::Ready);
+        assert_eq!(handshake.server_public_key(), Some(bob_public));
+        assert_eq!(
+            handshake.client_info_sent().unwrap_err(),
+            DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::AwaitingClientInfoWrite,
+                actual: DerpClientHandshakeState::Ready,
+            }
+        );
+    }
+
+    #[test]
+    fn client_handshake_requires_and_validates_greeting_when_key_is_unknown() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let zero_public = NodePublic::from_raw32([0; 32]);
+        let mut handshake = DerpClientHandshake::new(alice.clone(), Some(zero_public), ClientInfo::default()).unwrap();
+        assert_eq!(handshake.state(), DerpClientHandshakeState::AwaitingServerKey);
+        assert_eq!(handshake.server_public_key(), None);
+        assert_eq!(
+            handshake.build_client_info_frame().unwrap_err(),
+            DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::ReadyToSendClientInfo,
+                actual: DerpClientHandshakeState::AwaitingServerKey,
+            }
+        );
+
+        let mut zero_greeting = [0; 40];
+        zero_greeting[..MAGIC.len()].copy_from_slice(&MAGIC);
+        let mut wire = Vec::new();
+        write_frame(&mut wire, FRAME_SERVER_KEY, &zero_greeting).unwrap();
+        let mut input = wire.as_slice();
+        assert_eq!(handshake.receive_server_greeting(&mut input), Err(DerpClientHandshakeError::ZeroServerPublicKey));
+        assert_eq!(handshake.state(), DerpClientHandshakeState::AwaitingServerKey);
+
+        let mut body = [0; 40];
+        body[..MAGIC.len()].copy_from_slice(&MAGIC);
+        body[MAGIC.len()..].copy_from_slice(&bob_public.raw_bytes());
+        wire.clear();
+        write_frame(&mut wire, FRAME_SERVER_KEY, &body).unwrap();
+        wire.push(0xaa);
+        let mut input = wire.as_slice();
+        handshake.receive_server_greeting(&mut input).unwrap();
+        assert_eq!(input, &[0xaa]);
+        assert_eq!(handshake.state(), DerpClientHandshakeState::ReadyToSendClientInfo);
+        assert_eq!(handshake.server_public_key(), Some(bob_public));
+        assert_eq!(
+            handshake.receive_server_greeting(&mut input).unwrap_err(),
+            DerpClientHandshakeError::InvalidState {
+                expected: DerpClientHandshakeState::AwaitingServerKey,
+                actual: DerpClientHandshakeState::ReadyToSendClientInfo,
+            }
+        );
+
+        let frame = handshake.build_client_info_frame().unwrap();
+        assert_eq!(frame[0], FRAME_CLIENT_INFO.0);
+        handshake.client_info_sent().unwrap();
+        assert_eq!(handshake.state(), DerpClientHandshakeState::Ready);
+
+        let zero_private = NodePrivate::from_text(&format!("privkey:{}", "00".repeat(32))).unwrap();
+        assert_eq!(
+            DerpClientHandshake::new(zero_private, Some(bob_public), ClientInfo::default()).err().unwrap(),
+            DerpClientHandshakeError::ZeroPrivateKey
+        );
     }
 }
