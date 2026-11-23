@@ -353,6 +353,43 @@ impl fmt::Display for DerpRegionUrlError {
 
 impl Error for DerpRegionUrlError {}
 
+/// Invalid port text supplied as an already-parsed DERP URL component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpUrlPortError {
+    InvalidPortText,
+}
+
+impl fmt::Display for DerpUrlPortError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPortText => f.write_str("invalid parsed DERP URL port"),
+        }
+    }
+}
+
+impl Error for DerpUrlPortError {}
+
+/// Applies the pinned fork's `urlPort` scheme fallback to already-parsed URL parts.
+///
+/// A non-empty numeric port is returned verbatim, even above 65535, as Go's helper
+/// does; the URL parser itself is not implemented by this function.
+pub fn derp_url_port_from_parsed_parts<'a>(
+    scheme: &str,
+    parsed_port: Option<&'a str>,
+) -> Result<Option<&'a str>, DerpUrlPortError> {
+    if let Some(port) = parsed_port.filter(|port| !port.is_empty()) {
+        if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(DerpUrlPortError::InvalidPortText);
+        }
+        return Ok(Some(port));
+    }
+    Ok(match scheme {
+        "https" => Some("443"),
+        "http" => Some("80"),
+        _ => None,
+    })
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -736,9 +773,10 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_region_tls_server_name, derp_region_url_string, ping_deadline, DerpClientState, DerpPingCancellationToken,
-        DerpPongResponseRegistry, DerpRegionUrlError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError,
-        DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_region_tls_server_name, derp_region_url_string, derp_url_port_from_parsed_parts, ping_deadline,
+        DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpUrlPortError,
+        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
+        DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -878,6 +916,18 @@ mod tests {
         }
         assert_eq!(derp_region_tls_server_name(""), Err(DerpRegionUrlError::EmptyHostname));
         assert_eq!(derp_region_tls_server_name("derp.example/path"), Err(DerpRegionUrlError::InvalidHostname));
+    }
+
+    #[test]
+    fn explicit_url_port_selection_matches_pinned_scheme_fallback() {
+        assert_eq!(derp_url_port_from_parsed_parts("https", None), Ok(Some("443")));
+        assert_eq!(derp_url_port_from_parsed_parts("http", Some("")), Ok(Some("80")));
+        assert_eq!(derp_url_port_from_parsed_parts("https", Some("443")), Ok(Some("443")));
+        assert_eq!(derp_url_port_from_parsed_parts("http", Some("0080")), Ok(Some("0080")));
+        assert_eq!(derp_url_port_from_parsed_parts("ftp", Some("70000")), Ok(Some("70000")));
+        assert_eq!(derp_url_port_from_parsed_parts("ftp", None), Ok(None));
+        assert_eq!(derp_url_port_from_parsed_parts("HTTPS", None), Ok(None));
+        assert_eq!(derp_url_port_from_parsed_parts("https", Some("443x")), Err(DerpUrlPortError::InvalidPortText));
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
