@@ -362,12 +362,54 @@ pub const MAX_SERVER_INFO_PAYLOAD_LEN: usize = SERVER_INFO_NONCE_LEN + MAX_SERVE
 /// field order, null-as-no-op behavior, and signed 64-bit integer range. It
 /// rejects non-ASCII field names rather than silently misreading Go's Unicode
 /// simple-fold matches; malformed UTF-8 and Go's exact JSON error wording also
-/// intentionally remain outside this parser's compatibility claim.
+/// intentionally remain outside this parser's compatibility claim. The `i64`
+/// values match Go `int` on 64-bit targets; 32-bit integer overflow behavior is
+/// outside this slice.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ServerInfo {
     pub version: i64,
     pub token_bucket_bytes_per_second: i64,
     pub token_bucket_bytes_burst: i64,
+}
+
+/// The message shape that the pinned fork's `Client.Recv` returns for ServerInfo.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServerInfoMessage {
+    pub token_bucket_bytes_per_second: i64,
+    pub token_bucket_bytes_burst: i64,
+}
+
+/// Configuration passed to the pinned fork's `rate.NewLimiter` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SendRateLimiterConfig {
+    pub bytes_per_second: i64,
+    pub burst: i64,
+}
+
+impl ServerInfo {
+    /// Drops the JSON version field and produces the `Client.Recv` message.
+    pub fn into_message(self) -> ServerInfoMessage {
+        ServerInfoMessage {
+            token_bucket_bytes_per_second: self.token_bucket_bytes_per_second,
+            token_bucket_bytes_burst: self.token_bucket_bytes_burst,
+        }
+    }
+}
+
+impl ServerInfoMessage {
+    /// Mirrors `setSendRateLimiter`: zero rate disables the limiter; any nonzero
+    /// rate creates a limiter with the exact supplied rate and burst values.
+    /// This returns configuration only and is not a token-bucket implementation.
+    pub fn rate_limiter_config(self) -> Option<SendRateLimiterConfig> {
+        if self.token_bucket_bytes_per_second == 0 {
+            None
+        } else {
+            Some(SendRateLimiterConfig {
+                bytes_per_second: self.token_bucket_bytes_per_second,
+                burst: self.token_bucket_bytes_burst,
+            })
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for ServerInfo {
@@ -546,6 +588,19 @@ pub fn parse_server_info_frame(
     Ok((info, FRAME_HEADER_LEN + payload_len))
 }
 
+/// Parses a ServerInfo frame and maps it to the message returned by `Client.Recv`.
+///
+/// No limiter is installed; use [`ServerInfoMessage::rate_limiter_config`] to
+/// inspect the source-compatible configuration decision.
+pub fn parse_server_info_message_frame(
+    client_private: &NodePrivate,
+    server_public: &NodePublic,
+    frame: &[u8],
+) -> Result<(ServerInfoMessage, usize), ServerInfoFrameError> {
+    let (info, consumed) = parse_server_info_frame(client_private, server_public, frame)?;
+    Ok((info.into_message(), consumed))
+}
+
 fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
     if !*first {
         output.push(',');
@@ -720,6 +775,12 @@ mod tests {
         assert_eq!(info.version, 2);
         assert_eq!(info.token_bucket_bytes_per_second, 16_777_216);
         assert_eq!(info.token_bucket_bytes_burst, 4_194_304);
+
+        let (message, message_len) =
+            super::parse_server_info_message_frame(&alice, &bob.public().unwrap(), &wire).unwrap();
+        assert_eq!(message_len, consumed);
+        assert_eq!(message.token_bucket_bytes_per_second, 16_777_216);
+        assert_eq!(message.token_bucket_bytes_burst, 4_194_304);
     }
 
     #[test]
@@ -769,6 +830,32 @@ mod tests {
             super::parse_server_info_frame(&alice, &bob_public, &wrong_type),
             Err(super::ServerInfoFrameError::UnexpectedType { got: FRAME_CLIENT_INFO })
         ));
+    }
+
+    #[test]
+    fn server_info_message_maps_fields_and_limiter_branch_like_pinned_client() {
+        let unspecified =
+            super::ServerInfo { version: 2, token_bucket_bytes_per_second: 0, token_bucket_bytes_burst: 99 }
+                .into_message();
+        assert_eq!(
+            unspecified,
+            super::ServerInfoMessage { token_bucket_bytes_per_second: 0, token_bucket_bytes_burst: 99 }
+        );
+        assert_eq!(unspecified.rate_limiter_config(), None);
+
+        let configured =
+            super::ServerInfo { version: 123, token_bucket_bytes_per_second: 4096, token_bucket_bytes_burst: 0 }
+                .into_message();
+        assert_eq!(
+            configured.rate_limiter_config(),
+            Some(super::SendRateLimiterConfig { bytes_per_second: 4096, burst: 0 })
+        );
+
+        let negative = super::ServerInfoMessage { token_bucket_bytes_per_second: -1, token_bucket_bytes_burst: -7 };
+        assert_eq!(
+            negative.rate_limiter_config(),
+            Some(super::SendRateLimiterConfig { bytes_per_second: -1, burst: -7 })
+        );
     }
 
     #[test]
