@@ -169,7 +169,7 @@ mod tests {
 
     fn decode_hex(input: &str) -> [u8; 32] {
         let mut out = [0; 32];
-        for (index, pair) in input.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in input.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hex = std::str::from_utf8(pair).unwrap();
             out[index] = u8::from_str_radix(hex, 16).unwrap();
         }
@@ -181,11 +181,9 @@ mod tests {
     }
 
     fn decode_wire(input: &str) -> Vec<u8> {
-        input
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect()
+        let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        pairs.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()
     }
 
     #[test]
