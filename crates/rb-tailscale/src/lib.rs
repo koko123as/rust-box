@@ -17,9 +17,10 @@
 //! Pong writes through an injected asynchronous task spawner (using detached Rust
 //! threads by default), reports failures through a caller-provided logger, and
 //! continues receiving. Targeted tests cover individual protocol slices; they do
-//! not constitute full endpoint compatibility or Go scheduler parity. The
-//! ForwardPacket five-second connection-close watchdog, derphttp closed-state
-//! behavior, and the complete Tailscale endpoint runtime remain unimplemented.
+//! not constitute full endpoint compatibility or Go scheduler parity. The shared
+//! writer's ForwardPacket path now requires a connection-close handle and arms the
+//! pinned five-second watchdog; the stateless codec does not. `derphttp` closed-state
+//! behavior and the complete Tailscale endpoint runtime remain unimplemented.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;

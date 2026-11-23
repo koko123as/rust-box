@@ -10,13 +10,16 @@
 //! transition and a bounded SendPacket writer are oracle-tested. `DerpSendWriter`
 //! serializes packet, Ping/Pong, NotePreferred, WatchConnectionChanges, and ClosePeer
 //! writes under one lock. ForwardPacket's bounded frame writer is also covered, but
-//! its five-second connection-close timeout, other writer methods, automatic Ping
-//! replies, and server authentication remain unimplemented.
+//! the shared-writer path now requires an out-of-lock connection closer and arms the
+//! pinned five-second watchdog; the stateless helper remains unguarded. `magicsock`
+//! handles only the higher-level Ping->Pong branch; complete network lifecycle and
+//! server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -31,6 +34,8 @@ pub const FRAME_HEADER_LEN: usize = 5;
 pub const KEY_LEN: usize = 32;
 /// Maximum packet length accepted by the pinned fork's `Client.Send`.
 pub const MAX_PACKET_SIZE: usize = 64 << 10;
+/// Pinned fork timeout before `ForwardPacket` closes the underlying connection.
+pub const FORWARD_PACKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum payload length accepted by the pinned fork's `WriteFrame`.
 pub const MAX_FRAME_WRITE_SIZE: usize = 10 << 20;
 /// Maximum single frame payload accepted by the pinned fork's `Client.Recv`.
@@ -430,6 +435,8 @@ impl Error for SendPacketError {
 #[derive(Debug)]
 pub enum ForwardPacketError {
     PacketTooBig { packet_len: usize },
+    MissingConnectionCloser,
+    WatchdogStart(io::Error),
     StreamWrite(StreamWriteFrameError),
 }
 
@@ -437,6 +444,8 @@ impl fmt::Display for ForwardPacketError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PacketTooBig { packet_len } => write!(f, "derp.ForwardPacket: packet too big: {packet_len}"),
+            Self::MissingConnectionCloser => f.write_str("derp.ForwardPacket: connection close handle is required"),
+            Self::WatchdogStart(error) => write!(f, "derp.ForwardPacket: failed to start write timeout: {error}"),
             Self::StreamWrite(error) => write!(f, "derp.ForwardPacket: {error}"),
         }
     }
@@ -446,7 +455,8 @@ impl Error for ForwardPacketError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::StreamWrite(error) => Some(error),
-            Self::PacketTooBig { .. } => None,
+            Self::WatchdogStart(error) => Some(error),
+            Self::PacketTooBig { .. } | Self::MissingConnectionCloser => None,
         }
     }
 }
@@ -454,9 +464,9 @@ impl Error for ForwardPacketError {
 /// Writes and flushes one mesh ForwardPacket frame using the pinned fork's
 /// 64 KiB packet limit, source/destination key order, and wrapping error text.
 ///
-/// This stateless slice does not apply the Send rate limiter or own the shared
-/// writer mutex. It also does not model Go's five-second timer that closes the
-/// connection if a write remains blocked; the complete Client lifecycle is absent.
+/// This stateless slice does not apply the Send rate limiter, own the shared
+/// writer mutex, or provide Go's five-second close watchdog. Use
+/// [`DerpSendWriter::forward_packet`] for the shared-writer client path.
 pub fn forward_packet_to<W: Write>(
     writer: &mut W,
     source: NodePublic,
@@ -541,6 +551,34 @@ fn write_send_segment<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), Stre
     Ok(())
 }
 
+/// A connection close operation that can interrupt a blocked writer without
+/// acquiring the DERP writer mutex. The callback's close error is intentionally
+/// ignored, like the pinned fork's `net.Conn.Close` call.
+pub type DerpConnectionCloser = Arc<dyn Fn() + Send + Sync + 'static>;
+
+struct ForwardPacketWatchdog {
+    cancel: mpsc::SyncSender<()>,
+}
+
+impl ForwardPacketWatchdog {
+    fn start(timeout: Duration, close_connection: DerpConnectionCloser) -> io::Result<Self> {
+        let (cancel, canceled) = mpsc::sync_channel(1);
+        let handle = std::thread::Builder::new().spawn(move || {
+            if canceled.recv_timeout(timeout).is_err() {
+                close_connection();
+            }
+        })?;
+        drop(handle);
+        Ok(Self { cancel })
+    }
+}
+
+impl Drop for ForwardPacketWatchdog {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+    }
+}
+
 struct DerpSendWriterState<W> {
     writer: W,
     limiter: Option<DerpSendRateLimiter>,
@@ -551,18 +589,37 @@ struct DerpSendWriterState<W> {
 /// This mirrors the pinned fork's `Client.wmu` for `Send`, `ForwardPacket`, `Ping`,
 /// and `Pong`: frame writes are serialized, `Send` rate-limit checks and its send
 /// timestamp are sampled under the lock, and packet-size checks happen before it.
-/// Route every operation on the underlying writer through this owner to avoid
-/// byte-level frame interleaving.
-/// Other DERP writer methods and the complete client lifecycle are not implemented.
-/// This type also does not emulate Go `bufio.Writer.AvailableBuffer` internals.
+/// `forward_packet` requires an out-of-lock connection closer and arms the pinned
+/// five-second watchdog after acquiring the lock. Route every operation on the
+/// underlying writer through this owner to avoid byte-level frame interleaving.
+/// The complete client lifecycle and Go `bufio.Writer.AvailableBuffer` internals
+/// are not implemented.
 pub struct DerpSendWriter<W> {
     state: Mutex<DerpSendWriterState<W>>,
+    connection_closer: Option<DerpConnectionCloser>,
 }
 
 impl<W> DerpSendWriter<W> {
     /// Takes ownership of the stream writer and the optional send-rate limiter.
+    ///
+    /// This protocol-only constructor has no connection close handle; its
+    /// `forward_packet` method fails closed. Use `new_with_connection_closer` for
+    /// a live connection that needs the pinned write-timeout behavior.
     pub fn new(writer: W, limiter: Option<DerpSendRateLimiter>) -> Self {
-        Self { state: Mutex::new(DerpSendWriterState { writer, limiter }) }
+        Self { state: Mutex::new(DerpSendWriterState { writer, limiter }), connection_closer: None }
+    }
+
+    /// Constructs a writer whose close callback can interrupt a blocked write.
+    ///
+    /// The callback must close the underlying connection independently of the
+    /// writer mutex and should return promptly. The callback is invoked only by a
+    /// timed-out `ForwardPacket`.
+    pub fn new_with_connection_closer(
+        writer: W,
+        limiter: Option<DerpSendRateLimiter>,
+        connection_closer: DerpConnectionCloser,
+    ) -> Self {
+        Self { state: Mutex::new(DerpSendWriterState { writer, limiter }), connection_closer: Some(connection_closer) }
     }
 }
 
@@ -584,22 +641,39 @@ impl<W: Write> DerpSendWriter<W> {
         send_packet_to(writer, destination, packet, limiter.as_mut(), now)
     }
 
-    /// Writes one ForwardPacket under the same mutex used by all other methods.
+    /// Writes one ForwardPacket under the shared mutex and arms the five-second watchdog.
     ///
     /// The packet-size check occurs before acquiring the lock, like the Go client.
-    /// This method mirrors its wire bytes and wrapped write errors, but not the
-    /// five-second asynchronous connection-close timeout for a blocked write.
+    /// A connection closer is mandatory; missing handles and watchdog startup
+    /// failures return without writing. The close callback runs independently of
+    /// this mutex so it can interrupt a blocked write.
     pub fn forward_packet(
         &self,
         source: NodePublic,
         destination: NodePublic,
         packet: &[u8],
     ) -> Result<(), ForwardPacketError> {
+        self.forward_packet_with_timeout(source, destination, packet, FORWARD_PACKET_WRITE_TIMEOUT)
+    }
+
+    fn forward_packet_with_timeout(
+        &self,
+        source: NodePublic,
+        destination: NodePublic,
+        packet: &[u8],
+        timeout: Duration,
+    ) -> Result<(), ForwardPacketError> {
         if packet.len() > MAX_PACKET_SIZE {
             return Err(ForwardPacketError::PacketTooBig { packet_len: packet.len() });
         }
+        let close_connection =
+            self.connection_closer.as_ref().cloned().ok_or(ForwardPacketError::MissingConnectionCloser)?;
         let mut state = self.lock_state();
-        forward_packet_to(&mut state.writer, source, destination, packet)
+        let watchdog =
+            ForwardPacketWatchdog::start(timeout, close_connection).map_err(ForwardPacketError::WatchdogStart)?;
+        let result = forward_packet_to(&mut state.writer, source, destination, packet);
+        drop(watchdog);
+        result
     }
 
     /// Sends a Ping frame without applying the packet rate limiter.
@@ -1904,6 +1978,28 @@ mod tests {
         }
     }
 
+    struct WatchdogBlockingWriter {
+        started: Option<std::sync::mpsc::Sender<()>>,
+        closed: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Write for WatchdogBlockingWriter {
+        fn write(&mut self, _input: &[u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).map_err(|_| io::Error::other("test start receiver dropped"))?;
+                self.closed
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "watchdog did not close connection"))?;
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed"));
+            }
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct ChunkedDuplex {
         incoming: Vec<u8>,
         read_position: usize,
@@ -2348,7 +2444,12 @@ mod tests {
         assert_eq!(max_wire, before);
 
         let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
-        let writer = DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None);
+        let closer: super::DerpConnectionCloser = Arc::new(|| {});
+        let writer = DerpSendWriter::new_with_connection_closer(
+            YieldingWriter { observation: Arc::clone(&observation) },
+            None,
+            Arc::clone(&closer),
+        );
         writer.forward_packet(source, destination, &[0x55; 8]).unwrap();
         let observation = observation.lock().unwrap();
         let mut expected = vec![0x0a, 0, 0, 0, 72];
@@ -2358,10 +2459,76 @@ mod tests {
         assert_eq!(observation.bytes, expected);
         assert_eq!(observation.flushes, 1);
 
-        let writer = DerpSendWriter::new(FailingWriter, None);
+        let writer = DerpSendWriter::new_with_connection_closer(FailingWriter, None, closer);
         let error = writer.forward_packet(source, destination, &[0x55; 8]).unwrap_err();
         assert_eq!(error.to_string(), "derp.ForwardPacket: write failed");
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn forward_packet_fails_closed_without_a_connection_closer() {
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None);
+        let error = writer
+            .forward_packet(NodePublic::from_raw32([0x31; 32]), NodePublic::from_raw32([0x42; 32]), &[1])
+            .unwrap_err();
+        assert_eq!(error.to_string(), "derp.ForwardPacket: connection close handle is required");
+        assert!(observation.lock().unwrap().bytes.is_empty());
+    }
+
+    #[test]
+    fn forward_packet_watchdog_closes_outside_the_writer_lock() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let close_calls = Arc::new(Mutex::new(0));
+        let close_calls_in_callback = Arc::clone(&close_calls);
+        let closer: super::DerpConnectionCloser = Arc::new(move || {
+            *close_calls_in_callback.lock().unwrap() += 1;
+            closed_tx.send(()).unwrap();
+        });
+        let writer = DerpSendWriter::new_with_connection_closer(
+            WatchdogBlockingWriter { started: Some(started_tx), closed: closed_rx },
+            None,
+            closer,
+        );
+        assert_eq!(super::FORWARD_PACKET_WRITE_TIMEOUT, Duration::from_secs(5));
+
+        let error = writer
+            .forward_packet_with_timeout(
+                NodePublic::from_raw32([0x31; 32]),
+                NodePublic::from_raw32([0x42; 32]),
+                &[0x55; 8],
+                Duration::from_millis(25),
+            )
+            .unwrap_err();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(error.to_string(), "derp.ForwardPacket: connection closed");
+        assert_eq!(*close_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn forward_packet_watchdog_is_canceled_when_write_returns() {
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let close_calls = Arc::new(Mutex::new(0));
+        let close_calls_in_callback = Arc::clone(&close_calls);
+        let closer: super::DerpConnectionCloser = Arc::new(move || {
+            *close_calls_in_callback.lock().unwrap() += 1;
+        });
+        let writer = DerpSendWriter::new_with_connection_closer(
+            YieldingWriter { observation: Arc::clone(&observation) },
+            None,
+            closer,
+        );
+        writer
+            .forward_packet_with_timeout(
+                NodePublic::from_raw32([0x31; 32]),
+                NodePublic::from_raw32([0x42; 32]),
+                &[0x55; 8],
+                Duration::from_millis(20),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(*close_calls.lock().unwrap(), 0);
     }
 
     #[test]
@@ -2397,7 +2564,11 @@ mod tests {
         const OPERATIONS_PER_THREAD: usize = 12;
 
         let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
-        let writer = Arc::new(DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None));
+        let writer = Arc::new(DerpSendWriter::new_with_connection_closer(
+            YieldingWriter { observation: Arc::clone(&observation) },
+            None,
+            Arc::new(|| {}),
+        ));
         let start = Arc::new(Barrier::new(THREADS + 1));
         let source = NodePublic::from_raw32([0x6b; 32]);
         let destination = NodePublic::from_raw32([0x5a; 32]);
