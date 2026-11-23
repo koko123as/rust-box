@@ -29,6 +29,8 @@
 //! operate only on already-parsed scheme/port and debug inputs. A separate pure
 //! region dial-port selector models the 443/3340 fallback and nonzero DERPPort
 //! override, rejecting values outside the TCP port range; it does not open sockets.
+//! A separate proxy port selector mirrors `dialNodeUsingProxy`'s exact-`https` 443
+//! versus other-scheme 80 fallback for already-parsed fields; it does not parse or dial.
 //! The `shouldDialProto` family decision and `startDial` target/family guard accept
 //! already-classified address fields. A limited IP-field classifier supports empty,
 //! canonical dotted IPv4 and IPv6 address parts containing ASCII hexadecimal digits,

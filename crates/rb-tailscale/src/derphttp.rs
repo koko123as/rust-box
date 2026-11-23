@@ -419,6 +419,22 @@ pub fn derp_region_dial_port(derp_port: isize, use_https: bool) -> Result<String
     Ok(port.to_string())
 }
 
+/// Selects `dialNodeUsingProxy`'s port from already-parsed proxy URL parts.
+///
+/// Only the exact `https` scheme uses default port 443; all other schemes use
+/// 80. A non-empty parsed port is returned verbatim, without further validation.
+/// This does not parse a proxy URL, format a host, or establish a connection.
+pub fn derp_proxy_dial_port_from_parsed_parts<'a>(proxy_scheme: &str, parsed_port: &'a str) -> &'a str {
+    if !parsed_port.is_empty() {
+        return parsed_port;
+    }
+    if proxy_scheme == "https" {
+        "443"
+    } else {
+        "80"
+    }
+}
+
 /// An already-classified DERP node address field; no text parsing is performed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DerpParsedDialField {
@@ -1028,14 +1044,14 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_dial_field_from_supported_text, derp_region_dial_port, derp_region_tls_server_name,
-        derp_region_url_string, derp_should_dial_proto_from_parsed, derp_should_dial_proto_from_supported_text,
-        derp_start_dial_host_port, derp_start_dial_target_from_parsed, derp_url_port_from_parsed_parts, derp_use_https,
-        ping_deadline, DerpClientState, DerpDialProtocol, DerpParsedDialField, DerpParsedDialTarget,
-        DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpStartDialRace,
-        DerpStartDialRaceError, DerpStartDialRaceOutcome, DerpUnsupportedDialAddressText, DerpUrlPortError,
-        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
-        DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_dial_field_from_supported_text, derp_proxy_dial_port_from_parsed_parts, derp_region_dial_port,
+        derp_region_tls_server_name, derp_region_url_string, derp_should_dial_proto_from_parsed,
+        derp_should_dial_proto_from_supported_text, derp_start_dial_host_port, derp_start_dial_target_from_parsed,
+        derp_url_port_from_parsed_parts, derp_use_https, ping_deadline, DerpClientState, DerpDialProtocol,
+        DerpParsedDialField, DerpParsedDialTarget, DerpPingCancellationToken, DerpPongResponseRegistry,
+        DerpRegionUrlError, DerpStartDialRace, DerpStartDialRaceError, DerpStartDialRaceOutcome,
+        DerpUnsupportedDialAddressText, DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError,
+        DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -1187,6 +1203,23 @@ mod tests {
         assert_eq!(derp_url_port_from_parsed_parts("ftp", None), Ok(None));
         assert_eq!(derp_url_port_from_parsed_parts("HTTPS", None), Ok(None));
         assert_eq!(derp_url_port_from_parsed_parts("https", Some("443x")), Err(DerpUrlPortError::InvalidPortText));
+    }
+
+    #[test]
+    fn proxy_dial_port_matches_first_str_and_exact_https_fallback() {
+        let cases = [
+            ("https", "", "443"),
+            ("http", "", "80"),
+            ("socks5", "", "80"),
+            ("HTTPS", "", "80"),
+            ("https", "8443", "8443"),
+            ("http", "443", "443"),
+            ("https", "not-a-port", "not-a-port"),
+        ];
+
+        for (scheme, parsed_port, expected) in cases {
+            assert_eq!(derp_proxy_dial_port_from_parsed_parts(scheme, parsed_port), expected);
+        }
     }
 
     #[test]
