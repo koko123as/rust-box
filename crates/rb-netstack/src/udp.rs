@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
-use crate::packet;
+use crate::{packet, Command};
 
 /// sing-box `udp_mapping` / `udp_filtering` (RFC 4787 behaviors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,6 +23,61 @@ pub enum NatBehavior {
 
 /// Packets a session queues before it drops new ones.
 const SESSION_QUEUE: usize = 256;
+
+/// A UDP client socket opened through the user-space IP stack.
+pub struct ClientUdpConn {
+    source: SocketAddr,
+    commands: mpsc::Sender<Command>,
+    packets: AsyncMutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+}
+
+impl ClientUdpConn {
+    pub(crate) fn new(
+        source: SocketAddr,
+        commands: mpsc::Sender<Command>,
+        packets: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    ) -> Self {
+        ClientUdpConn { source, commands, packets: AsyncMutex::new(packets) }
+    }
+
+    /// The virtual local address assigned by the stack.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.source
+    }
+
+    /// Sends one UDP datagram through the stack.
+    pub async fn send_to(&self, data: &[u8], destination: SocketAddr) -> io::Result<()> {
+        if data.len() > 65507 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP payload is too large"));
+        }
+        if self.source.is_ipv4() != destination.is_ipv4() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP address family mismatch"));
+        }
+        self.commands
+            .send(Command::SendUdp { source: self.source, destination, data: data.to_vec() })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped"))
+    }
+
+    /// Reads the next datagram and its source address. The payload is
+    /// truncated to the supplied buffer, like a UDP socket.
+    pub async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let mut packets = self.packets.lock().await;
+        let (data, source) = packets
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "UDP stack connection closed"))?;
+        let length = data.len().min(buffer.len());
+        buffer[..length].copy_from_slice(&data[..length]);
+        Ok((length, source))
+    }
+}
+
+impl Drop for ClientUdpConn {
+    fn drop(&mut self) {
+        let _ = self.commands.try_send(Command::CloseUdp { source: self.source });
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NatKey {

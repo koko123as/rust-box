@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/quinn-proto"]
+exclude = ["vendor/quinn-proto", "vendor/rustls"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,6 +29,7 @@ rb-cachefile = { path = "crates/rb-cachefile" }
 rb-group = { path = "crates/rb-group" }
 rb-clashapi = { path = "crates/rb-clashapi" }
 rb-netstack = { path = "crates/rb-netstack" }
+boringtun = "=0.7.1"
 rb-platform = { path = "crates/rb-platform" }
 rb-tun = { path = "crates/rb-tun" }
 tokio = { version = "1", features = ["full"] }
@@ -67,6 +68,9 @@ socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 httparse = "1"
 rand = "0.9"
+zeroize = "1"
+crypto_secretbox = { version = "=0.1.1", default-features = false, features = ["alloc", "salsa20"] }
+salsa20 = { version = "=0.10.2", default-features = false, features = ["zeroize"] }
 flate2 = "1"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"
@@ -85,5 +89,6 @@ codegen-units = 1
 strip = true
 
 [patch.crates-io]
+rustls = { path = "vendor/rustls" }
 quinn-proto = { path = "vendor/quinn-proto" }
 h3-quinn = { path = "vendor/h3-quinn" }

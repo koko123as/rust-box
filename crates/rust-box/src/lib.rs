@@ -19,14 +19,14 @@ use rb_adapter::{
 };
 use rb_cachefile::CacheFile;
 use rb_clashapi::{ApiParts, ClashApi, ModeManager, TrafficManager};
-use rb_config::{Inbound as InboundOptions, Options, Outbound as OutboundOptions};
+use rb_config::{Endpoint as EndpointOptions, Inbound as InboundOptions, Options, Outbound as OutboundOptions};
 use rb_dialer::{DialerEnv, NetworkDefaults};
 use rb_dns::DnsRouter;
 use rb_group::{GroupContext, Selector, UrlTest};
 use rb_protocol::{
-    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, ProxyInbound, ProxyKind, ShadowsocksInbound,
-    ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound, VlessInbound,
-    VlessOutbound, VmessInbound, VmessOutbound,
+    Block, Direct, HttpOutbound, Hysteria2Inbound, Hysteria2Outbound, NaiveOutbound, ProxyInbound, ProxyKind,
+    ShadowsocksInbound, ShadowsocksOutbound, SocksOutbound, TrojanInbound, TrojanOutbound, TuicInbound, TuicOutbound,
+    VlessInbound, VlessOutbound, VmessInbound, VmessOutbound, WireGuardOutbound,
 };
 use rb_route::{Management, Router};
 use rb_rule::{RuleSet, RuleSets};
@@ -75,6 +75,7 @@ enum Group {
 
 pub struct RustBox {
     inbounds: Vec<Arc<dyn Inbound>>,
+    endpoints: Vec<Arc<WireGuardOutbound>>,
     pub router: Arc<Router>,
     pub dns: Arc<DnsRouter>,
     certificates: Arc<rb_certificate::Store>,
@@ -201,6 +202,10 @@ impl RustBox {
                     HttpOutbound::new(http, tag, &dialer_env, &certificates)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
                 ),
+                OutboundOptions::Naive(naive) => Arc::new(
+                    NaiveOutbound::new(naive, tag, &dialer_env, &certificates)
+                        .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?,
+                ),
                 OutboundOptions::Shadowsocks(shadowsocks) => {
                     let built: Arc<dyn Outbound> = ShadowsocksOutbound::new(shadowsocks, tag, &dialer_env)
                         .map_err(|error| anyhow!("outbounds[{index}]: {error}"))?;
@@ -245,6 +250,23 @@ impl RustBox {
             };
             outbounds.push(built);
         }
+        let mut endpoints: Vec<Arc<WireGuardOutbound>> = Vec::new();
+        for (index, endpoint) in options.endpoints.iter().enumerate() {
+            let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+            match endpoint {
+                EndpointOptions::WireGuard(wireguard) => {
+                    let built = Arc::new(
+                        WireGuardOutbound::new(wireguard, tag, &dialer_env, &format!("endpoints[{index}]"))
+                            .map_err(anyhow::Error::msg)?,
+                    );
+                    outbounds.push(built.clone() as Arc<dyn Outbound>);
+                    endpoints.push(built);
+                }
+                EndpointOptions::Tailscale(_) => {
+                    return Err(anyhow!("endpoints[{index}]: Tailscale endpoint runtime is not implemented yet"));
+                }
+            }
+        }
         if outbounds.is_empty() {
             // sing-box adds a default direct outbound when none is configured.
             outbounds.push(Arc::new(
@@ -265,6 +287,9 @@ impl RustBox {
             )
             .context("initialize router")?,
         );
+        for endpoint in &endpoints {
+            endpoint.set_router(router.clone());
+        }
         let traffic = experimental.clash_api.as_ref().map(|_| TrafficManager::new());
         let trackers: Vec<Arc<dyn ConnectionTracker>> =
             traffic.iter().map(|traffic| Arc::new(traffic.clone()) as Arc<dyn ConnectionTracker>).collect();
@@ -345,6 +370,7 @@ impl RustBox {
         inbound_registry.set(&inbounds);
         Ok(RustBox {
             inbounds,
+            endpoints,
             router,
             dns: dns_router,
             certificates,
@@ -408,6 +434,22 @@ impl RustBox {
         }
         self.start_rule_sets().await.context("start router")?;
         self.dns.start(&self.rule_sets).context("start dns-router")?;
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if let Err(error) = endpoint.start_stack().await {
+                for started in self.endpoints[..index].iter().rev() {
+                    started.close();
+                }
+                return Err(anyhow!("start endpoint/wireguard[{}]: {error}", endpoint.tag()));
+            }
+        }
+        for endpoint in &self.endpoints {
+            if let Err(error) = endpoint.start_transports().await {
+                for started in self.endpoints.iter().rev() {
+                    started.close();
+                }
+                return Err(anyhow!("start endpoint/wireguard[{}]: {error}", endpoint.tag()));
+            }
+        }
         for inbound in &self.inbounds {
             inbound
                 .clone()
@@ -443,6 +485,9 @@ impl RustBox {
         self.dns.close();
         for inbound in self.inbounds.iter().rev() {
             inbound.close().await;
+        }
+        for endpoint in self.endpoints.iter().rev() {
+            endpoint.close();
         }
         for rule_set in &self.managed_rule_sets {
             rule_set.close();

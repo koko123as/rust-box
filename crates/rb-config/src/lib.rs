@@ -16,9 +16,11 @@ pub mod quic;
 pub mod rule;
 pub mod rule_set;
 pub mod srs;
+pub mod tailscale;
 pub mod tls;
 pub mod tun;
 pub mod types;
+pub mod wireguard;
 
 use std::net::IpAddr;
 
@@ -42,8 +44,10 @@ pub use rule_set::{
     DefaultHeadlessRule, HeadlessRule, LogicalHeadlessRule, PlainRuleSet, PlainRuleSetCompat, RemoteRuleSet,
     RuleSetKind, RuleSetOptions,
 };
-pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions};
+pub use tailscale::{TailscaleEndpointOptions, TailscaleSshServerOptions, TailscaleSshServerSettings};
+pub use tls::{Base64Bytes, ClientAuthType, CurvePreference, InboundTlsOptions, OutboundTlsOptions, UtlsOptions};
 pub use types::{DomainResolveOptions, DomainStrategy, Duration, IpPrefix, Listable, QueryType, UdpTimeout, User};
+pub use wireguard::{Endpoint, WireGuardEndpointOptions, WireGuardPeer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -57,7 +61,7 @@ pub enum ConfigError {
 
 /// Top-level sections sing-box has and rust-box does not implement yet.
 const UNSUPPORTED_SECTIONS: &[&str] =
-    &["ntp", "certificate_providers", "endpoints", "services", "http_clients", "network_namespaces"];
+    &["ntp", "certificate_providers", "services", "http_clients", "network_namespaces"];
 
 /// sing-box `option.Options`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -73,6 +77,8 @@ pub struct Options {
     pub inbounds: Vec<Inbound>,
     #[serde(default)]
     pub outbounds: Vec<Outbound>,
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub route: RouteOptions,
     #[serde(default)]
@@ -535,6 +541,8 @@ pub enum Outbound {
     Selector(SelectorOutbound),
     #[serde(rename = "urltest")]
     UrlTest(UrlTestOutbound),
+    #[serde(rename = "naive")]
+    Naive(NaiveOutbound),
     #[serde(rename = "tuic")]
     Tuic(TuicOutbound),
     #[serde(rename = "hysteria2")]
@@ -554,6 +562,7 @@ impl Outbound {
             Outbound::Vmess(options) => &options.tag,
             Outbound::Selector(options) => &options.tag,
             Outbound::UrlTest(options) => &options.tag,
+            Outbound::Naive(options) => &options.tag,
             Outbound::Tuic(options) => &options.tag,
             Outbound::Hysteria2(options) => &options.tag,
         }
@@ -572,6 +581,7 @@ impl Outbound {
             Outbound::Vless(options) => Some(options.dialer_options()),
             Outbound::Vmess(options) => Some(options.dialer_options()),
             Outbound::Selector(_) | Outbound::UrlTest(_) => None,
+            Outbound::Naive(options) => Some(options.dialer_options()),
             Outbound::Tuic(options) => Some(options.dialer_options()),
             Outbound::Hysteria2(options) => Some(options.dialer_options()),
         }
@@ -711,6 +721,72 @@ fn check_proxy_outbound(
         return Err(field(format!("{path}.multiplex.brutal"), "`brutal` is not supported by rust-box yet".into()));
     }
     check_v2ray_transport(&format!("{path}.transport"), transport.as_ref(), true)?;
+    Ok(())
+}
+
+fn check_naive_outbound(path: &str, options: &NaiveOutbound) -> Result<(), ConfigError> {
+    let field = |name: &str, message: String| ConfigError::Field { path: format!("{path}.{name}"), message };
+    if options.server.is_empty() {
+        return Err(field("server", "server is required".into()));
+    }
+    if options.server_port == 0 {
+        return Err(field("server_port", "server_port is required".into()));
+    }
+    if options.insecure_concurrency < 0 {
+        return Err(field("insecure_concurrency", "must not be negative".into()));
+    }
+    if options.quic {
+        return Err(field("quic", "QUIC is not supported by rust-box yet".into()));
+    }
+    if options.udp_over_tcp.as_ref().is_some_and(|uot| uot.enabled) {
+        return Err(field("udp_over_tcp", "UDP-over-TCP is not supported by rust-box yet".into()));
+    }
+    if !matches!(options.quic_congestion_control.as_str(), "" | "bbr" | "bbr2" | "cubic" | "reno") {
+        return Err(field(
+            "quic_congestion_control",
+            format!("unknown quic congestion control: {}", options.quic_congestion_control),
+        ));
+    }
+    if let Some(window) = options.stream_receive_window {
+        if window.0 < 2 || window.0 > i32::MAX as u64 {
+            return Err(field("stream_receive_window", "must be between 2 bytes and 2147483647 bytes".into()));
+        }
+    }
+    let Some(tls) = options.tls.as_ref() else {
+        return Err(field("tls", "TLS is required".into()));
+    };
+    if !tls.enabled {
+        return Err(field("tls.enabled", "TLS is required".into()));
+    }
+    tls.validate(&format!("{path}.tls"))?;
+    for (name, enabled, message) in [
+        ("disable_sni", tls.disable_sni, "disable_sni is not supported on naive outbound"),
+        ("insecure", tls.insecure, "insecure is not supported on naive outbound"),
+        ("fragment", tls.fragment, "fragment is not supported on naive outbound"),
+        ("record_fragment", tls.record_fragment, "fragment is not supported on naive outbound"),
+        ("kernel_tx", tls.kernel_tx, "kernel TLS is not supported on naive outbound"),
+        ("kernel_rx", tls.kernel_rx, "kernel TLS is not supported on naive outbound"),
+    ] {
+        if enabled {
+            return Err(field(&format!("tls.{name}"), message.into()));
+        }
+    }
+    for (name, enabled) in [
+        ("alpn", !tls.alpn.is_empty()),
+        ("min_version", !tls.min_version.is_empty()),
+        ("max_version", !tls.max_version.is_empty()),
+        ("cipher_suites", !tls.cipher_suites.is_empty()),
+        ("curve_preferences", !tls.curve_preferences.is_empty()),
+        ("client_certificate", !tls.client_certificate.is_empty()),
+        ("client_certificate_path", !tls.client_certificate_path.is_empty()),
+        ("client_key", !tls.client_key.is_empty()),
+        ("client_key_path", !tls.client_key_path.is_empty()),
+        ("certificate_public_key_sha256", !tls.certificate_public_key_sha256.is_empty()),
+    ] {
+        if enabled {
+            return Err(field(&format!("tls.{name}"), format!("{name} is not supported on naive outbound")));
+        }
+    }
     Ok(())
 }
 
@@ -1220,6 +1296,42 @@ with_dial_fields! {
 }
 
 with_dial_fields! {
+    /// sing-box v1.14.4 `NaiveOutboundOptions`; runtime currently supports
+    /// TCP over HTTP/2 and explicitly rejects QUIC and UDP-over-TCP.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NaiveOutbound {
+        #[serde(default)]
+        pub tag: String,
+        #[serde(default)]
+        pub server: String,
+        #[serde(default)]
+        pub server_port: u16,
+        #[serde(default)]
+        pub username: String,
+        #[serde(default)]
+        pub password: String,
+        #[serde(default)]
+        pub insecure_concurrency: i64,
+        /// sing-box `badoption.HTTPHeader`; string or list of values.
+        #[serde(default)]
+        pub extra_headers: Option<std::collections::BTreeMap<String, Listable<String>>>,
+        #[serde(default)]
+        pub stream_receive_window: Option<MemoryBytes>,
+        #[serde(default)]
+        pub udp_over_tcp: Option<UdpOverTcpOptions>,
+        #[serde(default)]
+        pub quic: bool,
+        #[serde(default)]
+        pub quic_congestion_control: String,
+        #[serde(default)]
+        pub quic_session_receive_window: Option<MemoryBytes>,
+        #[serde(default)]
+        pub tls: Option<OutboundTlsOptions>,
+    }
+}
+
+with_dial_fields! {
     /// sing-box `DirectOutboundOptions`: the dial fields and the removed
     /// destination override fields (rejected when set).
     #[derive(Debug, Clone, Default, Deserialize)]
@@ -1333,6 +1445,45 @@ fn validate_fakeip_ranges(value: &Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// `#[serde(tag = "type")]` buffers tagged variant content and loses the
+/// nested path for unknown fields. Preflight client TLS `utls` objects so the
+/// error matches sing-box's full field path.
+fn validate_utls_unknown_fields_in_tls(tls: &Value, path: &str) -> Result<(), ConfigError> {
+    let Some(tls_fields) = tls.as_object() else { return Ok(()) };
+    let Some(utls) = tls_fields.get("utls") else { return Ok(()) };
+    let Some(utls_fields) = utls.as_object() else { return Ok(()) };
+    for field in utls_fields.keys() {
+        if !matches!(field.as_str(), "enabled" | "fingerprint") {
+            return Err(ConfigError::Field {
+                path: format!("{path}.utls.{field}"),
+                message: format!("json: unknown field \"{field}\""),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_utls_unknown_fields(value: &Value) -> Result<(), ConfigError> {
+    let Some(root) = value.as_object() else { return Ok(()) };
+    if let Some(outbounds) = root.get("outbounds").and_then(Value::as_array) {
+        for (index, outbound) in outbounds.iter().enumerate() {
+            if let Some(tls) = outbound.as_object().and_then(|object| object.get("tls")) {
+                validate_utls_unknown_fields_in_tls(tls, &format!("outbounds[{index}].tls"))?;
+            }
+        }
+    }
+    if let Some(servers) =
+        root.get("dns").and_then(Value::as_object).and_then(|dns| dns.get("servers")).and_then(Value::as_array)
+    {
+        for (index, server) in servers.iter().enumerate() {
+            if let Some(tls) = server.as_object().and_then(|object| object.get("tls")) {
+                validate_utls_unknown_fields_in_tls(tls, &format!("dns.servers[{index}].tls"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses a configuration, naming the path of a field that fails.
 pub fn parse(content: &str) -> Result<Options, ConfigError> {
     let clean = strip_json_comments(content.as_bytes()).map_err(ConfigError::Unsupported)?;
@@ -1346,6 +1497,7 @@ pub fn parse(content: &str) -> Result<Options, ConfigError> {
     }
     validate_hosts_predefined(&value)?;
     validate_fakeip_ranges(&value)?;
+    validate_utls_unknown_fields(&value)?;
     let options: Options = serde_path_to_error::deserialize(value)
         .map_err(|error| ConfigError::Field { path: error.path().to_string(), message: error.inner().to_string() })?;
     options.validate()?;
@@ -1397,6 +1549,18 @@ impl Options {
             }
             outbound_tags.push(tag);
         }
+        let mut endpoint_tags = Vec::new();
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+            if outbound_tags.contains(&tag) {
+                return Err(field(format!("endpoints[{index}]"), format!("duplicate outbound tag: {tag}")));
+            }
+            if endpoint_tags.contains(&tag) {
+                return Err(field(format!("endpoints[{index}]"), format!("duplicate endpoint tag: {tag}")));
+            }
+            endpoint_tags.push(tag);
+        }
+        outbound_tags.extend(endpoint_tags.iter().cloned());
         let mut server_tags = Vec::new();
         for (index, server) in self.dns.servers.iter().enumerate() {
             let tag = if server.tag().is_empty() { index.to_string() } else { server.tag().to_string() };
@@ -1494,6 +1658,15 @@ impl Options {
                 tls.validate(&format!("inbounds[{index}].tls"))?;
             }
         }
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            let path = format!("endpoints[{index}]");
+            endpoint.validate(&path)?;
+            let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+            if endpoint.dialer_options().detour == tag {
+                return Err(field(format!("{path}.detour"), "circular endpoint detour".into()));
+            }
+            self.check_dialer(&path, &endpoint.dialer_options(), &server_known)?;
+        }
         for (index, outbound) in self.outbounds.iter().enumerate() {
             let path = format!("outbounds[{index}]");
             match outbound {
@@ -1517,6 +1690,10 @@ impl Options {
                         tls.validate(&format!("{path}.tls"))?;
                     }
                     self.check_dialer(&path, &http.dialer_options(), &server_known)?;
+                }
+                Outbound::Naive(naive) => {
+                    check_naive_outbound(&path, naive)?;
+                    self.check_dialer(&path, &naive.dialer_options(), &server_known)?;
                 }
                 Outbound::Shadowsocks(shadowsocks) => {
                     if !shadowsocks.plugin.is_empty() {
@@ -1707,8 +1884,12 @@ impl Options {
                 let tag = if outbound.tag().is_empty() { index.to_string() } else { outbound.tag().to_string() };
                 tag == options.detour
             });
+            let endpoint_target = self.endpoints.iter().enumerate().find(|(index, endpoint)| {
+                let tag = if endpoint.tag().is_empty() { index.to_string() } else { endpoint.tag().to_string() };
+                tag == options.detour
+            });
             match target {
-                None => {
+                None if endpoint_target.is_none() => {
                     return Err(field(
                         format!("{path}.detour"),
                         format!("outbound detour not found: {}", options.detour),
@@ -1720,6 +1901,7 @@ impl Options {
                         "detour to an empty direct outbound makes no sense".into(),
                     ))
                 }
+                None => {}
                 Some(_) => {}
             }
         }
@@ -1868,6 +2050,55 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("outbounds[0].domain_resolver.client_subnet"), "{error}");
+    }
+
+    #[test]
+    fn naive_outbound_tcp_h2_schema_and_unsupported_options() {
+        let options = parse(
+            r#"{"outbounds":[{"type":"naive","tag":"n","server":"proxy.example","server_port":443,
+                "username":"user","password":"pass","insecure_concurrency":2,
+                "extra_headers":{"X-Trace":["one","two"]},"udp_over_tcp":false,
+                "tls":{"enabled":true}}]}"#,
+        )
+        .unwrap();
+        let Outbound::Naive(naive) = &options.outbounds[0] else { panic!() };
+        assert_eq!(naive.insecure_concurrency, 2);
+        assert_eq!(naive.extra_headers.as_ref().unwrap()["X-Trace"].0, ["one", "two"]);
+        assert_eq!(naive.stream_receive_window, None);
+
+        for (config, expected) in [
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"unknown":true}]}"#,
+                "unknown field",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"quic":true}]}"#,
+                "outbounds[0].quic: QUIC is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"udp_over_tcp":true}]}"#,
+                "outbounds[0].udp_over_tcp: UDP-over-TCP is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true,"alpn":"h2"}}]}"#,
+                "outbounds[0].tls.alpn: alpn is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true,"disable_sni":true}}]}"#,
+                "outbounds[0].tls.disable_sni: disable_sni is not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"insecure_concurrency":-1}]}"#,
+                "outbounds[0].insecure_concurrency: must not be negative",
+            ),
+            (
+                r#"{"outbounds":[{"type":"naive","server":"proxy.example","server_port":443,"tls":{"enabled":true},"stream_receive_window":1}]}"#,
+                "outbounds[0].stream_receive_window: must be between",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
     }
 
     #[test]
@@ -2049,7 +2280,21 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("dns.servers[1].tls.utls: `utls` is not supported by rust-box yet"), "{error}");
+        assert!(
+            error.contains(
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet"
+            ),
+            "{error}"
+        );
+
+        let error = parse(
+            r#"{"dns":{"servers":[{"type":"local","tag":"local"},
+                {"type":"tls","server":"dns.example","domain_resolver":"local",
+                 "tls":{"utls":{"enabled":false,"unknown":true}}}]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dns.servers[1].tls.utls.unknown: json: unknown field \"unknown\""), "{error}");
 
         let error =
             parse(r#"{"dns":{"servers":[{"type":"tls","server":"1.1.1.1","unknown":true}]}}"#).unwrap_err().to_string();
@@ -2076,7 +2321,7 @@ mod tests {
                 r#"{"dns":{"servers":[{"type":"local","tag":"local"},
                     {"type":"quic","server":"dns.example","domain_resolver":"local",
                      "tls":{"utls":{"enabled":true}}}]}}"#,
-                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
             ),
             (r#"{"dns":{"servers":[{"type":"quic","server":"1.1.1.1","unknown":true}]}}"#, "unknown field `unknown`"),
         ] {
@@ -2111,7 +2356,7 @@ mod tests {
                 r#"{"dns":{"servers":[{"type":"local","tag":"local"},
                     {"type":"https","server":"dns.example","domain_resolver":"local",
                      "tls":{"utls":{"enabled":true}}}]}}"#,
-                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
             ),
             (
                 r#"{"dns":{"servers":[{"type":"https","server":"dns.example","unknown":true}]}}"#,
@@ -2148,7 +2393,7 @@ mod tests {
                 r#"{"dns":{"servers":[{"type":"local","tag":"local"},
                     {"type":"h3","server":"dns.example","domain_resolver":"local",
                      "tls":{"utls":{"enabled":true}}}]}}"#,
-                "dns.servers[1].tls.utls: `utls` is not supported by rust-box yet",
+                "dns.servers[1].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
             ),
             (r#"{"dns":{"servers":[{"type":"h3","server":"1.1.1.1","unknown":true}]}}"#, "unknown field `unknown`"),
         ] {
@@ -2256,8 +2501,12 @@ mod tests {
             (r#"{"outbounds":[{"type":"socks","network":"icmp"}]}"#, "unknown network: icmp"),
             (r#"{"outbounds":[{"type":"http","detour":"x"}]}"#, "outbounds[0].detour: outbound detour not found: x"),
             (
-                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":true}}}]}"#,
-                "outbounds[0].tls.utls: `utls` is not supported by rust-box yet",
+                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":true,"fingerprint":"chrome"}}}]}"#,
+                "outbounds[0].tls.utls.fingerprint: uTLS fingerprint `chrome` is not supported by rust-box yet",
+            ),
+            (
+                r#"{"outbounds":[{"type":"http","tls":{"enabled":true,"utls":{"enabled":false,"unknown":true}}}]}"#,
+                "outbounds[0].tls.utls.unknown: json: unknown field \"unknown\"",
             ),
             (r#"{"inbounds":[{"type":"socks","tls":{"enabled":true}}]}"#, "inbounds[0]: unknown field `tls`"),
             (
@@ -2617,7 +2866,7 @@ mod tests {
             (r#"{"outbounds":[{"type":"vless","method":"x"}]}"#, "unknown field `method`"),
             (
                 r#"{"outbounds":[{"type":"trojan","tls":{"enabled":true,"utls":{"enabled":true}}}]}"#,
-                "outbounds[0].tls.utls",
+                "outbounds[0].tls.utls.fingerprint",
             ),
         ] {
             let error = parse(config).unwrap_err().to_string();
@@ -2760,6 +3009,117 @@ mod tests {
             let config = format!(r#"{{"type":"{transport}","unknown_option":true}}"#);
             let error = serde_json::from_str::<V2RayTransportOptions>(&config).unwrap_err().to_string();
             assert!(error.contains("unknown field `unknown_option`"), "{config}: {error}");
+        }
+    }
+
+    #[test]
+    fn wireguard_endpoint_is_a_route_outbound() {
+        let options = parse(
+            r#"{"endpoints":[{"type":"wireguard","tag":"wg0","address":["10.0.0.1/24","fd00::1/64"],
+                "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "peers":[{"address":"vpn.example","port":51820,
+                    "public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                    "allowed_ips":["0.0.0.0/0","::/0"],"persistent_keepalive_interval":25,
+                    "reserved":[1,2,3]}]}],
+                "route":{"final":"wg0","rules":[{"action":"route","outbound":"wg0"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(options.endpoints[0].tag(), "wg0");
+        assert_eq!(options.endpoints[0].kind(), "wireguard");
+        let Endpoint::WireGuard(wireguard) = &options.endpoints[0] else { panic!("expected WireGuard endpoint") };
+        assert_eq!(wireguard.address.0.len(), 2);
+        assert_eq!(wireguard.peers[0].address, "vpn.example");
+        assert_eq!(wireguard.peers[0].port, 51820);
+        assert_eq!(wireguard.peers[0].allowed_ips.0.len(), 2);
+        assert_eq!(wireguard.peers[0].reserved, [1, 2, 3]);
+    }
+
+    #[test]
+    fn wireguard_reserved_matches_go_byte_slice_json() {
+        for (reserved, expected) in [("\"AQID\"", vec![1, 2, 3]), ("[1,2,3]", vec![1, 2, 3]), ("null", vec![])] {
+            let config = format!(
+                r#"{{"endpoints":[{{"type":"wireguard","private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","peers":[{{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","reserved":{reserved}}}]}}]}}"#
+            );
+            let options = parse(&config).unwrap();
+            let Endpoint::WireGuard(endpoint) = &options.endpoints[0] else { panic!("expected WireGuard endpoint") };
+            assert_eq!(endpoint.peers[0].reserved, expected);
+        }
+    }
+
+    #[test]
+    fn wireguard_endpoint_detour_may_reference_another_endpoint() {
+        let options = parse(
+            r#"{"endpoints":[{"type":"wireguard","tag":"wg0","detour":"wg1"},{"type":"wireguard","tag":"wg1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(options.endpoints[0].dialer_options().detour, "wg1");
+
+        let error = parse(r#"{"endpoints":[{"type":"wireguard","tag":"wg","detour":"wg"}]}"#).unwrap_err().to_string();
+        assert!(error.contains("endpoints[0].detour: circular endpoint detour"), "{error}");
+    }
+
+    #[test]
+    fn wireguard_endpoint_rejects_unsupported_fields_with_paths() {
+        for (config, expected) in [
+            (
+                r#"{"endpoints":[{"type":"wireguard","system":true}]}"#,
+                "endpoints[0].system: system WireGuard mode is not supported",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","name":"wg0"}]}"#,
+                "endpoints[0].name: a named system interface is not supported",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","workers":2}]}"#,
+                "endpoints[0].workers: explicit WireGuard workers are not supported",
+            ),
+            (
+                r#"{"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"wireguard","listen_port":51820,"detour":"d"}]}"#,
+                "endpoints[0]: `listen_port` is conflict with `detour`",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","peers":[{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","reserved":[1,2]}]}]}"#,
+                "endpoints[0].peers[0].reserved: reserved must contain exactly 3 bytes",
+            ),
+            (
+                r#"{"endpoints":[{"type":"wireguard","peers":[{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}]}]}"#,
+                "endpoints[0].peers[0].allowed_ips: missing peer AllowedIPs",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
+        }
+
+        let unknown_endpoint = parse(r#"{"endpoints":[{"type":"wireguard","future":true}]}"#).unwrap_err().to_string();
+        assert!(unknown_endpoint.contains("endpoints[0]") && unknown_endpoint.contains("unknown field `future`"));
+        let unknown_peer = parse(
+            r#"{"endpoints":[{"type":"wireguard","peers":[{"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","allowed_ips":"0.0.0.0/0","future":true}]}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown_peer.contains("endpoints[0]") && unknown_peer.contains("unknown field `future`"),
+            "{unknown_peer}"
+        );
+        let post_v114_field =
+            parse(r#"{"endpoints":[{"type":"wireguard","on_demand":true}]}"#).unwrap_err().to_string();
+        assert!(post_v114_field.contains("unknown field `on_demand`"), "{post_v114_field}");
+    }
+
+    #[test]
+    fn wireguard_endpoint_tags_are_unique_within_endpoint_and_outbound_managers() {
+        for (config, expected) in [
+            (
+                r#"{"endpoints":[{"type":"wireguard","tag":"wg"},{"type":"wireguard","tag":"wg"}]}"#,
+                "endpoints[1]: duplicate endpoint tag: wg",
+            ),
+            (
+                r#"{"outbounds":[{"type":"direct","tag":"wg"}],"endpoints":[{"type":"wireguard","tag":"wg"}]}"#,
+                "endpoints[0]: duplicate outbound tag: wg",
+            ),
+        ] {
+            let error = parse(config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{config}: {error}");
         }
     }
 

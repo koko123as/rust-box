@@ -71,12 +71,12 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
 
 #[test]
 fn check_verdicts_like_sing_box() {
-    let rust_box = env!("CARGO_BIN_EXE_rust-box");
+    let rust_box = std::env::var("CARGO_BIN_EXE_rust-box").expect("Cargo provides rust-box binary path");
     let sing_box = std::env::var("SING_BOX_BIN").ok().filter(|binary| !binary.is_empty());
-    assert!(check(rust_box, &tun("")).0);
+    assert!(check(&rust_box, &tun("")).0);
     for fields in SAME {
         let config = tun(fields);
-        let (ours, our_error) = check(rust_box, &config);
+        let (ours, our_error) = check(&rust_box, &config);
         if let Some(sing_box) = &sing_box {
             let (theirs, their_error) = check(sing_box, &config);
             assert_eq!(ours, theirs, "{fields}\nrust-box: {our_error}\nsing-box: {their_error}");
@@ -84,7 +84,7 @@ fn check_verdicts_like_sing_box() {
     }
     for (fields, message) in NOT_IMPLEMENTED {
         let config = tun(fields);
-        let (ours, our_error) = check(rust_box, &config);
+        let (ours, our_error) = check(&rust_box, &config);
         assert!(!ours && our_error.contains(message), "{fields}: {our_error}");
         if let Some(sing_box) = &sing_box {
             let (theirs, their_error) = check(sing_box, &config);

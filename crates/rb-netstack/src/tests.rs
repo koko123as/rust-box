@@ -354,3 +354,96 @@ async fn icmp_echo_is_answered_unless_refused() {
     let judged = handler.judged.lock().unwrap();
     assert_eq!(judged[0].2, "8.8.4.4:4660".parse().unwrap());
 }
+
+#[tokio::test]
+async fn configured_ipv4_source_is_used_for_client_udp_packet() {
+    let handler = TestHandler::new();
+    let options = StackOptions { source_addresses: vec![("192.0.2.15".parse().unwrap(), 24)], ..Default::default() };
+    let mut harness = harness(handler, options);
+    let conn = harness.stack.open_udp("198.51.100.7:53".parse().unwrap()).await.unwrap();
+    conn.send_to(b"first", "198.51.100.7:53".parse().unwrap()).await.unwrap();
+    let packet = harness.next().await.unwrap();
+    assert_eq!(parse(&packet).unwrap().src, "192.0.2.15".parse::<IpAddr>().unwrap());
+}
+
+#[tokio::test]
+async fn strict_source_addresses_reject_missing_ipv6_immediately() {
+    let handler = TestHandler::new();
+    let options = StackOptions {
+        source_addresses: vec![("192.0.2.15".parse().unwrap(), 24)],
+        strict_source_addresses: true,
+        ..Default::default()
+    };
+    let harness = harness(handler, options);
+    let error = match harness.stack.open_udp("[2001:db8::1]:53".parse().unwrap()).await {
+        Ok(_) => panic!("missing IPv6 source address should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+    assert!(error.to_string().contains("IPv6 local address"));
+}
+
+fn stack_pair(handler: Arc<TestHandler>) -> (Stack, Stack, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let (left_output, left_packets) = mpsc::channel(QUEUE_PACKETS);
+    let (right_output, right_packets) = mpsc::channel(QUEUE_PACKETS);
+    let left = Stack::new(StackOptions::default(), handler.clone(), left_output);
+    let right = Stack::new(StackOptions::default(), handler, right_output);
+    let left_input = left.input();
+    let right_input = right.input();
+    let left_to_right = tokio::spawn(async move {
+        let mut packets = left_packets;
+        while let Some(packet) = packets.recv().await {
+            if right_input.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    let right_to_left = tokio::spawn(async move {
+        let mut packets = right_packets;
+        while let Some(packet) = packets.recv().await {
+            if left_input.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    (left, right, left_to_right, right_to_left)
+}
+
+#[tokio::test]
+async fn client_tcp_connect_uses_the_stack_and_returns_a_stream() {
+    let handler = TestHandler::new();
+    let (left, right, _left_to_right, _right_to_left) = stack_pair(handler);
+    let mut connection =
+        tokio::time::timeout(Duration::from_secs(5), left.connect_tcp("93.184.216.34:443".parse().unwrap()))
+            .await
+            .expect("TCP handshake timed out")
+            .expect("TCP connection failed");
+    connection.write_all(b"wireguard tcp").await.unwrap();
+    let mut response = vec![0; 13];
+    tokio::time::timeout(Duration::from_secs(5), connection.read_exact(&mut response))
+        .await
+        .expect("TCP echo timed out")
+        .unwrap();
+    assert_eq!(&response, b"wireguard tcp");
+    drop(connection);
+    left.close();
+    right.close();
+}
+
+#[tokio::test]
+async fn client_udp_socket_sends_and_receives_through_the_stack() {
+    let handler = TestHandler::new();
+    let (left, right, _left_to_right, _right_to_left) = stack_pair(handler);
+    let connection = left.open_udp("8.8.8.8:53".parse().unwrap()).await.unwrap();
+    connection.send_to(b"wireguard udp", "8.8.8.8:53".parse().unwrap()).await.unwrap();
+    let mut response = [0; 32];
+    let (length, source) = tokio::time::timeout(Duration::from_secs(5), connection.recv_from(&mut response))
+        .await
+        .expect("UDP echo timed out")
+        .unwrap();
+    assert_eq!(&response[..length], b"wireguard udp");
+    assert_eq!(source, "8.8.8.8:53".parse().unwrap());
+    drop(connection);
+    left.close();
+    right.close();
+}

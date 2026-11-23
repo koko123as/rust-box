@@ -19,6 +19,7 @@ mod udp;
 mod tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,13 +28,13 @@ use async_trait::async_trait;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp as smol_tcp;
-use smoltcp::wire::{HardwareAddress, IpCidr, IpListenEndpoint};
-use tokio::sync::{mpsc, Notify};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 pub use packet::{build_udp, is_global_unicast, parse, Parsed};
 pub use tcp::TcpConn;
-pub use udp::{NatBehavior, UdpReply, UdpSession};
+pub use udp::{ClientUdpConn, NatBehavior, UdpReply, UdpSession};
 
 use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SYN};
 use tcp::{Shared, QUEUE_LIMIT};
@@ -93,6 +94,10 @@ pub struct StackOptions {
     /// The TUN interface's own addresses, which the stack's internal
     /// addresses must differ from.
     pub interface_addresses: Vec<IpAddr>,
+    /// Local addresses from the tunnel configuration, with their CIDR prefixes.
+    pub source_addresses: Vec<(IpAddr, u8)>,
+    /// Require a configured local address for the destination's address family.
+    pub strict_source_addresses: bool,
 }
 
 impl Default for StackOptions {
@@ -103,6 +108,8 @@ impl Default for StackOptions {
             udp_filtering: NatBehavior::default(),
             udp_nat_max: 0,
             interface_addresses: Vec::new(),
+            source_addresses: Vec::new(),
+            strict_source_addresses: false,
         }
     }
 }
@@ -115,6 +122,7 @@ pub const QUEUE_PACKETS: usize = 1024;
 /// A running stack. Dropping it (or [`Stack::close`]) stops it.
 pub struct Stack {
     input: mpsc::Sender<Vec<u8>>,
+    commands: mpsc::Sender<Command>,
     task: JoinHandle<()>,
     table: Arc<Table>,
 }
@@ -124,15 +132,38 @@ impl Stack {
     /// device are sent to `output`.
     pub fn new(options: StackOptions, handler: Arc<dyn Handler>, output: mpsc::Sender<Vec<u8>>) -> Stack {
         let (input, packets) = mpsc::channel(QUEUE_PACKETS);
+        let (commands, command_rx) = mpsc::channel(128);
         let table = Arc::new(Table::default());
-        let worker = Worker::new(options, handler, output, table.clone());
+        let worker = Worker::new(options, handler, output, table.clone(), commands.clone(), command_rx);
         let task = tokio::spawn(worker.run(packets));
-        Stack { input, task, table }
+        Stack { input, commands, task, table }
     }
 
     /// Where packets read from the TUN device go.
     pub fn input(&self) -> mpsc::Sender<Vec<u8>> {
         self.input.clone()
+    }
+
+    /// Opens a TCP connection through this IP stack. The returned stream is
+    /// ready after the TCP handshake completes.
+    pub async fn connect_tcp(&self, destination: SocketAddr) -> io::Result<TcpConn> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ConnectTcp { destination, reply })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped"))?;
+        response.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped"))?
+    }
+
+    /// Opens a UDP socket through this IP stack. Packets can be sent to any
+    /// address and replies are returned with their source address.
+    pub async fn open_udp(&self, destination: SocketAddr) -> io::Result<ClientUdpConn> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::OpenUdp { destination, reply })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped"))?;
+        response.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped"))?
     }
 
     /// The number of UDP sessions.
@@ -205,12 +236,24 @@ impl Device for QueueDevice {
 
 type FlowKey = (SocketAddr, SocketAddr);
 
+pub(crate) enum Command {
+    ConnectTcp { destination: SocketAddr, reply: oneshot::Sender<io::Result<TcpConn>> },
+    OpenUdp { destination: SocketAddr, reply: oneshot::Sender<io::Result<ClientUdpConn>> },
+    SendUdp { source: SocketAddr, destination: SocketAddr, data: Vec<u8> },
+    CloseUdp { source: SocketAddr },
+}
+
+struct UdpClient {
+    incoming: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+}
+
 /// A TCP connection the stack holds a socket for.
 struct Conn {
     key: FlowKey,
     /// Set once the handshake completed and the handler has the connection.
     shared: Option<Arc<Shared>>,
     closing: bool,
+    connect_reply: Option<oneshot::Sender<io::Result<TcpConn>>>,
 }
 
 /// A judged flow, back from its judging task.
@@ -231,11 +274,17 @@ struct Worker {
     options: StackOptions,
     handler: Arc<dyn Handler>,
     output: mpsc::Sender<Vec<u8>>,
+    commands_tx: mpsc::Sender<Command>,
+    commands: mpsc::Receiver<Command>,
     table: Arc<Table>,
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
+    v4: Ipv4Addr,
+    v6: Ipv6Addr,
+    next_port: u16,
     conns: HashMap<SocketHandle, Conn>,
+    udp_clients: HashMap<SocketAddr, UdpClient>,
     flows: HashSet<FlowKey>,
     pending_tcp: HashMap<FlowKey, Vec<u8>>,
     pending_udp: HashMap<NatKey, PendingUdp>,
@@ -249,12 +298,24 @@ fn internal_address<T: Copy + Into<IpAddr>>(candidates: &[T], taken: &[IpAddr]) 
     *candidates.iter().find(|candidate| !taken.contains(&(**candidate).into())).unwrap_or(&candidates[0])
 }
 
+fn missing_source_address(destination: IpAddr) -> io::Error {
+    let family = if destination.is_ipv4() { "IPv4" } else { "IPv6" };
+    io::Error::new(io::ErrorKind::AddrNotAvailable, format!("missing {family} local address"))
+}
+
 fn now() -> smoltcp::time::Instant {
     smoltcp::time::Instant::now()
 }
 
 impl Worker {
-    fn new(options: StackOptions, handler: Arc<dyn Handler>, output: mpsc::Sender<Vec<u8>>, table: Arc<Table>) -> Self {
+    fn new(
+        options: StackOptions,
+        handler: Arc<dyn Handler>,
+        output: mpsc::Sender<Vec<u8>>,
+        table: Arc<Table>,
+        commands_tx: mpsc::Sender<Command>,
+        commands: mpsc::Receiver<Command>,
+    ) -> Self {
         let mut device = QueueDevice { rx: VecDeque::new(), tx: VecDeque::new(), mtu: options.mtu.clamp(1280, 65535) };
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = rand_seed();
@@ -273,6 +334,9 @@ impl Worker {
         iface.update_ip_addrs(|addresses| {
             let _ = addresses.push(IpCidr::new(v4.into(), 32));
             let _ = addresses.push(IpCidr::new(v6.into(), 128));
+            for (address, prefix) in &options.source_addresses {
+                let _ = addresses.push(IpCidr::new((*address).into(), *prefix));
+            }
         });
         let _ = iface.routes_mut().add_default_ipv4_route(v4);
         let _ = iface.routes_mut().add_default_ipv6_route(v6);
@@ -282,11 +346,17 @@ impl Worker {
             options,
             handler,
             output,
+            commands_tx,
+            commands,
             table,
             device,
             iface,
             sockets: SocketSet::new(Vec::new()),
+            v4,
+            v6,
+            next_port: 49152,
             conns: HashMap::new(),
+            udp_clients: HashMap::new(),
             flows: HashSet::new(),
             pending_tcp: HashMap::new(),
             pending_udp: HashMap::new(),
@@ -319,6 +389,10 @@ impl Worker {
                     }
                     None => break,
                 },
+                command = self.commands.recv() => match command {
+                    Some(command) => self.command(command),
+                    None => break,
+                },
                 Some(result) = judged.recv() => self.judged(result),
                 _ = notify.notified() => {}
                 _ = tokio::time::sleep(delay) => {}
@@ -332,6 +406,11 @@ impl Worker {
             }
         }
         self.table.close_all();
+        for conn in self.conns.values_mut() {
+            if let Some(reply) = conn.connect_reply.take() {
+                let _ = reply.send(Err(io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped")));
+            }
+        }
         for conn in self.conns.values() {
             if let Some(shared) = &conn.shared {
                 let mut state = shared.state.lock().unwrap();
@@ -351,6 +430,99 @@ impl Worker {
 
     fn send(&self, packet: Vec<u8>) {
         let _ = self.output.try_send(packet);
+    }
+
+    fn command(&mut self, command: Command) {
+        match command {
+            Command::ConnectTcp { destination, reply } => self.connect_tcp(destination, reply),
+            Command::OpenUdp { destination, reply } => self.open_udp(destination, reply),
+            Command::SendUdp { source, destination, data } => {
+                if self.udp_clients.contains_key(&source) && data.len() <= 65507 {
+                    self.send(packet::build_udp(source, destination, &data));
+                }
+            }
+            Command::CloseUdp { source } => {
+                self.udp_clients.remove(&source);
+            }
+        }
+    }
+
+    fn connect_tcp(&mut self, destination: SocketAddr, reply: oneshot::Sender<io::Result<TcpConn>>) {
+        if destination.port() == 0 {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "TCP destination port is zero")));
+            return;
+        }
+        let Some(source_ip) = self.source_ip(destination.ip()) else {
+            let _ = reply.send(Err(missing_source_address(destination.ip())));
+            return;
+        };
+        let Some(port) = self.allocate_port() else {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no source ports available")));
+            return;
+        };
+        let mut socket = smol_tcp::Socket::new(
+            smol_tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+            smol_tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+        );
+        socket.set_nagle_enabled(false);
+        socket.set_ack_delay(None);
+        let endpoint = (IpAddress::from(destination.ip()), destination.port());
+        if let Err(error) = socket.connect(self.iface.context(), endpoint, port) {
+            let _ = reply.send(Err(io::Error::other(format!("{destination}: {error}"))));
+            return;
+        }
+        let source = SocketAddr::new(source_ip, port);
+        let key = (source, destination);
+        let handle = self.sockets.add(socket);
+        self.conns.insert(handle, Conn { key, shared: None, closing: false, connect_reply: Some(reply) });
+    }
+
+    fn open_udp(&mut self, destination: SocketAddr, reply: oneshot::Sender<io::Result<ClientUdpConn>>) {
+        if destination.port() == 0 {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP destination port is zero")));
+            return;
+        }
+        let Some(source_ip) = self.source_ip(destination.ip()) else {
+            let _ = reply.send(Err(missing_source_address(destination.ip())));
+            return;
+        };
+        let Some(port) = self.allocate_port() else {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no source ports available")));
+            return;
+        };
+        let source = SocketAddr::new(source_ip, port);
+        let (incoming, packets) = mpsc::channel(256);
+        self.udp_clients.insert(source, UdpClient { incoming });
+        let conn = ClientUdpConn::new(source, self.commands_tx.clone(), packets);
+        let _ = reply.send(Ok(conn));
+    }
+
+    fn source_ip(&self, destination: IpAddr) -> Option<IpAddr> {
+        self.options
+            .source_addresses
+            .iter()
+            .find(|(address, _)| address.is_ipv4() == destination.is_ipv4())
+            .map(|(address, _)| *address)
+            .or_else(|| {
+                (!self.options.strict_source_addresses).then_some(if destination.is_ipv4() {
+                    self.v4.into()
+                } else {
+                    self.v6.into()
+                })
+            })
+    }
+
+    fn allocate_port(&mut self) -> Option<u16> {
+        for _ in 0..16384 {
+            let port = self.next_port;
+            self.next_port = if port == u16::MAX { 49152 } else { port + 1 };
+            let tcp_in_use = self.conns.values().any(|conn| conn.key.0.port() == port);
+            let udp_in_use = self.udp_clients.keys().any(|source| source.port() == port);
+            if !tcp_in_use && !udp_in_use {
+                return Some(port);
+            }
+        }
+        None
     }
 
     /// A packet from the TUN device.
@@ -399,7 +571,7 @@ impl Worker {
             return;
         }
         let handle = self.sockets.add(socket);
-        self.conns.insert(handle, Conn { key, shared: None, closing: false });
+        self.conns.insert(handle, Conn { key, shared: None, closing: false, connect_reply: None });
         self.flows.insert(key);
         self.device.rx.push_back(syn);
     }
@@ -411,6 +583,10 @@ impl Worker {
         let Some((src_port, dst_port, data)) = packet::parse_udp(parsed.payload) else { return };
         let source = SocketAddr::new(parsed.src, src_port);
         let destination = SocketAddr::new(parsed.dst, dst_port);
+        if let Some(client) = self.udp_clients.get(&destination) {
+            let _ = client.incoming.try_send((data.to_vec(), source));
+            return;
+        }
         let key = NatKey::new(self.options.udp_mapping, source, destination);
         if let Some(session) = self.table.get(&key) {
             session.push(data, destination);
@@ -518,9 +694,20 @@ impl Worker {
                     smol_tcp::State::Established | smol_tcp::State::CloseWait => {
                         let shared = Shared::new(self.notify.clone());
                         conn.shared = Some(shared.clone());
-                        self.handler.new_tcp(TcpConn::new(shared, conn.key.0, conn.key.1));
+                        let connection = TcpConn::new(shared, conn.key.0, conn.key.1);
+                        if let Some(reply) = conn.connect_reply.take() {
+                            let _ = reply.send(Ok(connection));
+                        } else {
+                            self.handler.new_tcp(connection);
+                        }
                     }
                     smol_tcp::State::Closed => {
+                        if let Some(reply) = conn.connect_reply.take() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!("{}: connection refused", conn.key.1),
+                            )));
+                        }
                         closed.push(handle);
                         continue;
                     }

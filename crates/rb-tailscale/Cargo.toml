@@ -1,0 +1,16 @@
+[package]
+name = "rb-tailscale"
+description = "Pure Rust Tailscale protocol primitives for rust-box"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+boringtun.workspace = true
+crypto_secretbox.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+salsa20.workspace = true
+zeroize.workspace = true
