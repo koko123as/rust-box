@@ -9,6 +9,8 @@ use std::fmt;
 
 /// A DERP frame header contains a type byte and a big-endian u32 payload length.
 pub const FRAME_HEADER_LEN: usize = 5;
+/// Maximum payload length accepted by the pinned fork's `WriteFrame`.
+pub const MAX_FRAME_WRITE_SIZE: usize = 10 << 20;
 
 /// A raw DERP frame type. Unknown values are preserved, as in Go's `FrameType`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +111,42 @@ impl fmt::Display for ReadFrameError {
 
 impl Error for ReadFrameError {}
 
+/// Failure to append a complete frame to an output buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteFrameError {
+    /// The payload exceeds the pinned fork's 10 MiB write limit.
+    UnreasonablyLarge,
+    /// Output buffer allocation failed; no frame bytes were appended.
+    Allocation,
+}
+
+impl fmt::Display for WriteFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnreasonablyLarge => f.write_str("unreasonably large frame write"),
+            Self::Allocation => f.write_str("unable to allocate DERP frame buffer"),
+        }
+    }
+}
+
+impl Error for WriteFrameError {}
+
+/// Appends a frame header and payload, rejecting payloads over 10 MiB before
+/// changing `output`, as in the fork's `WriteFrame` size check.
+///
+/// Unlike Go's buffered writer, this writes to a `Vec`, does not flush a stream,
+/// and reports allocation failure without appending a partial frame.
+pub fn write_frame(output: &mut Vec<u8>, frame_type: FrameType, payload: &[u8]) -> Result<(), WriteFrameError> {
+    if payload.len() > MAX_FRAME_WRITE_SIZE {
+        return Err(WriteFrameError::UnreasonablyLarge);
+    }
+    output.try_reserve(FRAME_HEADER_LEN + payload.len()).map_err(|_| WriteFrameError::Allocation)?;
+    let header = FrameHeader { frame_type, frame_len: payload.len() as u32 };
+    output.extend_from_slice(&header.encode());
+    output.extend_from_slice(payload);
+    Ok(())
+}
+
 /// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
 /// when the output is shorter than the advertised frame, matching Go `readFrame`.
 ///
@@ -144,7 +182,8 @@ pub fn read_frame(input: &mut &[u8], max_size: u32, output: &mut [u8]) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, read_frame_header, read_frame_type_header, FrameHeader, FrameHeaderError, FrameType, ReadFrameError,
+        read_frame, read_frame_header, read_frame_type_header, write_frame, FrameHeader, FrameHeaderError, FrameType,
+        ReadFrameError, WriteFrameError, MAX_FRAME_WRITE_SIZE,
     };
 
     #[test]
@@ -162,6 +201,24 @@ mod tests {
             assert_eq!(read_frame_header(&mut remaining), Ok(header));
             assert_eq!(remaining, [0xaa]);
         }
+    }
+
+    #[test]
+    fn write_frame_matches_pinned_go_size_and_wire_boundaries() {
+        for len in [0, 1, MAX_FRAME_WRITE_SIZE] {
+            let payload = vec![0x5a; len];
+            let mut output = vec![0xaa];
+            assert_eq!(write_frame(&mut output, FrameType(0xff), &payload), Ok(()));
+            assert_eq!(output.len(), 1 + 5 + len);
+            assert_eq!(&output[..6], &[0xaa, 0xff, (len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+            assert_eq!(&output[6..], payload);
+        }
+        let mut output = vec![0xaa];
+        let oversized = vec![0x5a; MAX_FRAME_WRITE_SIZE + 1];
+        let error = write_frame(&mut output, FrameType(0xff), &oversized).unwrap_err();
+        assert_eq!(error, WriteFrameError::UnreasonablyLarge);
+        assert_eq!(error.to_string(), "unreasonably large frame write");
+        assert_eq!(output, [0xaa]);
     }
 
     #[test]
