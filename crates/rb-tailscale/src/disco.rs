@@ -1,9 +1,8 @@
 //! Pure-Rust codecs for the implemented Tailscale disco plaintext messages.
 //!
-//! The pinned Tailscale fork supports more disco types than this module. Types
-//! 0x04 through 0x09 are reported as unsupported; unknown types are distinct.
-//! This module does not implement NaCl box encryption, outer packet runtime,
-//! UDP relay handshakes, or endpoint discovery.
+//! The pinned Tailscale fork supports more disco types than this module. The
+//! UDP relay codecs for types 0x04 through 0x09 are implemented. The module does
+//! not implement the outer packet runtime or endpoint discovery.
 
 use std::{
     fmt,
@@ -20,14 +19,80 @@ pub const OUTER_HEADER_LEN: usize = 6 + 32 + 24;
 const PING: u8 = 0x01;
 const PONG: u8 = 0x02;
 const CALL_ME_MAYBE: u8 = 0x03;
+const BIND_UDP_RELAY_ENDPOINT: u8 = 0x04;
+const BIND_UDP_RELAY_ENDPOINT_CHALLENGE: u8 = 0x05;
+const BIND_UDP_RELAY_ENDPOINT_ANSWER: u8 = 0x06;
+const CALL_ME_MAYBE_VIA: u8 = 0x07;
+const ALLOCATE_UDP_RELAY_ENDPOINT_REQUEST: u8 = 0x08;
+const ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE: u8 = 0x09;
 
-/// Semantic representation of the three disco plaintext message types
-/// currently implemented here.
+const UDP_RELAY_ENDPOINT_FIXED_LEN: usize = 3 * 32 + 8 + 4 + 8 + 8;
+const UDP_RELAY_ENDPOINT_ADDRPORT_LEN: usize = 18;
+
+/// Fields common to the three fixed-size UDP relay binding handshake messages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindUdpRelayEndpointCommon {
+    pub vni: u32,
+    pub generation: u32,
+    pub remote_key: crate::DiscoPublic,
+    pub challenge: [u8; 32],
+}
+
+/// Endpoint details carried by CallMeMaybeVia and relay-allocation responses.
+///
+/// Durations are represented as signed nanoseconds, matching Go's `time.Duration`
+/// bit pattern on the wire. A zero-value endpoint also represents the pinned
+/// Go parser's empty result for a nonzero message version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpRelayEndpoint {
+    pub server_disco: crate::DiscoPublic,
+    pub client_disco: [crate::DiscoPublic; 2],
+    pub lamport_id: u64,
+    pub vni: u32,
+    pub bind_lifetime_nanos: i64,
+    pub steady_state_lifetime_nanos: i64,
+    pub addr_ports: Vec<SocketAddr>,
+}
+
+impl Default for UdpRelayEndpoint {
+    fn default() -> Self {
+        Self {
+            server_disco: crate::DiscoPublic::from_raw32([0; 32]),
+            client_disco: [crate::DiscoPublic::from_raw32([0; 32]); 2],
+            lamport_id: 0,
+            vni: 0,
+            bind_lifetime_nanos: 0,
+            steady_state_lifetime_nanos: 0,
+            addr_ports: Vec::new(),
+        }
+    }
+}
+
+/// Request to allocate a UDP relay endpoint for two disco clients.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocateUdpRelayEndpointRequest {
+    pub client_disco: [crate::DiscoPublic; 2],
+    pub generation: u32,
+}
+
+impl Default for AllocateUdpRelayEndpointRequest {
+    fn default() -> Self {
+        Self { client_disco: [crate::DiscoPublic::from_raw32([0; 32]); 2], generation: 0 }
+    }
+}
+
+/// Semantic representation of the disco plaintext message types implemented here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
     Ping { tx_id: [u8; 12], node_key: NodePublic, padding: usize },
     Pong { tx_id: [u8; 12], source: SocketAddr },
     CallMeMaybe { endpoints: Vec<SocketAddr> },
+    BindUdpRelayEndpoint(BindUdpRelayEndpointCommon),
+    BindUdpRelayEndpointChallenge(BindUdpRelayEndpointCommon),
+    BindUdpRelayEndpointAnswer(BindUdpRelayEndpointCommon),
+    CallMeMaybeVia(UdpRelayEndpoint),
+    AllocateUdpRelayEndpointRequest(AllocateUdpRelayEndpointRequest),
+    AllocateUdpRelayEndpointResponse { generation: u32, endpoint: UdpRelayEndpoint },
 }
 
 /// A malformed or not-yet-implemented disco plaintext message.
@@ -69,10 +134,10 @@ pub fn source(packet: &[u8]) -> Option<&[u8]> {
 
 /// Parses plaintext inside an authenticated NaCl box.
 ///
-/// Version bytes for Ping and Pong are ignored by the pinned fork. CallMeMaybe
-/// returns an empty endpoint list for a nonzero version, empty body, or body
-/// whose length is not divisible by 18. The fork's other assigned message
-/// types (0x04..=0x09) fail explicitly here rather than being silently ignored.
+/// Version bytes for Ping, Pong, and UDP relay bind messages are ignored by the
+/// pinned fork. CallMeMaybe returns an empty endpoint list for a nonzero
+/// version, empty body, or body whose length is not divisible by 18. The relay
+/// endpoint types return zero-valued messages for nonzero versions, as Go does.
 ///
 /// As in the Go codec, there is no arbitrary wire-size limit. Allocation is
 /// fallible in Rust and returns `Error::Resource` rather than aborting.
@@ -125,9 +190,107 @@ pub fn parse(packet: &[u8]) -> Result<Message, Error> {
             }
             Ok(Message::CallMeMaybe { endpoints })
         }
-        0x04..=0x09 => Err(Error::UnsupportedType(kind)),
+        BIND_UDP_RELAY_ENDPOINT => Ok(Message::BindUdpRelayEndpoint(parse_bind_udp_relay_endpoint(body)?)),
+        BIND_UDP_RELAY_ENDPOINT_CHALLENGE => {
+            Ok(Message::BindUdpRelayEndpointChallenge(parse_bind_udp_relay_endpoint(body)?))
+        }
+        BIND_UDP_RELAY_ENDPOINT_ANSWER => Ok(Message::BindUdpRelayEndpointAnswer(parse_bind_udp_relay_endpoint(body)?)),
+        CALL_ME_MAYBE_VIA => {
+            if version != 0 {
+                return Ok(Message::CallMeMaybeVia(UdpRelayEndpoint::default()));
+            }
+            Ok(Message::CallMeMaybeVia(parse_udp_relay_endpoint(body)?))
+        }
+        ALLOCATE_UDP_RELAY_ENDPOINT_REQUEST => {
+            if version != 0 {
+                return Ok(Message::AllocateUdpRelayEndpointRequest(AllocateUdpRelayEndpointRequest::default()));
+            }
+            if body.len() < 68 {
+                return Err(Error::Short);
+            }
+            let mut first = [0; 32];
+            first.copy_from_slice(&body[..32]);
+            let mut second = [0; 32];
+            second.copy_from_slice(&body[32..64]);
+            let generation = u32::from_be_bytes(body[64..68].try_into().map_err(|_| Error::Short)?);
+            Ok(Message::AllocateUdpRelayEndpointRequest(AllocateUdpRelayEndpointRequest {
+                client_disco: [crate::DiscoPublic::from_raw32(first), crate::DiscoPublic::from_raw32(second)],
+                generation,
+            }))
+        }
+        ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE => {
+            if version != 0 {
+                return Ok(Message::AllocateUdpRelayEndpointResponse {
+                    generation: 0,
+                    endpoint: UdpRelayEndpoint::default(),
+                });
+            }
+            if body.len() < 4 {
+                return Err(Error::Short);
+            }
+            let generation = u32::from_be_bytes(body[..4].try_into().map_err(|_| Error::Short)?);
+            let endpoint = parse_udp_relay_endpoint(&body[4..])?;
+            Ok(Message::AllocateUdpRelayEndpointResponse { generation, endpoint })
+        }
         other => Err(Error::UnknownType(other)),
     }
+}
+
+fn parse_bind_udp_relay_endpoint(body: &[u8]) -> Result<BindUdpRelayEndpointCommon, Error> {
+    if body.len() < 72 {
+        return Err(Error::Short);
+    }
+    let vni = u32::from_be_bytes(body[..4].try_into().map_err(|_| Error::Short)?);
+    let generation = u32::from_be_bytes(body[4..8].try_into().map_err(|_| Error::Short)?);
+    let mut remote_key = [0; 32];
+    remote_key.copy_from_slice(&body[8..40]);
+    let mut challenge = [0; 32];
+    challenge.copy_from_slice(&body[40..72]);
+    Ok(BindUdpRelayEndpointCommon {
+        vni,
+        generation,
+        remote_key: crate::DiscoPublic::from_raw32(remote_key),
+        challenge,
+    })
+}
+
+fn parse_udp_relay_endpoint(body: &[u8]) -> Result<UdpRelayEndpoint, Error> {
+    if body.len() < UDP_RELAY_ENDPOINT_FIXED_LEN + UDP_RELAY_ENDPOINT_ADDRPORT_LEN
+        || !(body.len() - UDP_RELAY_ENDPOINT_FIXED_LEN).is_multiple_of(UDP_RELAY_ENDPOINT_ADDRPORT_LEN)
+    {
+        return Err(Error::Short);
+    }
+
+    let mut server_disco = [0; 32];
+    server_disco.copy_from_slice(&body[..32]);
+    let mut first_client = [0; 32];
+    first_client.copy_from_slice(&body[32..64]);
+    let mut second_client = [0; 32];
+    second_client.copy_from_slice(&body[64..96]);
+    let lamport_id = u64::from_be_bytes(body[96..104].try_into().map_err(|_| Error::Short)?);
+    let vni = u32::from_be_bytes(body[104..108].try_into().map_err(|_| Error::Short)?);
+    let bind_lifetime_nanos = i64::from_be_bytes(body[108..116].try_into().map_err(|_| Error::Short)?);
+    let steady_state_lifetime_nanos = i64::from_be_bytes(body[116..124].try_into().map_err(|_| Error::Short)?);
+
+    let (records, remainder) = body[UDP_RELAY_ENDPOINT_FIXED_LEN..].as_chunks::<UDP_RELAY_ENDPOINT_ADDRPORT_LEN>();
+    if !remainder.is_empty() {
+        return Err(Error::Short);
+    }
+    let mut addr_ports = Vec::new();
+    addr_ports.try_reserve(records.len()).map_err(|_| Error::Resource)?;
+    for record in records {
+        addr_ports.push(SocketAddr::new(decode_ip(&record[..16]), u16::from_be_bytes([record[16], record[17]])));
+    }
+
+    Ok(UdpRelayEndpoint {
+        server_disco: crate::DiscoPublic::from_raw32(server_disco),
+        client_disco: [crate::DiscoPublic::from_raw32(first_client), crate::DiscoPublic::from_raw32(second_client)],
+        lamport_id,
+        vni,
+        bind_lifetime_nanos,
+        steady_state_lifetime_nanos,
+        addr_ports,
+    })
 }
 
 /// Encodes a supported plaintext message into a new byte vector.
@@ -166,8 +329,69 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, Error> {
                 output.extend_from_slice(&endpoint.port().to_be_bytes());
             }
         }
+        Message::BindUdpRelayEndpoint(common) => {
+            encode_bind_udp_relay_endpoint(&mut output, BIND_UDP_RELAY_ENDPOINT, common)?
+        }
+        Message::BindUdpRelayEndpointChallenge(common) => {
+            encode_bind_udp_relay_endpoint(&mut output, BIND_UDP_RELAY_ENDPOINT_CHALLENGE, common)?
+        }
+        Message::BindUdpRelayEndpointAnswer(common) => {
+            encode_bind_udp_relay_endpoint(&mut output, BIND_UDP_RELAY_ENDPOINT_ANSWER, common)?
+        }
+        Message::CallMeMaybeVia(endpoint) => {
+            output.try_reserve(2).map_err(|_| Error::Resource)?;
+            output.extend_from_slice(&[CALL_ME_MAYBE_VIA, 0]);
+            encode_udp_relay_endpoint(&mut output, endpoint)?;
+        }
+        Message::AllocateUdpRelayEndpointRequest(request) => {
+            output.try_reserve(70).map_err(|_| Error::Resource)?;
+            output.extend_from_slice(&[ALLOCATE_UDP_RELAY_ENDPOINT_REQUEST, 0]);
+            for key in request.client_disco {
+                output.extend_from_slice(&key.raw_bytes());
+            }
+            output.extend_from_slice(&request.generation.to_be_bytes());
+        }
+        Message::AllocateUdpRelayEndpointResponse { generation, endpoint } => {
+            output.try_reserve(6).map_err(|_| Error::Resource)?;
+            output.extend_from_slice(&[ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE, 0]);
+            output.extend_from_slice(&generation.to_be_bytes());
+            encode_udp_relay_endpoint(&mut output, endpoint)?;
+        }
     }
     Ok(output)
+}
+
+fn encode_bind_udp_relay_endpoint(
+    output: &mut Vec<u8>,
+    kind: u8,
+    common: &BindUdpRelayEndpointCommon,
+) -> Result<(), Error> {
+    output.try_reserve(74).map_err(|_| Error::Resource)?;
+    output.extend_from_slice(&[kind, 0]);
+    output.extend_from_slice(&common.vni.to_be_bytes());
+    output.extend_from_slice(&common.generation.to_be_bytes());
+    output.extend_from_slice(&common.remote_key.raw_bytes());
+    output.extend_from_slice(&common.challenge);
+    Ok(())
+}
+
+fn encode_udp_relay_endpoint(output: &mut Vec<u8>, endpoint: &UdpRelayEndpoint) -> Result<(), Error> {
+    let address_len = endpoint.addr_ports.len().checked_mul(UDP_RELAY_ENDPOINT_ADDRPORT_LEN).ok_or(Error::Resource)?;
+    let total_len = UDP_RELAY_ENDPOINT_FIXED_LEN.checked_add(address_len).ok_or(Error::Resource)?;
+    output.try_reserve(total_len).map_err(|_| Error::Resource)?;
+    output.extend_from_slice(&endpoint.server_disco.raw_bytes());
+    for key in endpoint.client_disco {
+        output.extend_from_slice(&key.raw_bytes());
+    }
+    output.extend_from_slice(&endpoint.lamport_id.to_be_bytes());
+    output.extend_from_slice(&endpoint.vni.to_be_bytes());
+    output.extend_from_slice(&endpoint.bind_lifetime_nanos.to_be_bytes());
+    output.extend_from_slice(&endpoint.steady_state_lifetime_nanos.to_be_bytes());
+    for address in &endpoint.addr_ports {
+        output.extend_from_slice(&encode_ip(address.ip()));
+        output.extend_from_slice(&address.port().to_be_bytes());
+    }
+    Ok(())
 }
 
 fn decode_ip(bytes: &[u8]) -> IpAddr {
@@ -190,6 +414,12 @@ mod tests {
 
     fn key(byte: u8) -> NodePublic {
         NodePublic::from_raw32([byte; 32])
+    }
+
+    fn decode_hex(input: &str) -> Vec<u8> {
+        let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        pairs.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()
     }
 
     #[test]
@@ -286,6 +516,150 @@ mod tests {
     }
 
     #[test]
+    fn udp_relay_bind_messages_match_real_go_vectors_and_ignore_version_and_trailing_bytes() {
+        // Generated by AppendMarshal and Parse in the pinned Go fork at
+        // github.com/sagernet/tailscale@79c1732442a9dfba9f80512247432a6ab7faca67.
+        const GO_BODY_HEX: &str = "01020304a0b0c0d011111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222";
+        let common = BindUdpRelayEndpointCommon {
+            vni: 0x0102_0304,
+            generation: 0xa0b0_c0d0,
+            remote_key: crate::DiscoPublic::from_raw32([0x11; 32]),
+            challenge: [0x22; 32],
+        };
+
+        for kind in BIND_UDP_RELAY_ENDPOINT..=BIND_UDP_RELAY_ENDPOINT_ANSWER {
+            let message = match kind {
+                BIND_UDP_RELAY_ENDPOINT => Message::BindUdpRelayEndpoint(common.clone()),
+                BIND_UDP_RELAY_ENDPOINT_CHALLENGE => Message::BindUdpRelayEndpointChallenge(common.clone()),
+                BIND_UDP_RELAY_ENDPOINT_ANSWER => Message::BindUdpRelayEndpointAnswer(common.clone()),
+                _ => unreachable!(),
+            };
+            let expected = decode_hex(&format!("{kind:02x}00{GO_BODY_HEX}"));
+            assert_eq!(encode(&message).unwrap(), expected);
+            assert_eq!(parse(&expected).unwrap(), message);
+
+            let mut versioned_with_tail = expected.clone();
+            versioned_with_tail[1] = 99;
+            versioned_with_tail.extend_from_slice(&[0xaa, 0xbb]);
+            let parsed = parse(&versioned_with_tail).unwrap();
+            assert_eq!(parsed, message);
+            assert_eq!(encode(&parsed).unwrap(), expected);
+
+            let mut short = vec![kind, 0];
+            short.resize(2 + 71, 0);
+            assert_eq!(parse(&short), Err(Error::Short));
+        }
+    }
+
+    fn disco_key(byte: u8) -> crate::DiscoPublic {
+        crate::DiscoPublic::from_raw32([byte; 32])
+    }
+
+    fn go_endpoint() -> UdpRelayEndpoint {
+        UdpRelayEndpoint {
+            server_disco: disco_key(0x10),
+            client_disco: [disco_key(0x11), disco_key(0x12)],
+            lamport_id: 0x0102_0304_0506_0708,
+            vni: 0x1122_3344,
+            bind_lifetime_nanos: 10_000_000_000,
+            steady_state_lifetime_nanos: 3_600_000_000_000,
+            addr_ports: vec!["192.0.2.1:41641".parse().unwrap(), "[2001:db8::1]:443".parse().unwrap()],
+        }
+    }
+
+    #[test]
+    fn relay_endpoint_via_and_allocation_messages_match_real_go_vectors() {
+        // Generated by AppendMarshal and Parse in the pinned Go fork; the fixed
+        // endpoint portion includes two AddrPorts (IPv4-mapped and native IPv6).
+        const GO_ENDPOINT_BODY: &str = concat!(
+            "1010101010101010101010101010101010101010101010101010101010101010",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "1212121212121212121212121212121212121212121212121212121212121212",
+            "01020304050607081122334400000002540be4000000034630b8a000",
+            "00000000000000000000ffffc0000201a2a9",
+            "20010db800000000000000000000000101bb"
+        );
+        let endpoint = go_endpoint();
+        let request = AllocateUdpRelayEndpointRequest {
+            client_disco: [disco_key(0x11), disco_key(0x12)],
+            generation: 0xa0b0_c0d0,
+        };
+        let messages = [
+            Message::CallMeMaybeVia(endpoint.clone()),
+            Message::AllocateUdpRelayEndpointRequest(request.clone()),
+            Message::AllocateUdpRelayEndpointResponse { generation: 0xa0b0_c0d0, endpoint: endpoint.clone() },
+        ];
+        let request_hex = format!("0800{}{}a0b0c0d0", "11".repeat(32), "12".repeat(32));
+        let expected = [
+            decode_hex(&format!("0700{GO_ENDPOINT_BODY}")),
+            decode_hex(&request_hex),
+            decode_hex(&format!("0900a0b0c0d0{GO_ENDPOINT_BODY}")),
+        ];
+        for (message, expected_wire) in messages.iter().zip(expected) {
+            assert_eq!(encode(message).unwrap(), expected_wire);
+            assert_eq!(parse(&expected_wire).unwrap(), *message);
+        }
+    }
+
+    #[test]
+    fn zero_value_endpoint_marshal_matches_go_even_when_parse_rejects_it() {
+        let via = encode(&Message::CallMeMaybeVia(UdpRelayEndpoint::default())).unwrap();
+        assert_eq!(via.len(), 2 + UDP_RELAY_ENDPOINT_FIXED_LEN);
+        assert_eq!(parse(&via), Err(Error::Short));
+
+        let response =
+            encode(&Message::AllocateUdpRelayEndpointResponse { generation: 0, endpoint: UdpRelayEndpoint::default() })
+                .unwrap();
+        assert_eq!(response.len(), 2 + 4 + UDP_RELAY_ENDPOINT_FIXED_LEN);
+        assert_eq!(parse(&response), Err(Error::Short));
+    }
+
+    #[test]
+    fn relay_endpoint_nonzero_versions_return_go_zero_values() {
+        assert_eq!(parse(&[CALL_ME_MAYBE_VIA, 1, 0xaa]), Ok(Message::CallMeMaybeVia(UdpRelayEndpoint::default())));
+        assert_eq!(
+            parse(&[ALLOCATE_UDP_RELAY_ENDPOINT_REQUEST, 1, 0xaa]),
+            Ok(Message::AllocateUdpRelayEndpointRequest(AllocateUdpRelayEndpointRequest::default()))
+        );
+        assert_eq!(
+            parse(&[ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE, 1, 0xaa]),
+            Ok(Message::AllocateUdpRelayEndpointResponse { generation: 0, endpoint: UdpRelayEndpoint::default() })
+        );
+    }
+
+    #[test]
+    fn relay_endpoint_length_and_tail_rules_match_go() {
+        for body_len in
+            [0, UDP_RELAY_ENDPOINT_FIXED_LEN - 1, UDP_RELAY_ENDPOINT_FIXED_LEN, UDP_RELAY_ENDPOINT_FIXED_LEN + 17]
+        {
+            let mut frame = vec![CALL_ME_MAYBE_VIA, 0];
+            frame.resize(2 + body_len, 0);
+            assert_eq!(parse(&frame), Err(Error::Short), "CallMeMaybeVia body length {body_len}");
+        }
+
+        let mut short_request = vec![ALLOCATE_UDP_RELAY_ENDPOINT_REQUEST, 0];
+        short_request.resize(2 + 67, 0);
+        assert_eq!(parse(&short_request), Err(Error::Short));
+        let mut request_with_tail =
+            encode(&Message::AllocateUdpRelayEndpointRequest(AllocateUdpRelayEndpointRequest::default())).unwrap();
+        request_with_tail.extend_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(
+            parse(&request_with_tail),
+            Ok(Message::AllocateUdpRelayEndpointRequest(AllocateUdpRelayEndpointRequest::default()))
+        );
+
+        for body_len in [4, 4 + UDP_RELAY_ENDPOINT_FIXED_LEN, 4 + UDP_RELAY_ENDPOINT_FIXED_LEN + 19] {
+            let mut frame = vec![ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE, 0];
+            frame.resize(2 + body_len, 0);
+            assert_eq!(parse(&frame), Err(Error::Short), "allocation response body length {body_len}");
+        }
+        let mut response_with_bad_tail =
+            encode(&Message::AllocateUdpRelayEndpointResponse { generation: 7, endpoint: go_endpoint() }).unwrap();
+        response_with_bad_tail.push(0xaa);
+        assert_eq!(parse(&response_with_bad_tail), Err(Error::Short));
+    }
+
+    #[test]
     fn wrapper_requires_full_outer_header_and_exact_magic() {
         let mut packet = vec![0; OUTER_HEADER_LEN];
         packet[..6].copy_from_slice(&MAGIC);
@@ -305,8 +679,8 @@ mod tests {
         assert_eq!(parse(&[]), Err(Error::Short));
         assert_eq!(parse(&[PING, 0]), Err(Error::Short));
         assert_eq!(parse(&[PONG, 0, 0]), Err(Error::Short));
-        for kind in 0x04..=0x09 {
-            assert_eq!(parse(&[kind, 0]), Err(Error::UnsupportedType(kind)));
+        for kind in CALL_ME_MAYBE_VIA..=ALLOCATE_UDP_RELAY_ENDPOINT_RESPONSE {
+            assert_eq!(parse(&[kind, 0]), Err(Error::Short));
         }
         assert_eq!(parse(&[0x63, 0]), Err(Error::UnknownType(0x63)));
     }
