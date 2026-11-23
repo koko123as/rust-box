@@ -450,6 +450,46 @@ pub fn derp_should_dial_proto_from_parsed(field: DerpParsedDialField, protocol: 
     }
 }
 
+/// A destination paired with the caller's Go `netip.ParseAddr`-equivalent result.
+///
+/// `None` means parsing the text failed; IPv6 zone information need not be
+/// retained for the family decision. This type does not validate the pairing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DerpParsedDialTarget<'a> {
+    text: &'a str,
+    address: Option<std::net::IpAddr>,
+}
+
+impl<'a> DerpParsedDialTarget<'a> {
+    pub fn from_preclassified(text: &'a str, address: Option<std::net::IpAddr>) -> Self {
+        Self { text, address }
+    }
+}
+
+/// Selects the pinned `startDial` destination and its IP-family guard.
+///
+/// The caller must provide correct parsed results for each input, including
+/// Go's IPv6-zone and mapped-IPv6 semantics. A non-IP or empty chosen string
+/// passes this particular guard just as in Go; this is not target validation,
+/// and neither this function nor its return value starts a network operation.
+pub fn derp_start_dial_target_from_parsed<'a>(
+    primary: DerpParsedDialTarget<'a>,
+    hostname: DerpParsedDialTarget<'a>,
+    protocol: DerpDialProtocol,
+) -> Option<&'a str> {
+    let destination = if primary.text.is_empty() { hostname } else { primary };
+    let mismatched_family = matches!(
+        (destination.address, protocol),
+        (Some(std::net::IpAddr::V6(_)), DerpDialProtocol::Tcp4)
+            | (Some(std::net::IpAddr::V4(_)), DerpDialProtocol::Tcp6)
+    );
+    if mismatched_family {
+        None
+    } else {
+        Some(destination.text)
+    }
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -834,10 +874,10 @@ mod tests {
 
     use super::{
         derp_region_dial_port, derp_region_tls_server_name, derp_region_url_string, derp_should_dial_proto_from_parsed,
-        derp_url_port_from_parsed_parts, derp_use_https, ping_deadline, DerpClientState, DerpDialProtocol,
-        DerpParsedDialField, DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpUrlPortError,
-        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
-        DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_start_dial_target_from_parsed, derp_url_port_from_parsed_parts, derp_use_https, ping_deadline,
+        DerpClientState, DerpDialProtocol, DerpParsedDialField, DerpParsedDialTarget, DerpPingCancellationToken,
+        DerpPongResponseRegistry, DerpRegionUrlError, DerpUrlPortError, DerphttpConnectionRegistry,
+        DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -1033,6 +1073,32 @@ mod tests {
         ] {
             assert_eq!(derp_should_dial_proto_from_parsed(field, Tcp4), tcp4, "{field:?} tcp4");
             assert_eq!(derp_should_dial_proto_from_parsed(field, Tcp6), tcp6, "{field:?} tcp6");
+        }
+    }
+
+    #[test]
+    fn start_dial_selects_preclassified_destination_and_checks_family() {
+        use DerpDialProtocol::{Tcp4, Tcp6};
+
+        let target = DerpParsedDialTarget::from_preclassified;
+        let empty = target("", None);
+        let hostname = target("derp.example", None);
+        let ipv4 = target("192.0.2.1", Some("192.0.2.1".parse().unwrap()));
+        let ipv6 = target("2001:db8::1", Some("2001:db8::1".parse().unwrap()));
+        let mapped = target("::ffff:192.0.2.1", Some("::ffff:192.0.2.1".parse().unwrap()));
+        let zoned = target("fe80::1%eth0", Some("fe80::1".parse().unwrap()));
+        let invalid = target("bad ip text", None);
+
+        assert_eq!(derp_start_dial_target_from_parsed(ipv4, hostname, Tcp4), Some("192.0.2.1"));
+        assert_eq!(derp_start_dial_target_from_parsed(ipv4, hostname, Tcp6), None);
+        assert_eq!(derp_start_dial_target_from_parsed(empty, ipv6, Tcp6), Some("2001:db8::1"));
+        assert_eq!(derp_start_dial_target_from_parsed(empty, ipv6, Tcp4), None);
+        assert_eq!(derp_start_dial_target_from_parsed(empty, hostname, Tcp4), Some("derp.example"));
+        assert_eq!(derp_start_dial_target_from_parsed(invalid, hostname, Tcp4), Some("bad ip text"));
+        assert_eq!(derp_start_dial_target_from_parsed(empty, empty, Tcp6), Some(""));
+        for ipv6_target in [mapped, zoned] {
+            assert_eq!(derp_start_dial_target_from_parsed(ipv6_target, hostname, Tcp4), None);
+            assert_eq!(derp_start_dial_target_from_parsed(ipv6_target, hostname, Tcp6), Some(ipv6_target.text));
         }
     }
 
