@@ -9,8 +9,9 @@
 //! the first error. A pure Rust model of the pinned `rate.Limiter.AllowN` state
 //! transition and a bounded SendPacket writer are oracle-tested. `DerpSendWriter`
 //! serializes packet, Ping/Pong, NotePreferred, WatchConnectionChanges, and ClosePeer
-//! writes under one lock. ForwardPacket and other DERP writer methods, automatic
-//! Ping replies, and server authentication remain unimplemented.
+//! writes under one lock. ForwardPacket's bounded frame writer is also covered, but
+//! its five-second connection-close timeout, other writer methods, automatic Ping
+//! replies, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
@@ -44,6 +45,8 @@ pub const FRAME_CLIENT_INFO: FrameType = FrameType(0x02);
 pub const FRAME_SERVER_INFO: FrameType = FrameType(0x03);
 /// The client-to-server packet frame type.
 pub const FRAME_SEND_PACKET: FrameType = FrameType(0x04);
+/// The mesh client-to-client packet forwarding frame type.
+pub const FRAME_FORWARD_PACKET: FrameType = FrameType(0x0a);
 /// The received-packet frame type.
 pub const FRAME_RECV_PACKET: FrameType = FrameType(0x05);
 /// The keep-alive frame type.
@@ -423,6 +426,58 @@ impl Error for SendPacketError {
     }
 }
 
+/// An error from the pinned-fork DERP `Client.ForwardPacket` frame-write path.
+#[derive(Debug)]
+pub enum ForwardPacketError {
+    PacketTooBig { packet_len: usize },
+    StreamWrite(StreamWriteFrameError),
+}
+
+impl fmt::Display for ForwardPacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PacketTooBig { packet_len } => write!(f, "derp.ForwardPacket: packet too big: {packet_len}"),
+            Self::StreamWrite(error) => write!(f, "derp.ForwardPacket: {error}"),
+        }
+    }
+}
+
+impl Error for ForwardPacketError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StreamWrite(error) => Some(error),
+            Self::PacketTooBig { .. } => None,
+        }
+    }
+}
+
+/// Writes and flushes one mesh ForwardPacket frame using the pinned fork's
+/// 64 KiB packet limit, source/destination key order, and wrapping error text.
+///
+/// This stateless slice does not apply the Send rate limiter or own the shared
+/// writer mutex. It also does not model Go's five-second timer that closes the
+/// connection if a write remains blocked; the complete Client lifecycle is absent.
+pub fn forward_packet_to<W: Write>(
+    writer: &mut W,
+    source: NodePublic,
+    destination: NodePublic,
+    packet: &[u8],
+) -> Result<(), ForwardPacketError> {
+    if packet.len() > MAX_PACKET_SIZE {
+        return Err(ForwardPacketError::PacketTooBig { packet_len: packet.len() });
+    }
+
+    let payload_len = 2 * KEY_LEN + packet.len();
+    let header = FrameHeader { frame_type: FRAME_FORWARD_PACKET, frame_len: payload_len as u32 }.encode();
+    let source_bytes = source.raw_bytes();
+    let destination_bytes = destination.raw_bytes();
+    write_send_segment(writer, &header).map_err(ForwardPacketError::StreamWrite)?;
+    write_send_segment(writer, &source_bytes).map_err(ForwardPacketError::StreamWrite)?;
+    write_send_segment(writer, &destination_bytes).map_err(ForwardPacketError::StreamWrite)?;
+    write_send_segment(writer, packet).map_err(ForwardPacketError::StreamWrite)?;
+    writer.flush().map_err(StreamWriteFrameError::Io).map_err(ForwardPacketError::StreamWrite)
+}
+
 /// A `NotePreferred` write error with the pinned Go error prefix.
 #[derive(Debug)]
 pub struct NotePreferredError(StreamWriteFrameError);
@@ -491,12 +546,13 @@ struct DerpSendWriterState<W> {
     limiter: Option<DerpSendRateLimiter>,
 }
 
-/// Owns the DERP packet/Ping/Pong writer paths under one shared write lock.
+/// Owns the DERP Send/ForwardPacket/Ping/Pong writer paths under one shared write lock.
 ///
-/// This mirrors the pinned fork's `Client.wmu` for these three operations: rate
-/// limiter checks and all frame writes are serialized together, and the send
-/// timestamp is sampled only after acquiring the lock. Route every operation on
-/// the underlying writer through this owner to avoid byte-level frame interleaving.
+/// This mirrors the pinned fork's `Client.wmu` for `Send`, `ForwardPacket`, `Ping`,
+/// and `Pong`: frame writes are serialized, `Send` rate-limit checks and its send
+/// timestamp are sampled under the lock, and packet-size checks happen before it.
+/// Route every operation on the underlying writer through this owner to avoid
+/// byte-level frame interleaving.
 /// Other DERP writer methods and the complete client lifecycle are not implemented.
 /// This type also does not emulate Go `bufio.Writer.AvailableBuffer` internals.
 pub struct DerpSendWriter<W> {
@@ -526,6 +582,24 @@ impl<W: Write> DerpSendWriter<W> {
         let now = Instant::now();
         let DerpSendWriterState { writer, limiter } = &mut *state;
         send_packet_to(writer, destination, packet, limiter.as_mut(), now)
+    }
+
+    /// Writes one ForwardPacket under the same mutex used by all other methods.
+    ///
+    /// The packet-size check occurs before acquiring the lock, like the Go client.
+    /// This method mirrors its wire bytes and wrapped write errors, but not the
+    /// five-second asynchronous connection-close timeout for a blocked write.
+    pub fn forward_packet(
+        &self,
+        source: NodePublic,
+        destination: NodePublic,
+        packet: &[u8],
+    ) -> Result<(), ForwardPacketError> {
+        if packet.len() > MAX_PACKET_SIZE {
+            return Err(ForwardPacketError::PacketTooBig { packet_len: packet.len() });
+        }
+        let mut state = self.lock_state();
+        forward_packet_to(&mut state.writer, source, destination, packet)
     }
 
     /// Sends a Ping frame without applying the packet rate limiter.
@@ -2174,6 +2248,47 @@ mod tests {
     }
 
     #[test]
+    fn forward_packet_matches_fixed_go_wire_limit_and_wrapped_error_oracle() {
+        let source = NodePublic::from_raw32([0x31; 32]);
+        let destination = NodePublic::from_raw32([0x42; 32]);
+        let pattern = (0..=u8::MAX).collect::<Vec<_>>();
+        let max_packet = pattern.repeat(256);
+        let mut max_wire = Vec::new();
+        super::forward_packet_to(&mut max_wire, source, destination, &max_packet).unwrap();
+        assert_eq!(max_wire.len(), super::FRAME_HEADER_LEN + 2 * super::KEY_LEN + super::MAX_PACKET_SIZE);
+        assert_eq!(&max_wire[..super::FRAME_HEADER_LEN], &[0x0a, 0x00, 0x01, 0x00, 0x40]);
+        assert_eq!(&max_wire[super::FRAME_HEADER_LEN..super::FRAME_HEADER_LEN + super::KEY_LEN], &[0x31; 32]);
+        assert_eq!(
+            &max_wire[super::FRAME_HEADER_LEN + super::KEY_LEN..super::FRAME_HEADER_LEN + 2 * super::KEY_LEN],
+            &[0x42; 32]
+        );
+        assert_eq!(&max_wire[super::FRAME_HEADER_LEN + 2 * super::KEY_LEN..], max_packet.as_slice());
+
+        let before = max_wire.clone();
+        let oversized = vec![0; super::MAX_PACKET_SIZE + 1];
+        let error = super::forward_packet_to(&mut max_wire, source, destination, &oversized).unwrap_err();
+        assert_eq!(error.to_string(), "derp.ForwardPacket: packet too big: 65537");
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(max_wire, before);
+
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None);
+        writer.forward_packet(source, destination, &[0x55; 8]).unwrap();
+        let observation = observation.lock().unwrap();
+        let mut expected = vec![0x0a, 0, 0, 0, 72];
+        expected.extend_from_slice(&[0x31; 32]);
+        expected.extend_from_slice(&[0x42; 32]);
+        expected.extend_from_slice(&[0x55; 8]);
+        assert_eq!(observation.bytes, expected);
+        assert_eq!(observation.flushes, 1);
+
+        let writer = DerpSendWriter::new(FailingWriter, None);
+        let error = writer.forward_packet(source, destination, &[0x55; 8]).unwrap_err();
+        assert_eq!(error.to_string(), "derp.ForwardPacket: write failed");
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
     fn note_preferred_watch_connections_and_close_peer_match_go_wire_frames() {
         let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
         let writer = DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None);
@@ -2201,13 +2316,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_send_writer_prevents_concurrent_packet_ping_pong_frame_interleaving() {
+    fn shared_send_writer_prevents_concurrent_packet_forward_ping_pong_frame_interleaving() {
         const THREADS: usize = 8;
-        const OPERATIONS_PER_THREAD: usize = 9;
+        const OPERATIONS_PER_THREAD: usize = 12;
 
         let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
         let writer = Arc::new(DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None));
         let start = Arc::new(Barrier::new(THREADS + 1));
+        let source = NodePublic::from_raw32([0x6b; 32]);
         let destination = NodePublic::from_raw32([0x5a; 32]);
         let mut workers = Vec::new();
 
@@ -2219,12 +2335,13 @@ mod tests {
                 for operation in 0..OPERATIONS_PER_THREAD {
                     let tag = (thread_index * OPERATIONS_PER_THREAD + operation + 1) as u8;
                     let data = [tag; 8];
-                    match operation % 3 {
+                    match operation % 4 {
                         0 => writer.send_ping(data).unwrap(),
                         1 => writer.send_pong(data).unwrap(),
-                        _ => {
+                        2 => {
                             assert_eq!(writer.send_packet(destination, &data).unwrap(), super::SendPacketOutcome::Sent)
                         }
+                        _ => writer.forward_packet(source, destination, &data).unwrap(),
                     }
                 }
             }));
@@ -2252,6 +2369,12 @@ mod tests {
                     assert_eq!(frame_len, 40);
                     assert_eq!(&payload[..32], &[0x5a; 32]);
                     assert!(payload[32..].iter().all(|byte| *byte == payload[32]));
+                }
+                0x0a => {
+                    assert_eq!(frame_len, 72);
+                    assert_eq!(&payload[..32], &[0x6b; 32]);
+                    assert_eq!(&payload[32..64], &[0x5a; 32]);
+                    assert!(payload[64..].iter().all(|byte| *byte == payload[64]));
                 }
                 0x12 | 0x13 => {
                     assert_eq!(frame_len, 8);
