@@ -25,6 +25,22 @@ pub(crate) struct ClientHelloExtensionProfile {
     entries: Vec<ClientHelloExtensionProfileEntry>,
 }
 
+/// Matches Go 1.20 `crypto/rand.Int(reader, math.MaxInt64)` for exact fills.
+/// The exclusive bound is `i64::MAX`; that candidate is rejected and retried.
+fn utls_crypto_rand_int_max_int64<E>(mut fill: impl FnMut(&mut [u8]) -> Result<(), E>) -> Result<i64, E> {
+    const MAX_EXCLUSIVE: u64 = i64::MAX as u64;
+
+    loop {
+        let mut bytes = [0u8; 8];
+        fill(&mut bytes)?;
+        bytes[0] &= 0x7f;
+        let candidate = u64::from_be_bytes(bytes);
+        if candidate < MAX_EXCLUSIVE {
+            return Ok(candidate as i64);
+        }
+    }
+}
+
 impl ClientHelloExtensionProfile {
     #[allow(dead_code)] // Caller-side profile mapping is a later fork step.
     pub(crate) fn new(entries: Vec<ClientHelloExtensionProfileEntry>) -> Result<Self, ClientHelloExtensionOrderError> {
@@ -79,16 +95,34 @@ impl ClientHelloExtensionProfile {
     /// Shuffles ordinary entries using the pinned uTLS Go 1.20 small-n algorithm.
     #[allow(dead_code)] // Called only by the staged, disabled uTLS profile builder.
     pub(crate) fn shuffle_utls_extensions(&mut self, seed: i64) {
-        let reserved_slots = self
-            .entries
+        let reserved_slots = self.utls_reserved_shuffle_slots();
+        super::go_math_rand::shuffle_with_reserved_slots(&mut self.entries, &reserved_slots, seed);
+    }
+
+    /// Samples a Go-compatible cryptographic seed and shuffles. If entropy fails,
+    /// returns the source error without mutating entries. The pinned Go global
+    /// fallback has no pure-Rust equivalent, so callers must fail closed; the
+    /// user-selectable profile remains disabled.
+    #[allow(dead_code)] // The disabled profile builder is not wired to user configuration.
+    pub(crate) fn try_shuffle_utls_extensions<E>(
+        &mut self,
+        mut fill_crypto_random: impl FnMut(&mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let seed = utls_crypto_rand_int_max_int64(&mut fill_crypto_random)?;
+        let reserved_slots = self.utls_reserved_shuffle_slots();
+        super::go_math_rand::shuffle_with_reserved_slots(&mut self.entries, &reserved_slots, seed);
+        Ok(())
+    }
+
+    fn utls_reserved_shuffle_slots(&self) -> Vec<bool> {
+        self.entries
             .iter()
             .map(|entry| match entry {
                 ClientHelloExtensionProfileEntry::Grease { .. }
                 | ClientHelloExtensionProfileEntry::Typed(ExtensionType::Padding | ExtensionType::PreSharedKey) => true,
                 _ => false,
             })
-            .collect::<Vec<_>>();
-        super::go_math_rand::shuffle_with_reserved_slots(&mut self.entries, &reserved_slots, seed);
+            .collect()
     }
 
     pub(crate) fn grease_count(&self) -> usize {
@@ -291,6 +325,100 @@ mod tests {
         const GO_SHUFFLE_ORDER: [usize; 18] = [0, 12, 7, 3, 6, 16, 13, 4, 2, 9, 1, 11, 8, 5, 14, 10, 15, 17];
         let expected_entries = GO_SHUFFLE_ORDER.map(|slot| original_entries[slot].clone());
         assert_eq!(profile.entries, expected_entries);
+    }
+
+    #[test]
+    fn crypto_rand_int_max_int64_matches_go_sampling_vectors() {
+        for (sample, expected) in [(0u64, 0i64), (1u64, 1i64), (i64::MAX as u64 - 1, i64::MAX - 1)] {
+            let mut samples = [sample].into_iter();
+            let seed = utls_crypto_rand_int_max_int64(|bytes| {
+                assert_eq!(bytes.len(), 8);
+                bytes.copy_from_slice(&samples.next().expect("one exact entropy sample").to_be_bytes());
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            assert_eq!(seed, expected);
+            assert!(samples.next().is_none());
+        }
+    }
+
+    #[test]
+    fn crypto_rand_int_masks_high_bit_and_rejects_exclusive_maximum() {
+        let mut samples = [u64::MAX, 7].into_iter();
+        let mut reads = 0;
+        let seed = utls_crypto_rand_int_max_int64(|bytes| {
+            reads += 1;
+            bytes.copy_from_slice(&samples.next().expect("rejection is followed by another sample").to_be_bytes());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(seed, 7);
+        assert_eq!(reads, 2);
+        assert!(samples.next().is_none());
+    }
+
+    #[test]
+    fn crypto_seed_path_uses_pinned_shuffle() {
+        let original = vec![
+            ClientHelloExtensionProfileEntry::Grease { payload: vec![0] },
+            ClientHelloExtensionProfileEntry::Opaque {
+                extension_type: ExtensionType::Unknown(0x1201),
+                payload: vec![1],
+            },
+            ClientHelloExtensionProfileEntry::Opaque {
+                extension_type: ExtensionType::Unknown(0x1202),
+                payload: vec![2],
+            },
+            ClientHelloExtensionProfileEntry::Typed(ExtensionType::Padding),
+            ClientHelloExtensionProfileEntry::Typed(ExtensionType::PreSharedKey),
+        ];
+        let mut expected = ClientHelloExtensionProfile::new(original.clone()).unwrap();
+        expected.shuffle_utls_extensions(7);
+        let mut actual = ClientHelloExtensionProfile::new(original).unwrap();
+
+        actual
+            .try_shuffle_utls_extensions(|bytes| {
+                bytes.copy_from_slice(&7u64.to_be_bytes());
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn entropy_error_fails_closed_after_rejected_sample_without_mutation() {
+        let entries = vec![
+            ClientHelloExtensionProfileEntry::Grease { payload: vec![0] },
+            ClientHelloExtensionProfileEntry::Opaque {
+                extension_type: ExtensionType::Unknown(0x1201),
+                payload: vec![1],
+            },
+            ClientHelloExtensionProfileEntry::Opaque {
+                extension_type: ExtensionType::Unknown(0x1202),
+                payload: vec![2],
+            },
+            ClientHelloExtensionProfileEntry::Typed(ExtensionType::Padding),
+            ClientHelloExtensionProfileEntry::Typed(ExtensionType::PreSharedKey),
+        ];
+        let original = entries.clone();
+        let mut profile = ClientHelloExtensionProfile::new(entries).unwrap();
+        let mut reads = 0;
+
+        let result = profile.try_shuffle_utls_extensions(|bytes| {
+            reads += 1;
+            if reads == 1 {
+                bytes.copy_from_slice(&u64::MAX.to_be_bytes());
+                Ok(())
+            } else {
+                Err("entropy source failed")
+            }
+        });
+
+        assert_eq!(result, Err("entropy source failed"));
+        assert_eq!(reads, 2);
+        assert_eq!(profile.entries, original);
     }
 
     #[test]
