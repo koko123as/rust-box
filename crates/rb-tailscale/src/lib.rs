@@ -1,7 +1,10 @@
 //! Pure Rust primitives ported from the Tailscale fork pinned by sing-box v1.14.4.
 //!
-//! This crate currently implements the machine and node X25519 key encodings and
-//! derivation rules. It is not a Tailscale control-plane or endpoint runtime.
+//! This crate implements machine, node, and disco X25519 key primitives, plus a
+//! fail-closed plaintext codec for Disco Ping, Pong, and CallMeMaybe messages.
+//! It is not yet a Tailscale control-plane or endpoint runtime.
+
+pub mod disco;
 
 use std::error::Error;
 use std::fmt;
