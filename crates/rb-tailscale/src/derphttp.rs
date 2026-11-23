@@ -7,6 +7,8 @@
 //! scheduler select parity. A narrow post-connect slot assigns generations and guards
 //! reconnect invalidation by client identity; it does not establish sockets or own the
 //! complete `derphttp.Client` lifecycle.
+//! The `startDial` result reducer preserves completion-order errors and immediate
+//! success only; its context, timer, scheduler, and network runtime remain unimplemented.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -559,6 +561,90 @@ pub fn derp_start_dial_host_port(host: &str, port: &str) -> String {
     }
 }
 
+/// Pure reducer for the received-result branch of the pinned `startDial` race.
+///
+/// `attempts` is the caller's count of started attempts. Feed only results that
+/// the caller actually received: the first reported success wins immediately,
+/// while exhaustion returns the first error in result-arrival order. This does
+/// not model timers, context selection, channels, task scheduling, or dialing.
+#[derive(Debug)]
+pub struct DerpStartDialRace<E> {
+    attempts_remaining: usize,
+    first_error: Option<E>,
+    completed: bool,
+}
+
+/// Result of reducing one received dial attempt result.
+#[derive(Debug, Eq, PartialEq)]
+pub enum DerpStartDialRaceOutcome<C, E> {
+    Pending,
+    Connected(C),
+    Failed(E),
+}
+
+/// A zero-attempt startDial race or a result submitted after a terminal outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpStartDialRaceError {
+    NoDialAttempts,
+    ResultAfterCompletion,
+}
+
+impl fmt::Display for DerpStartDialRaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoDialAttempts => f.write_str("both IPv4 and IPv6 are explicitly disabled for node"),
+            Self::ResultAfterCompletion => f.write_str("dial result received after startDial race completed"),
+        }
+    }
+}
+
+impl Error for DerpStartDialRaceError {}
+
+impl<E> DerpStartDialRace<E> {
+    /// Creates a reducer for the number of attempts already started by the caller.
+    pub fn new(attempts: usize) -> Result<Self, DerpStartDialRaceError> {
+        if attempts == 0 {
+            return Err(DerpStartDialRaceError::NoDialAttempts);
+        }
+        Ok(Self { attempts_remaining: attempts, first_error: None, completed: false })
+    }
+
+    /// Reduces one received result in arrival order.
+    pub fn record_result<C>(
+        &mut self,
+        result: Result<C, E>,
+    ) -> Result<DerpStartDialRaceOutcome<C, E>, DerpStartDialRaceError> {
+        if self.completed {
+            return Err(DerpStartDialRaceError::ResultAfterCompletion);
+        }
+
+        self.attempts_remaining -= 1;
+        match result {
+            Ok(connection) => {
+                self.completed = true;
+                self.first_error = None;
+                Ok(DerpStartDialRaceOutcome::Connected(connection))
+            }
+            Err(error) => {
+                let first_error = match self.first_error.take() {
+                    Some(first_error) => {
+                        drop(error);
+                        first_error
+                    }
+                    None => error,
+                };
+                if self.attempts_remaining == 0 {
+                    self.completed = true;
+                    Ok(DerpStartDialRaceOutcome::Failed(first_error))
+                } else {
+                    self.first_error = Some(first_error);
+                    Ok(DerpStartDialRaceOutcome::Pending)
+                }
+            }
+        }
+    }
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -946,9 +1032,10 @@ mod tests {
         derp_region_url_string, derp_should_dial_proto_from_parsed, derp_should_dial_proto_from_supported_text,
         derp_start_dial_host_port, derp_start_dial_target_from_parsed, derp_url_port_from_parsed_parts, derp_use_https,
         ping_deadline, DerpClientState, DerpDialProtocol, DerpParsedDialField, DerpParsedDialTarget,
-        DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpUnsupportedDialAddressText,
-        DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient,
-        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpStartDialRace,
+        DerpStartDialRaceError, DerpStartDialRaceOutcome, DerpUnsupportedDialAddressText, DerpUrlPortError,
+        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
+        DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -1266,6 +1353,29 @@ mod tests {
         for (host, port, expected) in cases {
             assert_eq!(derp_start_dial_host_port(host, port), expected);
         }
+    }
+
+    #[test]
+    fn start_dial_race_zero_attempt_error_matches_pinned_fork() {
+        let error = DerpStartDialRace::<&str>::new(0).unwrap_err();
+        assert_eq!(error, DerpStartDialRaceError::NoDialAttempts);
+        assert_eq!(error.to_string(), "both IPv4 and IPv6 are explicitly disabled for node");
+    }
+
+    #[test]
+    fn start_dial_race_returns_first_arriving_error_when_all_attempts_fail() {
+        let mut race = DerpStartDialRace::<&str>::new(3).unwrap();
+        assert_eq!(race.record_result::<()>(Err("first")), Ok(DerpStartDialRaceOutcome::Pending));
+        assert_eq!(race.record_result::<()>(Err("second")), Ok(DerpStartDialRaceOutcome::Pending));
+        assert_eq!(race.record_result::<()>(Err("third")), Ok(DerpStartDialRaceOutcome::Failed("first")));
+    }
+
+    #[test]
+    fn start_dial_race_success_wins_and_rejects_results_after_completion() {
+        let mut race = DerpStartDialRace::<&str>::new(2).unwrap();
+        assert_eq!(race.record_result::<()>(Err("first")), Ok(DerpStartDialRaceOutcome::Pending));
+        assert_eq!(race.record_result::<&str>(Ok("connected")), Ok(DerpStartDialRaceOutcome::Connected("connected")));
+        assert_eq!(race.record_result::<()>(Err("late")), Err(DerpStartDialRaceError::ResultAfterCompletion));
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);

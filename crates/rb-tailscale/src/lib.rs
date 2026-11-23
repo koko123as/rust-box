@@ -38,6 +38,8 @@
 //! and usable zone-aware dial-address construction remain unimplemented. The target guard alone is not input validation.
 //! The `startDial` host-port formatter mirrors `net.JoinHostPort`'s raw colon/bracket
 //! rule only; it does not validate, resolve, or dial the resulting address.
+//! A pure result reducer preserves the first reported dial error and immediate success
+//! only; it does not implement context selection or execute dial attempts.
 //! Explicit-URL parsing, TLS handshakes, network dialing, socket setup, reconnect
 //! retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
