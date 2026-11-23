@@ -69,6 +69,8 @@ libc = "0.2"
 httparse = "1"
 rand = "0.9"
 zeroize = "1"
+crypto_secretbox = { version = "=0.1.1", default-features = false, features = ["alloc", "salsa20"] }
+salsa20 = { version = "=0.10.2", default-features = false, features = ["zeroize"] }
 flate2 = "1"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"

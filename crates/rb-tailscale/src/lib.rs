@@ -5,6 +5,7 @@
 //! It is not yet a Tailscale control-plane or endpoint runtime.
 
 pub mod disco;
+pub mod disco_crypto;
 
 use std::error::Error;
 use std::fmt;
