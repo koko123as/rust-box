@@ -377,7 +377,7 @@ fn decode_hex_key(input: &str, prefix: &'static str) -> Result<[u8; KEY_BYTES], 
         return Err(KeyParseError::WrongLength { got: encoded.len(), want });
     }
     let mut output = [0; KEY_BYTES];
-    for (index, pair) in encoded.chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_chunks::<2>().0.iter().enumerate() {
         let Some(high) = hex_value(pair[0]) else {
             output.zeroize();
             return Err(KeyParseError::InvalidHex);
