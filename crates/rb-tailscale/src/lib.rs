@@ -29,6 +29,8 @@
 //! operate only on already-parsed scheme/port and debug inputs. A separate pure
 //! region dial-port selector models the 443/3340 fallback and nonzero DERPPort
 //! override, rejecting values outside the TCP port range; it does not open sockets.
+//! The `shouldDialProto` family decision accepts already-classified address fields;
+//! Go `netip` text and IPv6 zone parsing remain the caller's responsibility.
 //! Explicit-URL parsing, TLS handshakes, network dialing, socket setup, reconnect
 //! retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full

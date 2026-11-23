@@ -417,6 +417,39 @@ pub fn derp_region_dial_port(derp_port: isize, use_https: bool) -> Result<String
     Ok(port.to_string())
 }
 
+/// An already-classified DERP node address field; no text parsing is performed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpParsedDialField {
+    /// An empty field permits dialing with the node hostname as the fallback.
+    Empty,
+    /// A nonempty field which did not parse as an IP address.
+    Invalid,
+    /// A parsed IP address; IPv4-mapped IPv6 must remain the IPv6 variant.
+    Address(std::net::IpAddr),
+}
+
+/// The IP family for a region node's candidate TCP dial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpDialProtocol {
+    Tcp4,
+    Tcp6,
+}
+
+/// Applies the pinned `shouldDialProto` decision to an already-parsed field.
+///
+/// The caller must classify text with Go `netip.ParseAddr` semantics, including
+/// IPv6 zones. This helper neither parses addresses nor starts a dial.
+pub fn derp_should_dial_proto_from_parsed(field: DerpParsedDialField, protocol: DerpDialProtocol) -> bool {
+    match field {
+        DerpParsedDialField::Empty => true,
+        DerpParsedDialField::Invalid => false,
+        DerpParsedDialField::Address(address) => match protocol {
+            DerpDialProtocol::Tcp4 => address.is_ipv4(),
+            DerpDialProtocol::Tcp6 => address.is_ipv6(),
+        },
+    }
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -800,10 +833,11 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_region_dial_port, derp_region_tls_server_name, derp_region_url_string, derp_url_port_from_parsed_parts,
-        derp_use_https, ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry,
-        DerpRegionUrlError, DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError,
-        DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_region_dial_port, derp_region_tls_server_name, derp_region_url_string, derp_should_dial_proto_from_parsed,
+        derp_url_port_from_parsed_parts, derp_use_https, ping_deadline, DerpClientState, DerpDialProtocol,
+        DerpParsedDialField, DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpUrlPortError,
+        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
+        DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -978,6 +1012,28 @@ mod tests {
         assert_eq!(derp_region_dial_port(u16::MAX as isize, true).unwrap(), "65535");
         assert_eq!(derp_region_dial_port(-1, true), Err(DerpRegionUrlError::PortOutOfRange));
         assert_eq!(derp_region_dial_port(u16::MAX as isize + 1, true), Err(DerpRegionUrlError::PortOutOfRange));
+    }
+
+    #[test]
+    fn should_dial_proto_matches_fixed_fork_for_preclassified_fields() {
+        use DerpDialProtocol::{Tcp4, Tcp6};
+        use DerpParsedDialField::{Address, Empty, Invalid};
+
+        let ipv4 = Address("192.0.2.1".parse().unwrap());
+        let ipv6 = Address("2001:db8::1".parse().unwrap());
+        let link_local_ipv6 = Address("fe80::1".parse().unwrap());
+        let mapped = Address("::ffff:192.0.2.1".parse().unwrap());
+        for (field, tcp4, tcp6) in [
+            (Empty, true, true),
+            (Invalid, false, false),
+            (ipv4, true, false),
+            (ipv6, false, true),
+            (link_local_ipv6, false, true),
+            (mapped, false, true),
+        ] {
+            assert_eq!(derp_should_dial_proto_from_parsed(field, Tcp4), tcp4, "{field:?} tcp4");
+            assert_eq!(derp_should_dial_proto_from_parsed(field, Tcp6), tcp6, "{field:?} tcp6");
+        }
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
