@@ -140,6 +140,7 @@ pub enum StreamReadFrameError {
     UnexpectedEndOfInput,
     ExceedsLimit { frame_len: u32, max_size: u32 },
     ShortBuffer { header: FrameHeader },
+    Allocation,
     Io(io::Error),
 }
 
@@ -152,6 +153,7 @@ impl fmt::Display for StreamReadFrameError {
                 write!(f, "frame header size {frame_len} exceeds reader limit of {max_size}")
             }
             Self::ShortBuffer { .. } => f.write_str("short buffer"),
+            Self::Allocation => f.write_str("unable to allocate DERP frame buffer"),
             Self::Io(error) => error.fmt(f),
         }
     }
@@ -161,9 +163,11 @@ impl Error for StreamReadFrameError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::EndOfInput | Self::UnexpectedEndOfInput | Self::ExceedsLimit { .. } | Self::ShortBuffer { .. } => {
-                None
-            }
+            Self::EndOfInput
+            | Self::UnexpectedEndOfInput
+            | Self::ExceedsLimit { .. }
+            | Self::ShortBuffer { .. }
+            | Self::Allocation => None,
         }
     }
 }
@@ -187,6 +191,21 @@ fn read_full_from<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), Stre
     Ok(())
 }
 
+fn read_frame_header_from<R: Read>(reader: &mut R) -> Result<FrameHeader, StreamReadFrameError> {
+    let mut encoded_header = [0; FRAME_HEADER_LEN];
+    read_full_from(reader, &mut encoded_header)?;
+    Ok(FrameHeader {
+        frame_type: FrameType(encoded_header[0]),
+        frame_len: u32::from_be_bytes([encoded_header[1], encoded_header[2], encoded_header[3], encoded_header[4]]),
+    })
+}
+
+fn reserve_frame_payload(payload_len: usize) -> Result<Vec<u8>, StreamReadFrameError> {
+    let mut payload = Vec::new();
+    payload.try_reserve_exact(payload_len).map_err(|_| StreamReadFrameError::Allocation)?;
+    Ok(payload)
+}
+
 /// Reads one bounded DERP frame from a blocking stream, matching the pinned
 /// fork's `readFrame` payload consumption and short-buffer behavior.
 ///
@@ -199,12 +218,7 @@ pub fn read_frame_from<R: Read>(
     max_size: u32,
     output: &mut [u8],
 ) -> Result<FrameHeader, StreamReadFrameError> {
-    let mut encoded_header = [0; FRAME_HEADER_LEN];
-    read_full_from(reader, &mut encoded_header)?;
-    let header = FrameHeader {
-        frame_type: FrameType(encoded_header[0]),
-        frame_len: u32::from_be_bytes([encoded_header[1], encoded_header[2], encoded_header[3], encoded_header[4]]),
-    };
+    let header = read_frame_header_from(reader)?;
     if header.frame_len > max_size {
         return Err(StreamReadFrameError::ExceedsLimit { frame_len: header.frame_len, max_size });
     }
@@ -228,6 +242,24 @@ pub fn read_frame_from<R: Read>(
         return Err(StreamReadFrameError::ShortBuffer { header });
     }
     Ok(header)
+}
+
+/// Reads one complete bounded DERP frame, allocating only the advertised
+/// payload length after validating it against `max_size`. The header is already
+/// consumed if allocation fails; in that case the payload remains unread.
+pub fn read_frame_vec_from<R: Read>(
+    reader: &mut R,
+    max_size: u32,
+) -> Result<(FrameHeader, Vec<u8>), StreamReadFrameError> {
+    let header = read_frame_header_from(reader)?;
+    if header.frame_len > max_size {
+        return Err(StreamReadFrameError::ExceedsLimit { frame_len: header.frame_len, max_size });
+    }
+    let payload_len = header.frame_len as usize;
+    let mut payload = reserve_frame_payload(payload_len)?;
+    payload.resize(payload_len, 0);
+    read_full_from(reader, &mut payload)?;
+    Ok((header, payload))
 }
 
 /// Failure to append a complete frame to an output buffer.
@@ -946,6 +978,38 @@ impl Error for ServerInfoFrameError {
     }
 }
 
+/// Errors while reading and parsing one ServerInfo frame from a blocking stream.
+#[derive(Debug)]
+pub enum StreamServerInfoError {
+    Read(StreamReadFrameError),
+    Oversized { frame_len: u32 },
+    UnexpectedType { got: FrameType },
+    Payload(ServerInfoError),
+}
+
+impl fmt::Display for StreamServerInfoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(f),
+            Self::Oversized { frame_len } => write!(f, "unexpectedly large frame of {frame_len} bytes returned"),
+            Self::UnexpectedType { got } => {
+                write!(f, "bad frame type 0x{:X}, want 0x{:X}", got.0, FRAME_SERVER_INFO.0)
+            }
+            Self::Payload(error) => write!(f, "invalid server info frame: {error}"),
+        }
+    }
+}
+
+impl Error for StreamServerInfoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Payload(error) => Some(error),
+            Self::Oversized { .. } | Self::UnexpectedType { .. } => None,
+        }
+    }
+}
+
 /// Parses one complete ServerInfo frame from an in-memory byte slice.
 ///
 /// The returned `usize` is the number of bytes consumed, so a following frame
@@ -991,6 +1055,32 @@ pub fn parse_server_info_message_frame(
 ) -> Result<(ServerInfoMessage, usize), ServerInfoFrameError> {
     let (info, consumed) = parse_server_info_frame(client_private, server_public, frame)?;
     Ok((info.into_message(), consumed))
+}
+
+/// Reads and parses exactly one ServerInfo frame from a blocking stream.
+///
+/// The Client.Recv 1 MiB frame limit is applied before allocating its payload.
+/// Unlike Client.Recv, this narrow helper returns an error for a non-ServerInfo
+/// frame instead of dispatching or skipping it; it returns configuration only
+/// and does not install or execute a token-bucket limiter.
+pub fn read_server_info_message_from<R: Read>(
+    reader: &mut R,
+    client_private: &NodePrivate,
+    server_public: &NodePublic,
+) -> Result<ServerInfoMessage, StreamServerInfoError> {
+    let (header, payload) = match read_frame_vec_from(reader, MAX_CLIENT_RECV_FRAME_LEN as u32) {
+        Ok(frame) => frame,
+        Err(StreamReadFrameError::ExceedsLimit { frame_len, .. }) => {
+            return Err(StreamServerInfoError::Oversized { frame_len });
+        }
+        Err(error) => return Err(StreamServerInfoError::Read(error)),
+    };
+    if header.frame_type != FRAME_SERVER_INFO {
+        return Err(StreamServerInfoError::UnexpectedType { got: header.frame_type });
+    }
+    let info =
+        parse_server_info_payload(client_private, server_public, &payload).map_err(StreamServerInfoError::Payload)?;
+    Ok(info.into_message())
 }
 
 fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
@@ -1747,6 +1837,72 @@ mod tests {
             Err(StreamReadFrameError::ExceedsLimit { frame_len: 11, max_size: 10 })
         ));
         assert_eq!(too_large.remaining(), &[0xaa; 11]);
+    }
+
+    #[test]
+    fn stream_frame_vec_reader_reports_reservation_failure() {
+        assert!(matches!(super::reserve_frame_payload(usize::MAX), Err(StreamReadFrameError::Allocation)));
+        assert_eq!(StreamReadFrameError::Allocation.to_string(), "unable to allocate DERP frame buffer");
+    }
+
+    #[test]
+    fn stream_server_info_reader_matches_go_oracle_and_failure_boundaries() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let payload = decode_hex("808182838485868788898a8b8c8d8e8f90919293949596972a5043cecfb67d977e3a71109462311a38a15b673d7b2bf55da90ef8f0d0c5313f73665a84fefee88e79c04d9f28b8eedadcd657528c5f0c7a08671cf92cd641f0e77fae5c0817566ac2b69be71d61523ec54dd49e137aaa9e0e19cb487e0f7557d9");
+        let mut wire = Vec::new();
+        write_frame(&mut wire, super::FRAME_SERVER_INFO, &payload).unwrap();
+        wire.extend_from_slice(&[0x12, 0, 0, 0, 0]);
+        let mut reader = ChunkedReader::new(wire, 7);
+        let message = super::read_server_info_message_from(&mut reader, &alice, &bob_public).unwrap();
+        assert_eq!(message.token_bucket_bytes_per_second, 16_777_216);
+        assert_eq!(message.token_bucket_bytes_burst, 4_194_304);
+        assert_eq!(reader.remaining(), &[0x12, 0, 0, 0, 0]);
+
+        let mut empty = ChunkedReader::new(Vec::new(), 2);
+        assert!(matches!(
+            super::read_server_info_message_from(&mut empty, &alice, &bob_public),
+            Err(super::StreamServerInfoError::Read(StreamReadFrameError::EndOfInput))
+        ));
+        let mut partial_header = ChunkedReader::new(vec![0x03, 0], 1);
+        assert!(matches!(
+            super::read_server_info_message_from(&mut partial_header, &alice, &bob_public),
+            Err(super::StreamServerInfoError::Read(StreamReadFrameError::UnexpectedEndOfInput))
+        ));
+
+        let mut truncated = FrameHeader { frame_type: super::FRAME_SERVER_INFO, frame_len: 3 }.encode().to_vec();
+        truncated.extend_from_slice(&[0xaa, 0xbb]);
+        let mut truncated = ChunkedReader::new(truncated, 2);
+        assert!(matches!(
+            super::read_server_info_message_from(&mut truncated, &alice, &bob_public),
+            Err(super::StreamServerInfoError::Read(StreamReadFrameError::UnexpectedEndOfInput))
+        ));
+
+        let over_limit = FrameHeader {
+            frame_type: super::FRAME_SERVER_INFO,
+            frame_len: (super::MAX_CLIENT_RECV_FRAME_LEN + 1) as u32,
+        }
+        .encode();
+        let mut over_limit = over_limit.to_vec();
+        over_limit.push(0xee);
+        let mut over_limit = ChunkedReader::new(over_limit, 2);
+        assert!(matches!(
+            super::read_server_info_message_from(&mut over_limit, &alice, &bob_public),
+            Err(super::StreamServerInfoError::Oversized { frame_len })
+                if frame_len == (super::MAX_CLIENT_RECV_FRAME_LEN + 1) as u32
+        ));
+        assert_eq!(over_limit.remaining(), &[0xee]);
+
+        let mut wrong_type = Vec::new();
+        write_frame(&mut wrong_type, FrameType(0x12), &[]).unwrap();
+        let mut wrong_type = ChunkedReader::new(wrong_type, 2);
+        assert!(matches!(
+            super::read_server_info_message_from(&mut wrong_type, &alice, &bob_public),
+            Err(super::StreamServerInfoError::UnexpectedType { got: FrameType(0x12) })
+        ));
     }
 
     #[test]
