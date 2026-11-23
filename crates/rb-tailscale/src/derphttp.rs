@@ -464,10 +464,10 @@ impl Error for DerpUnsupportedDialAddressText {}
 
 /// Classifies a deliberately limited subset of a DERP IP address field.
 ///
-/// Empty text, canonical dotted IPv4, and eight four-digit IPv6 hex groups are
-/// supported. Other forms, including compressed IPv6, zones, invalid addresses,
-/// and hostnames, return an error rather than being classified as a Go parse
-/// failure. This is not a general Go `netip.ParseAddr` replacement.
+/// Empty text, canonical dotted IPv4, and IPv6 containing only ASCII hexadecimal
+/// digits and colons are supported. Zones, embedded dotted IPv4 in IPv6, invalid
+/// addresses, and hostnames return an error rather than being classified as a Go
+/// parse failure. This is not a general Go `netip.ParseAddr` replacement.
 pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialField, DerpUnsupportedDialAddressText> {
     if text.is_empty() {
         return Ok(DerpParsedDialField::Empty);
@@ -475,11 +475,7 @@ pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialF
     if let Some(address) = text.parse::<std::net::Ipv4Addr>().ok().filter(|address| address.to_string() == text) {
         return Ok(DerpParsedDialField::Address(address.into()));
     }
-    let mut groups = text.split(':');
-    if (0..8)
-        .all(|_| groups.next().is_some_and(|group| group.len() == 4 && group.bytes().all(|b| b.is_ascii_hexdigit())))
-        && groups.next().is_none()
-    {
+    if text.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':') {
         return text
             .parse::<std::net::Ipv6Addr>()
             .map(|address| DerpParsedDialField::Address(address.into()))
@@ -1137,6 +1133,13 @@ mod tests {
             ("0123:4567:89ab:cdef:0000:0000:0000:0001", false, true),
             ("0123:4567:89AB:CDEF:0000:0000:0000:0001", false, true),
             ("0000:0000:0000:0000:0000:ffff:c000:0201", false, true),
+            ("::", false, true),
+            ("::1", false, true),
+            ("1::", false, true),
+            ("1:2:3:4:5:6:7:8", false, true),
+            ("1:2:3:4:5:6:7::", false, true),
+            ("2001:db8::1", false, true),
+            ("::ffff:c000:201", false, true),
         ] {
             assert_eq!(derp_should_dial_proto_from_supported_text(text, Tcp4), Ok(tcp4), "{text:?}");
             assert_eq!(derp_should_dial_proto_from_supported_text(text, Tcp6), Ok(tcp6), "{text:?}");
@@ -1145,12 +1148,19 @@ mod tests {
             "192.168.001.1",
             "192.0.2.256",
             "192.0.2",
-            "::1",
             "fe80::1%eth0",
             "fe80::1%",
+            "::ffff:192.0.2.1",
             "bad host",
             "0000:0000:0000:0000:0000:0000:0000:000g",
             "0000:0000:0000:0000:0000:0000:0000:0000:0000",
+            "1:2:3:4:5:6:7:8::",
+            "1::2::3",
+            ":1",
+            "1:",
+            ":::1",
+            "1:::2",
+            "10000::",
         ] {
             assert_eq!(derp_dial_field_from_supported_text(text), Err(DerpUnsupportedDialAddressText), "{text:?}");
             assert_eq!(

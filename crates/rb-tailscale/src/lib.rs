@@ -31,9 +31,9 @@
 //! override, rejecting values outside the TCP port range; it does not open sockets.
 //! The `shouldDialProto` family decision and `startDial` target/family guard accept
 //! already-classified address fields. A limited IP-field classifier supports empty,
-//! canonical dotted IPv4 and eight full IPv6 groups, rejecting all other text.
-//! General Go `netip` text and IPv6 zone parsing remain unimplemented. The target
-//! guard alone is not input validation.
+//! canonical dotted IPv4 and IPv6 containing only hexadecimal digits and colons,
+//! rejecting all other text. General Go `netip` text, IPv6 zone and embedded dotted
+//! IPv4 parsing remain unimplemented. The target guard alone is not input validation.
 //! Explicit-URL parsing, TLS handshakes, network dialing, socket setup, reconnect
 //! retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
