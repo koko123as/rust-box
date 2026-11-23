@@ -6,6 +6,7 @@
 
 pub mod disco;
 pub mod disco_crypto;
+pub mod geneve;
 
 use std::error::Error;
 use std::fmt;
