@@ -424,7 +424,8 @@ pub enum DerpParsedDialField {
     Empty,
     /// A nonempty field which did not parse as an IP address.
     Invalid,
-    /// A parsed IP address; IPv4-mapped IPv6 must remain the IPv6 variant.
+    /// A parsed IP address for family selection; IPv4-mapped IPv6 remains IPv6.
+    /// The supported-text helper discards an IPv6 zone in this family-only value.
     Address(std::net::IpAddr),
 }
 
@@ -464,10 +465,13 @@ impl Error for DerpUnsupportedDialAddressText {}
 
 /// Classifies a deliberately limited subset of a DERP IP address field.
 ///
-/// Empty text, canonical dotted IPv4, and IPv6 containing only ASCII hexadecimal
-/// digits and colons are supported. Zones, embedded dotted IPv4 in IPv6, invalid
-/// addresses, and hostnames return an error rather than being classified as a Go
-/// parse failure. This is not a general Go `netip.ParseAddr` replacement.
+/// Empty text, canonical dotted IPv4, and IPv6 whose address part contains only
+/// ASCII hexadecimal digits and colons are supported. IPv6 may have a nonempty
+/// UTF-8 zone after the first `%`; it is discarded in the returned family-only
+/// value, so callers must retain the original text for any later operation.
+/// Embedded dotted IPv4 in IPv6, invalid addresses, and hostnames return an error
+/// rather than being classified as a Go parse failure. This is not a general Go
+/// `netip.ParseAddr` replacement and does not produce a usable dial address.
 pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialField, DerpUnsupportedDialAddressText> {
     if text.is_empty() {
         return Ok(DerpParsedDialField::Empty);
@@ -475,8 +479,13 @@ pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialF
     if let Some(address) = text.parse::<std::net::Ipv4Addr>().ok().filter(|address| address.to_string() == text) {
         return Ok(DerpParsedDialField::Address(address.into()));
     }
-    if text.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':') {
-        return text
+    let address_text = match text.split_once('%') {
+        Some((address_text, zone)) if !zone.is_empty() => address_text,
+        Some(_) => return Err(DerpUnsupportedDialAddressText),
+        None => text,
+    };
+    if address_text.contains(':') && address_text.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':') {
+        return address_text
             .parse::<std::net::Ipv6Addr>()
             .map(|address| DerpParsedDialField::Address(address.into()))
             .map_err(|_| DerpUnsupportedDialAddressText);
@@ -495,8 +504,9 @@ pub fn derp_should_dial_proto_from_supported_text(
 
 /// A destination paired with the caller's Go `netip.ParseAddr`-equivalent result.
 ///
-/// `None` means parsing the text failed; IPv6 zone information need not be
-/// retained for the family decision. This type does not validate the pairing.
+/// `text` remains verbatim, including any IPv6 zone. The optional parsed address
+/// is only for family gating and need not retain the zone; it is not a usable
+/// zone-aware dial address. This type does not validate the pairing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DerpParsedDialTarget<'a> {
     text: &'a str,
@@ -1140,6 +1150,13 @@ mod tests {
             ("1:2:3:4:5:6:7::", false, true),
             ("2001:db8::1", false, true),
             ("::ffff:c000:201", false, true),
+            ("fe80::1%eth0", false, true),
+            ("fe80::%eth0", false, true),
+            ("fe80::1%a%b", false, true),
+            ("fe80::1%%", false, true),
+            ("fe80::1% \t", false, true),
+            ("fe80::1%界", false, true),
+            ("::ffff:c000:201%z", false, true),
         ] {
             assert_eq!(derp_should_dial_proto_from_supported_text(text, Tcp4), Ok(tcp4), "{text:?}");
             assert_eq!(derp_should_dial_proto_from_supported_text(text, Tcp6), Ok(tcp6), "{text:?}");
@@ -1148,9 +1165,11 @@ mod tests {
             "192.168.001.1",
             "192.0.2.256",
             "192.0.2",
-            "fe80::1%eth0",
             "fe80::1%",
+            "fe80::g%eth0",
+            "::ffff:192.0.2.1%z",
             "::ffff:192.0.2.1",
+            "192.0.2.1%eth0",
             "bad host",
             "0000:0000:0000:0000:0000:0000:0000:000g",
             "0000:0000:0000:0000:0000:0000:0000:0000:0000",
