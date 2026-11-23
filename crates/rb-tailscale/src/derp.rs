@@ -636,6 +636,15 @@ impl<W: Write> DerpSendWriter<W> {
         let target_bytes = target.raw_bytes();
         write_frame_to(&mut state.writer, FRAME_CLOSE_PEER, &target_bytes)
     }
+
+    /// Applies a decoded ServerInfo message like the pinned fork's
+    /// `Client.setSendRateLimiter`, under the same lock used by packet writes.
+    /// A zero rate removes the limiter; any nonzero rate creates a fresh limiter
+    /// with its initial burst tokens. This does not parse or receive ServerInfo.
+    pub fn set_rate_limiter_from_server_info(&self, server_info: ServerInfoMessage) {
+        let mut state = self.lock_state();
+        state.limiter = server_info.rate_limiter_config().map(DerpSendRateLimiter::new);
+    }
 }
 
 /// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
@@ -2245,6 +2254,30 @@ mod tests {
         expected.extend_from_slice(&[0x13, 0, 0, 0, 8, 8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(observation.bytes, expected);
         assert_eq!(observation.flushes, 3);
+    }
+
+    #[test]
+    fn server_info_replaces_or_disables_shared_send_limiter_like_go_client_recv() {
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None);
+        let destination = NodePublic::from_raw32([0x73; 32]);
+        let packet = [0x29; 10];
+        let limited = super::ServerInfoMessage { token_bucket_bytes_per_second: 1, token_bucket_bytes_burst: 47 };
+
+        writer.set_rate_limiter_from_server_info(limited);
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Sent);
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Dropped);
+
+        writer.set_rate_limiter_from_server_info(limited);
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Sent);
+
+        writer.set_rate_limiter_from_server_info(super::ServerInfoMessage {
+            token_bucket_bytes_per_second: 0,
+            token_bucket_bytes_burst: 0,
+        });
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Sent);
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), super::SendPacketOutcome::Sent);
+        assert_eq!(observation.lock().unwrap().flushes, 4);
     }
 
     #[test]

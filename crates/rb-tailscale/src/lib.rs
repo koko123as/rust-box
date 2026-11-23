@@ -10,12 +10,12 @@
 //! support, ServerInfo parsing and send-rate configuration mapping, and bounded
 //! blocking-stream routing for the pinned fork's recognized received-message
 //! frame types with a session helper for 120-second read-deadline requests and
-//! permanent first-error latching, plus Go-oracle-tested Send-packet rules and a
-//! shared-lock writer for packet, Ping/Pong, NotePreferred, WatchConnectionChanges,
-//! and ClosePeer writes, plus a bounded ForwardPacket writer matching its packet
-//! limit, frame, error, and lock behavior. Its five-second connection-close timeout,
-//! other DERP writer methods, automatic Ping responses, and the complete Tailscale
-//! endpoint runtime are not yet implemented.
+//! permanent first-error latching, plus a shared writer that applies decoded
+//! ServerInfo rate settings and serializes Send/ForwardPacket, Ping/Pong,
+//! NotePreferred, WatchConnectionChanges, and ClosePeer operations. Send and
+//! ForwardPacket size, wire, error, and lock behavior are covered. The ForwardPacket
+//! five-second connection-close timeout, other DERP writer methods, automatic Ping
+//! responses, and the complete Tailscale endpoint runtime are not yet implemented.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
