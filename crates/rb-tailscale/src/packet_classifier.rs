@@ -5,10 +5,7 @@
 //! A WireGuard result is only the pinned fork's fallback guess; it does not
 //! validate WireGuard contents or implement socket, peer, or endpoint runtime.
 
-use crate::{disco, geneve};
-
-const STUN_HEADER_LEN: usize = 20;
-const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+use crate::{disco, geneve, stun};
 
 /// The packet type guessed by magicsock's `packetLooksLike` classifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +25,7 @@ pub enum PacketKind {
 /// back to `WireGuard`, as in the Go source; callers must still validate or
 /// reject it in the next protocol layer.
 pub fn packet_looks_like(packet: &[u8]) -> (PacketKind, bool) {
-    if is_stun(packet) && packet[1] == 0x01 {
+    if stun::is_stun(packet) && packet[1] == 0x01 {
         return (PacketKind::StunBinding, false);
     }
 
@@ -52,10 +49,6 @@ pub fn packet_looks_like(packet: &[u8]) -> (PacketKind, bool) {
     } else {
         (PacketKind::WireGuard, false)
     }
-}
-
-fn is_stun(packet: &[u8]) -> bool {
-    packet.len() >= STUN_HEADER_LEN && packet[0] & 0xc0 == 0 && packet[4..8] == STUN_MAGIC_COOKIE
 }
 
 #[cfg(test)]
