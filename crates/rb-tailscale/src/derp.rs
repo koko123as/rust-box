@@ -1,13 +1,16 @@
 //! DERP slice primitives from the Tailscale fork pinned by sing-box v1.14.4.
 //!
 //! This module provides header codecs, bounded frame slice reads/writes, a
-//! server-greeting parser, ClientInfo JSON encoding, and in-memory encrypted
-//! ClientInfo frame construction. Node-key box primitives live in `disco_crypto`;
-//! a streaming DERP client/server, transport lifecycle, and server authentication
-//! remain unimplemented.
+//! server-greeting parser, ClientInfo JSON encoding and in-memory encrypted frame
+//! construction, and bounded ServerInfo payload decryption/JSON parsing. Node-key
+//! box primitives live in `disco_crypto`; a streaming DERP client/server,
+//! transport lifecycle, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
+
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
 
@@ -342,6 +345,132 @@ fn encode_client_info_frame(sender: NodePublic, sealed: &[u8]) -> Result<Vec<u8>
     Ok(frame)
 }
 
+/// NaCl box nonce size used by DERP ServerInfo payloads.
+pub const SERVER_INFO_NONCE_LEN: usize = 24;
+/// Maximum plaintext ServerInfo size accepted by the pinned fork.
+pub const MAX_SERVER_INFO_JSON_LEN: usize = 1 << 20;
+/// Maximum encrypted ServerInfo payload accepted by the pinned fork.
+pub const MAX_SERVER_INFO_PAYLOAD_LEN: usize = SERVER_INFO_NONCE_LEN + MAX_SERVER_INFO_JSON_LEN;
+
+/// The numeric rate limits carried by the pinned fork's DERP ServerInfo JSON.
+///
+/// The decoder preserves Go's ASCII case-insensitive field matching, duplicate
+/// field order, null-as-no-op behavior, and signed 64-bit integer range. It
+/// rejects non-ASCII field names rather than silently misreading Go's Unicode
+/// simple-fold matches; malformed UTF-8 and Go's exact JSON error wording also
+/// intentionally remain outside this parser's compatibility claim.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServerInfo {
+    pub version: i64,
+    pub token_bucket_bytes_per_second: i64,
+    pub token_bucket_bytes_burst: i64,
+}
+
+impl<'de> Deserialize<'de> for ServerInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ServerInfoVisitor;
+
+        impl<'de> Visitor<'de> for ServerInfoVisitor {
+            type Value = ServerInfo;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a DERP ServerInfo object or null")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(ServerInfo::default())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut info = ServerInfo::default();
+                while let Some(field) = map.next_key::<String>()? {
+                    if !field.is_ascii() {
+                        return Err(de::Error::custom("non-ASCII ServerInfo field names are unsupported"));
+                    }
+                    if field.eq_ignore_ascii_case("version") {
+                        if let Some(value) = map.next_value::<Option<i64>>()? {
+                            info.version = value;
+                        }
+                    } else if field.eq_ignore_ascii_case("TokenBucketBytesPerSecond") {
+                        if let Some(value) = map.next_value::<Option<i64>>()? {
+                            info.token_bucket_bytes_per_second = value;
+                        }
+                    } else if field.eq_ignore_ascii_case("TokenBucketBytesBurst") {
+                        if let Some(value) = map.next_value::<Option<i64>>()? {
+                            info.token_bucket_bytes_burst = value;
+                        }
+                    } else {
+                        let _: IgnoredAny = map.next_value()?;
+                    }
+                }
+                Ok(info)
+            }
+        }
+
+        deserializer.deserialize_any(ServerInfoVisitor)
+    }
+}
+
+/// Errors while validating and opening an encrypted DERP ServerInfo payload.
+#[derive(Debug)]
+pub enum ServerInfoError {
+    ShortFrame { got: usize },
+    LongFrame { got: usize, max: usize },
+    Box(NodeBoxError),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for ServerInfoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShortFrame { .. } => f.write_str("short serverInfo frame"),
+            Self::LongFrame { .. } => f.write_str("long serverInfo frame"),
+            Self::Box(error) => write!(f, "failed to open DERP ServerInfo box: {error}"),
+            Self::Json(error) => write!(f, "invalid JSON: {error}"),
+        }
+    }
+}
+
+impl Error for ServerInfoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Box(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::ShortFrame { .. } | Self::LongFrame { .. } => None,
+        }
+    }
+}
+
+/// Opens and parses a DERP ServerInfo encrypted payload (without its 5-byte
+/// frame header), matching the pinned fork's nonce/size checks and box layout.
+///
+/// Authentication is checked before JSON parsing, so unauthenticated plaintext
+/// is never returned. This helper does not read a frame from a stream, validate
+/// the DERP greeting, establish connection state, or update a rate limiter.
+pub fn parse_server_info_payload(
+    client_private: &NodePrivate,
+    server_public: &NodePublic,
+    payload: &[u8],
+) -> Result<ServerInfo, ServerInfoError> {
+    if payload.len() < SERVER_INFO_NONCE_LEN {
+        return Err(ServerInfoError::ShortFrame { got: payload.len() });
+    }
+    if payload.len() > MAX_SERVER_INFO_PAYLOAD_LEN {
+        return Err(ServerInfoError::LongFrame { got: payload.len(), max: MAX_SERVER_INFO_PAYLOAD_LEN });
+    }
+    let plaintext = client_private.open_from(server_public, payload).map_err(ServerInfoError::Box)?;
+    serde_json::from_slice(&plaintext).map_err(ServerInfoError::Json)
+}
+
 fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
     if !*first {
         output.push(',');
@@ -440,6 +569,94 @@ mod tests {
             build_client_info_frame(&alice, &NodePublic::from_raw32([0; 32]), &info),
             Err(ClientInfoFrameError::Box(NodeBoxError::ZeroPeerPublicKey))
         );
+    }
+
+    #[test]
+    fn server_info_payload_opens_pinned_go_box_fixture() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let payload = decode_hex("808182838485868788898a8b8c8d8e8f90919293949596972a5043cecfb67d977e3a71109462311a38a15b673d7b2bf55da90ef8f0d0c5313f73665a84fefee88e79c04d9f28b8eedadcd657528c5f0c7a08671cf92cd641f0e77fae5c0817566ac2b69be71d61523ec54dd49e137aaa9e0e19cb487e0f7557d9");
+        let info = super::parse_server_info_payload(&alice, &bob.public().unwrap(), &payload).unwrap();
+        assert_eq!(
+            info,
+            super::ServerInfo {
+                version: 2,
+                token_bucket_bytes_per_second: 16_777_216,
+                token_bucket_bytes_burst: 4_194_304,
+            }
+        );
+    }
+
+    #[test]
+    fn server_info_payload_enforces_length_and_authentication_before_json() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+
+        assert!(matches!(
+            super::parse_server_info_payload(&alice, &bob_public, &[0; 23]),
+            Err(super::ServerInfoError::ShortFrame { got: 23 })
+        ));
+        assert!(matches!(
+            super::parse_server_info_payload(
+                &alice,
+                &bob_public,
+                &vec![0; super::MAX_SERVER_INFO_PAYLOAD_LEN + 1]
+            ),
+            Err(super::ServerInfoError::LongFrame { got, max })
+                if got == super::MAX_SERVER_INFO_PAYLOAD_LEN + 1 && max == super::MAX_SERVER_INFO_PAYLOAD_LEN
+        ));
+        assert!(matches!(
+            super::parse_server_info_payload(&alice, &bob_public, &[0; super::SERVER_INFO_NONCE_LEN]),
+            Err(super::ServerInfoError::Box(NodeBoxError::Authentication))
+        ));
+
+        let mut tampered = decode_hex("808182838485868788898a8b8c8d8e8f90919293949596972a5043cecfb67d977e3a71109462311a38a15b673d7b2bf55da90ef8f0d0c5313f73665a84fefee88e79c04d9f28b8eedadcd657528c5f0c7a08671cf92cd641f0e77fae5c0817566ac2b69be71d61523ec54dd49e137aaa9e0e19cb487e0f7557d9");
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            super::parse_server_info_payload(&alice, &bob_public, &tampered),
+            Err(super::ServerInfoError::Box(NodeBoxError::Authentication))
+        ));
+        assert!(matches!(
+            super::parse_server_info_payload(&alice, &NodePublic::from_raw32([0; 32]), &[0; 24]),
+            Err(super::ServerInfoError::Box(NodeBoxError::ZeroPeerPublicKey))
+        ));
+    }
+
+    #[test]
+    fn server_info_json_matches_pinned_go_ascii_field_semantics() {
+        use super::ServerInfo;
+
+        assert_eq!(serde_json::from_str::<ServerInfo>("{}").unwrap(), ServerInfo::default());
+        assert_eq!(serde_json::from_str::<ServerInfo>("null").unwrap(), ServerInfo::default());
+        assert_eq!(
+            serde_json::from_str::<ServerInfo>(
+                r#"{"VERSION":1,"Version":2,"version":null,"tokenbucketbytespersecond":12,"TOKENBUCKETBYTESBURST":34,"other":{"nested":[1,true,null]}}"#
+            )
+            .unwrap(),
+            ServerInfo { version: 2, token_bucket_bytes_per_second: 12, token_bucket_bytes_burst: 34 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerInfo>(
+                r#"{"version":9223372036854775807,"TokenBucketBytesBurst":-9223372036854775808}"#
+            )
+            .unwrap(),
+            ServerInfo { version: i64::MAX, token_bucket_bytes_per_second: 0, token_bucket_bytes_burst: i64::MIN }
+        );
+        for invalid in [
+            r#"{"version":9223372036854775808}"#,
+            r#"{"version":1.0}"#,
+            r#"{"version":"2"}"#,
+            "[]",
+            "{} {}",
+            r#"{"Verſion":2}"#,
+        ] {
+            assert!(serde_json::from_str::<ServerInfo>(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
