@@ -10,10 +10,10 @@
 //! support, ServerInfo parsing and send-rate configuration mapping, and bounded
 //! blocking-stream routing for the pinned fork's recognized received-message
 //! frame types with a session helper for 120-second read-deadline requests and
-//! permanent first-error latching, plus a Go-oracle-tested Send-packet writer
-//! helper with the pinned packet-size and limiter-drop rules. Shared write
-//! serialization across all DERP methods, automatic Ping response, and complete
-//! Tailscale endpoint runtime are not yet implemented.
+//! permanent first-error latching, plus Go-oracle-tested Send-packet rules and a
+//! shared-lock writer for packet, Ping, and Pong writes. Other DERP writer methods,
+//! automatic Ping responses, and the complete Tailscale endpoint runtime are not
+//! yet implemented.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;

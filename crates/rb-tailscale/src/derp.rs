@@ -7,15 +7,15 @@
 //! bounded blocking-stream routing for pinned-fork received-message frames. A
 //! receive-session helper requests the pinned 120-second read deadline and latches
 //! the first error. A pure Rust model of the pinned `rate.Limiter.AllowN` state
-//! transition and a bounded SendPacket writer are oracle-tested. Node-key box
-//! primitives live in `disco_crypto`; shared write serialization across methods,
-//! automatic Ping replies, and server authentication remain unimplemented.
+//! transition and a bounded SendPacket writer are oracle-tested. `DerpSendWriter`
+//! serializes packet, Ping, and Pong writes under one lock. Other DERP writer
+//! methods, automatic Ping replies, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
@@ -460,6 +460,61 @@ fn write_send_segment<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), Stre
         return Err(StreamWriteFrameError::Io(io::Error::new(io::ErrorKind::WriteZero, "short write")));
     }
     Ok(())
+}
+
+struct DerpSendWriterState<W> {
+    writer: W,
+    limiter: Option<DerpSendRateLimiter>,
+}
+
+/// Owns the DERP packet/Ping/Pong writer paths under one shared write lock.
+///
+/// This mirrors the pinned fork's `Client.wmu` for these three operations: rate
+/// limiter checks and all frame writes are serialized together, and the send
+/// timestamp is sampled only after acquiring the lock. Route every operation on
+/// the underlying writer through this owner to avoid byte-level frame interleaving.
+/// Other DERP writer methods and the complete client lifecycle are not implemented.
+/// This type also does not emulate Go `bufio.Writer.AvailableBuffer` internals.
+pub struct DerpSendWriter<W> {
+    state: Mutex<DerpSendWriterState<W>>,
+}
+
+impl<W> DerpSendWriter<W> {
+    /// Takes ownership of the stream writer and the optional send-rate limiter.
+    pub fn new(writer: W, limiter: Option<DerpSendRateLimiter>) -> Self {
+        Self { state: Mutex::new(DerpSendWriterState { writer, limiter }) }
+    }
+}
+
+impl<W: Write> DerpSendWriter<W> {
+    fn lock_state(&self) -> MutexGuard<'_, DerpSendWriterState<W>> {
+        // Go's sync.Mutex is not poisoned. Recover Rust's mutex guard so a prior
+        // panic does not permanently prevent the same unlock/relock behavior.
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sends a packet while holding the same lock used by Ping and Pong writes.
+    pub fn send_packet(&self, destination: NodePublic, packet: &[u8]) -> Result<SendPacketOutcome, SendPacketError> {
+        if packet.len() > MAX_PACKET_SIZE {
+            return Err(SendPacketError::PacketTooBig { packet_len: packet.len() });
+        }
+        let mut state = self.lock_state();
+        let now = Instant::now();
+        let DerpSendWriterState { writer, limiter } = &mut *state;
+        send_packet_to(writer, destination, packet, limiter.as_mut(), now)
+    }
+
+    /// Sends a Ping frame without applying the packet rate limiter.
+    pub fn send_ping(&self, data: [u8; 8]) -> Result<(), StreamWriteFrameError> {
+        let mut state = self.lock_state();
+        write_ping_to(&mut state.writer, data)
+    }
+
+    /// Sends a Pong frame without applying the packet rate limiter.
+    pub fn send_pong(&self, data: [u8; 8]) -> Result<(), StreamWriteFrameError> {
+        let mut state = self.lock_state();
+        write_pong_to(&mut state.writer, data)
+    }
 }
 
 /// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
@@ -1562,13 +1617,14 @@ mod tests {
         build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_from, read_frame_header,
         read_frame_type_header, read_server_greeting, write_frame, write_frame_to, write_ping_to, write_pong_to,
         ClientInfo, ClientInfoFrameError, DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState,
-        DerpClientStreamHandshakeError, DerpRecvSession, FrameHeader, FrameHeaderError, FrameType, ReadFrameError,
-        RecvDeadlineReader, ServerGreetingError, StreamReadFrameError, StreamWriteFrameError, WriteFrameError,
-        CLIENT_RECV_TIMEOUT, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
+        DerpClientStreamHandshakeError, DerpRecvSession, DerpSendWriter, FrameHeader, FrameHeaderError, FrameType,
+        ReadFrameError, RecvDeadlineReader, ServerGreetingError, StreamReadFrameError, StreamWriteFrameError,
+        WriteFrameError, CLIENT_RECV_TIMEOUT, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE,
+        PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
     use std::io::{self, Read, Write};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
     struct ChunkedReader {
@@ -1636,6 +1692,29 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct SharedWriteObservation {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    struct YieldingWriter {
+        observation: Arc<Mutex<SharedWriteObservation>>,
+    }
+
+    impl Write for YieldingWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.observation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).bytes.extend_from_slice(input);
+            std::thread::yield_now();
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.observation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).flushes += 1;
             Ok(())
         }
     }
@@ -2002,6 +2081,102 @@ mod tests {
         expected.extend_from_slice(&destination.raw_bytes());
         expected.extend_from_slice(&packet);
         assert_eq!(limited_wire, expected);
+    }
+
+    #[test]
+    fn shared_send_writer_matches_go_limiter_and_control_frame_lock_scope() {
+        use super::{DerpSendRateLimiter, SendPacketOutcome, SendRateLimiterConfig};
+
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = DerpSendWriter::new(
+            YieldingWriter { observation: Arc::clone(&observation) },
+            Some(DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 1, burst: 47 })),
+        );
+        let destination = NodePublic::from_raw32([0xab; 32]);
+        let packet = [0x22; 10];
+        let oversized = vec![0; super::MAX_PACKET_SIZE + 1];
+        assert_eq!(
+            writer.send_packet(destination, &oversized).unwrap_err().to_string(),
+            "derp.Send: packet too big: 65537"
+        );
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), SendPacketOutcome::Sent);
+        assert_eq!(writer.send_packet(destination, &packet).unwrap(), SendPacketOutcome::Dropped);
+        writer.send_ping([0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        writer.send_pong([8, 7, 6, 5, 4, 3, 2, 1]).unwrap();
+
+        let observation = observation.lock().unwrap();
+        let mut expected = vec![0x04, 0, 0, 0, 42];
+        expected.extend_from_slice(&destination.raw_bytes());
+        expected.extend_from_slice(&packet);
+        expected.extend_from_slice(&[0x12, 0, 0, 0, 8, 0, 1, 2, 3, 4, 5, 6, 7]);
+        expected.extend_from_slice(&[0x13, 0, 0, 0, 8, 8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(observation.bytes, expected);
+        assert_eq!(observation.flushes, 3);
+    }
+
+    #[test]
+    fn shared_send_writer_prevents_concurrent_packet_ping_pong_frame_interleaving() {
+        const THREADS: usize = 8;
+        const OPERATIONS_PER_THREAD: usize = 9;
+
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = Arc::new(DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None));
+        let start = Arc::new(Barrier::new(THREADS + 1));
+        let destination = NodePublic::from_raw32([0x5a; 32]);
+        let mut workers = Vec::new();
+
+        for thread_index in 0..THREADS {
+            let writer = Arc::clone(&writer);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                for operation in 0..OPERATIONS_PER_THREAD {
+                    let tag = (thread_index * OPERATIONS_PER_THREAD + operation + 1) as u8;
+                    let data = [tag; 8];
+                    match operation % 3 {
+                        0 => writer.send_ping(data).unwrap(),
+                        1 => writer.send_pong(data).unwrap(),
+                        _ => {
+                            assert_eq!(writer.send_packet(destination, &data).unwrap(), super::SendPacketOutcome::Sent)
+                        }
+                    }
+                }
+            }));
+        }
+
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let observation = observation.lock().unwrap();
+        assert_eq!(observation.flushes, THREADS * OPERATIONS_PER_THREAD);
+        let mut frame_count = 0;
+        let mut offset = 0;
+        while offset < observation.bytes.len() {
+            assert!(offset + super::FRAME_HEADER_LEN <= observation.bytes.len());
+            let frame_type = observation.bytes[offset];
+            let frame_len = u32::from_be_bytes(observation.bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+            let payload_start = offset + super::FRAME_HEADER_LEN;
+            let payload_end = payload_start + frame_len;
+            assert!(payload_end <= observation.bytes.len());
+            let payload = &observation.bytes[payload_start..payload_end];
+            match frame_type {
+                0x04 => {
+                    assert_eq!(frame_len, 40);
+                    assert_eq!(&payload[..32], &[0x5a; 32]);
+                    assert!(payload[32..].iter().all(|byte| *byte == payload[32]));
+                }
+                0x12 | 0x13 => {
+                    assert_eq!(frame_len, 8);
+                    assert!(payload.iter().all(|byte| *byte == payload[0]));
+                }
+                other => panic!("unexpected DERP frame type {other:#x}"),
+            }
+            frame_count += 1;
+            offset = payload_end;
+        }
+        assert_eq!(frame_count, THREADS * OPERATIONS_PER_THREAD);
     }
 
     #[test]
