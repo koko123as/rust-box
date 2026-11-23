@@ -1,0 +1,12 @@
+[package]
+name = "rb-tailscale"
+description = "Pure Rust Tailscale protocol primitives for rust-box"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+boringtun.workspace = true
+rand.workspace = true
+zeroize.workspace = true

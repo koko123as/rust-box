@@ -1866,6 +1866,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-tailscale"
+version = "0.1.0"
+dependencies = [
+ "boringtun",
+ "rand 0.9.5",
+ "zeroize",
+]
+
+[[package]]
 name = "rb-tls"
 version = "0.1.0"
 dependencies = [
