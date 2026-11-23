@@ -547,6 +547,18 @@ pub fn derp_start_dial_target_from_parsed<'a>(
     }
 }
 
+/// Formats the pinned `startDial` address argument like Go's `net.JoinHostPort`.
+///
+/// Any colon in the raw host causes brackets; neither host nor port is parsed
+/// or validated, and this helper does not resolve or dial the address.
+pub fn derp_start_dial_host_port(host: &str, port: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
@@ -932,11 +944,11 @@ mod tests {
     use super::{
         derp_dial_field_from_supported_text, derp_region_dial_port, derp_region_tls_server_name,
         derp_region_url_string, derp_should_dial_proto_from_parsed, derp_should_dial_proto_from_supported_text,
-        derp_start_dial_target_from_parsed, derp_url_port_from_parsed_parts, derp_use_https, ping_deadline,
-        DerpClientState, DerpDialProtocol, DerpParsedDialField, DerpParsedDialTarget, DerpPingCancellationToken,
-        DerpPongResponseRegistry, DerpRegionUrlError, DerpUnsupportedDialAddressText, DerpUrlPortError,
-        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
-        DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_start_dial_host_port, derp_start_dial_target_from_parsed, derp_url_port_from_parsed_parts, derp_use_https,
+        ping_deadline, DerpClientState, DerpDialProtocol, DerpParsedDialField, DerpParsedDialTarget,
+        DerpPingCancellationToken, DerpPongResponseRegistry, DerpRegionUrlError, DerpUnsupportedDialAddressText,
+        DerpUrlPortError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient,
+        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -1235,6 +1247,24 @@ mod tests {
         for ipv6_target in [mapped, zoned, dotted_zoned] {
             assert_eq!(derp_start_dial_target_from_parsed(ipv6_target, hostname, Tcp4), None);
             assert_eq!(derp_start_dial_target_from_parsed(ipv6_target, hostname, Tcp6), Some(ipv6_target.text));
+        }
+    }
+
+    #[test]
+    fn start_dial_host_port_matches_pinned_go_join_host_port_formatting() {
+        let cases = [
+            ("derp.example", "443", "derp.example:443"),
+            ("192.0.2.1", "3340", "192.0.2.1:3340"),
+            ("2001:db8::1", "443", "[2001:db8::1]:443"),
+            ("fe80::1%eth0", "3340", "[fe80::1%eth0]:3340"),
+            ("::ffff:192.0.2.1%eth0", "service", "[::ffff:192.0.2.1%eth0]:service"),
+            ("not:an:ip", "", "[not:an:ip]:"),
+            ("[::1]", "443", "[[::1]]:443"),
+            ("", "443", ":443"),
+        ];
+
+        for (host, port, expected) in cases {
+            assert_eq!(derp_start_dial_host_port(host, port), expected);
         }
     }
 

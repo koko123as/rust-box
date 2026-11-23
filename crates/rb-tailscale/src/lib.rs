@@ -36,6 +36,8 @@
 //! a nonempty UTF-8 zone after the first `%` for IPv6 family selection only, discarding
 //! it from that classification value. General Go `netip` text, full target validation,
 //! and usable zone-aware dial-address construction remain unimplemented. The target guard alone is not input validation.
+//! The `startDial` host-port formatter mirrors `net.JoinHostPort`'s raw colon/bracket
+//! rule only; it does not validate, resolve, or dial the resulting address.
 //! Explicit-URL parsing, TLS handshakes, network dialing, socket setup, reconnect
 //! retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
