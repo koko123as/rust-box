@@ -8,8 +8,9 @@
 //! receive-session helper requests the pinned 120-second read deadline and latches
 //! the first error. A pure Rust model of the pinned `rate.Limiter.AllowN` state
 //! transition and a bounded SendPacket writer are oracle-tested. `DerpSendWriter`
-//! serializes packet, Ping, and Pong writes under one lock. Other DERP writer
-//! methods, automatic Ping replies, and server authentication remain unimplemented.
+//! serializes packet, Ping/Pong, NotePreferred, WatchConnectionChanges, and ClosePeer
+//! writes under one lock. ForwardPacket and other DERP writer methods, automatic
+//! Ping replies, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
@@ -47,10 +48,16 @@ pub const FRAME_SEND_PACKET: FrameType = FrameType(0x04);
 pub const FRAME_RECV_PACKET: FrameType = FrameType(0x05);
 /// The keep-alive frame type.
 pub const FRAME_KEEP_ALIVE: FrameType = FrameType(0x06);
+/// The client preferred-server notification frame type.
+pub const FRAME_NOTE_PREFERRED: FrameType = FrameType(0x07);
 /// The peer-gone frame type.
 pub const FRAME_PEER_GONE: FrameType = FrameType(0x08);
 /// The peer-present frame type.
 pub const FRAME_PEER_PRESENT: FrameType = FrameType(0x09);
+/// The mesh connection-list subscription frame type.
+pub const FRAME_WATCH_CONNS: FrameType = FrameType(0x10);
+/// The privileged peer-close request frame type.
+pub const FRAME_CLOSE_PEER: FrameType = FrameType(0x11);
 /// The ping frame type.
 pub const FRAME_PING: FrameType = FrameType(0x12);
 /// The pong frame type.
@@ -416,6 +423,23 @@ impl Error for SendPacketError {
     }
 }
 
+/// A `NotePreferred` write error with the pinned Go error prefix.
+#[derive(Debug)]
+pub struct NotePreferredError(StreamWriteFrameError);
+
+impl fmt::Display for NotePreferredError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "derp.NotePreferred: {}", self.0)
+    }
+}
+
+impl Error for NotePreferredError {
+    // The Go fork formats this error with `%v`, not `%w`; it does not unwrap.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
+
 /// Writes and flushes one packet using the pinned `Client.Send` size, rate, and
 /// wire-length rules. The limiter charge includes the five-byte frame header;
 /// the frame payload length is only the 32-byte destination key plus packet.
@@ -514,6 +538,29 @@ impl<W: Write> DerpSendWriter<W> {
     pub fn send_pong(&self, data: [u8; 8]) -> Result<(), StreamWriteFrameError> {
         let mut state = self.lock_state();
         write_pong_to(&mut state.writer, data)
+    }
+
+    /// Sends a preferred-server note under the shared lock, wrapping write
+    /// failures with `derp.NotePreferred` without exposing the source error.
+    pub fn note_preferred(&self, preferred: bool) -> Result<(), NotePreferredError> {
+        let mut state = self.lock_state();
+        let payload = [u8::from(preferred)];
+        write_frame_to(&mut state.writer, FRAME_NOTE_PREFERRED, &payload).map_err(NotePreferredError)
+    }
+
+    /// Requests mesh connection-change notifications under the shared lock.
+    /// As in the Go client, this sends the request without locally checking a mesh key.
+    pub fn watch_connection_changes(&self) -> Result<(), StreamWriteFrameError> {
+        let mut state = self.lock_state();
+        write_frame_to(&mut state.writer, FRAME_WATCH_CONNS, &[])
+    }
+
+    /// Requests closure of a peer under the shared lock. Authorization is enforced
+    /// by the DERP server; the Go client does not perform a local mesh-key check.
+    pub fn close_peer(&self, target: NodePublic) -> Result<(), StreamWriteFrameError> {
+        let mut state = self.lock_state();
+        let target_bytes = target.raw_bytes();
+        write_frame_to(&mut state.writer, FRAME_CLOSE_PEER, &target_bytes)
     }
 }
 
@@ -1719,6 +1766,18 @@ mod tests {
         }
     }
 
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _input: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("write failed"))
+        }
+    }
+
     struct ChunkedDuplex {
         incoming: Vec<u8>,
         read_position: usize,
@@ -2112,6 +2171,33 @@ mod tests {
         expected.extend_from_slice(&[0x13, 0, 0, 0, 8, 8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(observation.bytes, expected);
         assert_eq!(observation.flushes, 3);
+    }
+
+    #[test]
+    fn note_preferred_watch_connections_and_close_peer_match_go_wire_frames() {
+        let observation = Arc::new(Mutex::new(SharedWriteObservation::default()));
+        let writer = DerpSendWriter::new(YieldingWriter { observation: Arc::clone(&observation) }, None);
+        let peer = NodePublic::from_raw32([0x42; 32]);
+        writer.note_preferred(true).unwrap();
+        writer.note_preferred(false).unwrap();
+        writer.watch_connection_changes().unwrap();
+        writer.close_peer(peer).unwrap();
+
+        let observation = observation.lock().unwrap();
+        let mut expected = vec![0x07, 0, 0, 0, 1, 1, 0x07, 0, 0, 0, 1, 0];
+        expected.extend_from_slice(&[0x10, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[0x11, 0, 0, 0, 32]);
+        expected.extend_from_slice(&peer.raw_bytes());
+        assert_eq!(observation.bytes, expected);
+        assert_eq!(observation.flushes, 4);
+    }
+
+    #[test]
+    fn note_preferred_error_prefix_matches_go_non_wrapping_format() {
+        let writer = DerpSendWriter::new(FailingWriter, None);
+        let error = writer.note_preferred(true).unwrap_err();
+        assert_eq!(error.to_string(), "derp.NotePreferred: write failed");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
