@@ -1,8 +1,10 @@
 //! Tailscale-specific address classification from the fork pinned by sing-box v1.14.4.
 //!
 //! This module ports Tailscale address classification/translation, service IPs,
-//! and `UnmapVia`; other route helpers and endpoint behavior remain out of scope.
+//! and via-route mapping helpers; other route helpers and endpoint behavior remain out of scope.
 
+use std::error::Error;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const CGNAT_START: u32 = u32::from_be_bytes([100, 64, 0, 0]);
@@ -12,6 +14,85 @@ const CHROMEOS_VM_END: u32 = u32::from_be_bytes([100, 115, 93, 255]);
 const TAILSCALE_ULA_PREFIX: [u16; 3] = [0xfd7a, 0x115c, 0xa1e0];
 const TAILSCALE_4TO6_PREFIX: [u8; 13] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0xab, 0x12, 0x48, 0x43, 0xcd, 0x96, 0x62];
 const TAILSCALE_VIA_PREFIX: [u8; 8] = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a];
+
+/// An IP prefix preserving the supplied address and Go's invalid-prefix state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpPrefix {
+    address: IpAddr,
+    prefix_len: i32,
+}
+
+impl IpPrefix {
+    /// Creates a prefix, storing `-1` bits when Go `netip.PrefixFrom` is invalid.
+    pub fn new(address: IpAddr, prefix_len: i32) -> Self {
+        let max_bits = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix_len = if (0..=max_bits).contains(&prefix_len) { prefix_len } else { -1 };
+        Self { address, prefix_len }
+    }
+
+    pub fn address(self) -> IpAddr {
+        self.address
+    }
+
+    /// Returns `-1` for an invalid prefix, matching Go `netip.Prefix.Bits`.
+    pub fn prefix_len(self) -> i32 {
+        self.prefix_len
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.prefix_len >= 0
+    }
+
+    pub fn is_ipv4(self) -> bool {
+        matches!(self.address, IpAddr::V4(_))
+    }
+
+    pub fn is_ipv6(self) -> bool {
+        matches!(self.address, IpAddr::V6(_))
+    }
+
+    /// Tests prefix membership without normalizing the stored address.
+    pub fn contains(self, address: IpAddr) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
+        match (self.address, address) {
+            (IpAddr::V4(prefix), IpAddr::V4(address)) => {
+                let mask = if self.prefix_len == 0 { 0 } else { u32::MAX << (32 - self.prefix_len as u32) };
+                u32::from(prefix) & mask == u32::from(address) & mask
+            }
+            (IpAddr::V6(prefix), IpAddr::V6(address)) => {
+                let mask = if self.prefix_len == 0 { 0 } else { u128::MAX << (128 - self.prefix_len as u32) };
+                u128::from(prefix) & mask == u128::from(address) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IpPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_valid() {
+            write!(f, "{}/{}", self.address, self.prefix_len)
+        } else {
+            f.write_str("invalid Prefix")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MapViaError;
+
+impl fmt::Display for MapViaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("want IPv4 CIDR with a site ID")
+    }
+}
+
+impl Error for MapViaError {}
 
 /// Returns the IPv4 Tailscale service address (`100.100.100.100`).
 pub const fn tailscale_service_ip() -> Ipv4Addr {
@@ -90,6 +171,28 @@ pub fn is_via_ip(ip: IpAddr) -> bool {
     ipv6.octets()[..8] == TAILSCALE_VIA_PREFIX
 }
 
+/// Reports whether a prefix's address is in the Tailscale via `/64` range.
+///
+/// As in the pinned fork, the prefix length is ignored; only its address is tested.
+pub fn is_via_prefix(prefix: IpPrefix) -> bool {
+    is_via_ip(prefix.address())
+}
+
+/// Maps an IPv4 prefix into the Tailscale via range for `site_id`.
+///
+/// The source address is retained as-is (including host bits), and the IPv4 prefix
+/// length is extended by 96 bits. Non-IPv4 prefixes return the pinned error.
+pub fn map_via(site_id: u32, ipv4_prefix: IpPrefix) -> Result<IpPrefix, MapViaError> {
+    let IpAddr::V4(ipv4) = ipv4_prefix.address() else {
+        return Err(MapViaError);
+    };
+    let mut address = [0; 16];
+    address[..8].copy_from_slice(&TAILSCALE_VIA_PREFIX);
+    address[8..12].copy_from_slice(&site_id.to_be_bytes());
+    address[12..].copy_from_slice(&ipv4.octets());
+    Ok(IpPrefix::new(IpAddr::V6(Ipv6Addr::from(address)), ipv4_prefix.prefix_len() + 96))
+}
+
 /// Unmaps an address in the Tailscale IPv4-via-IPv6 `/64` using its final 32 bits.
 ///
 /// The pinned fork does not validate the resulting IPv4 address; addresses outside
@@ -113,10 +216,15 @@ fn is_tailscale_ipv6_ula(ipv6: Ipv6Addr) -> bool {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{is_tailscale_ip, is_tailscale_ipv4};
+    use super::{is_tailscale_ip, is_tailscale_ipv4, IpPrefix, MapViaError};
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("test address must be valid")
+    }
+
+    fn prefix(value: &str) -> IpPrefix {
+        let (address, prefix_len) = value.split_once('/').expect("test prefix must have a length");
+        IpPrefix::new(ip(address), prefix_len.parse().expect("test prefix length must be numeric"))
     }
 
     #[test]
@@ -177,6 +285,55 @@ mod tests {
             let address = ip(address);
             assert_eq!(super::is_via_ip(address), expected_is_via, "via-range predicate for {address}");
             assert_eq!(super::unmap_via(address), ip(expected_unmapped), "UnmapVia for {address}");
+        }
+    }
+
+    #[test]
+    fn ip_prefix_and_via_mapping_match_pinned_go_oracle() {
+        let subnet = prefix("10.0.0.1/24");
+        assert!(subnet.contains(ip("10.0.0.255")));
+        assert!(!subnet.contains(ip("10.0.1.0")));
+        assert!(!subnet.contains(ip("fd00::1")));
+        assert!(prefix("::1/0").contains(ip("2001:db8::1")));
+        assert!(!prefix("::1/0").contains(ip("192.0.2.1")));
+        for invalid_bits in [-1, 33] {
+            let invalid_v4 = IpPrefix::new(ip("100.64.0.1"), invalid_bits);
+            assert!(!invalid_v4.is_valid());
+            assert!(invalid_v4.is_ipv4());
+            assert_eq!(invalid_v4.prefix_len(), -1);
+            assert_eq!(invalid_v4.address(), ip("100.64.0.1"));
+            assert_eq!(invalid_v4.to_string(), "invalid Prefix");
+            assert!(!invalid_v4.contains(ip("100.64.0.1")));
+            assert_eq!(super::map_via(7, invalid_v4).unwrap().to_string(), "fd7a:115c:a1e0:b1a:0:7:6440:1/95");
+        }
+        let invalid_v6 = IpPrefix::new(ip("fd7a:115c:a1e0:b1a::1"), 129);
+        assert!(!invalid_v6.is_valid());
+        assert!(invalid_v6.is_ipv6());
+        assert_eq!(invalid_v6.prefix_len(), -1);
+        assert_eq!(invalid_v6.address(), ip("fd7a:115c:a1e0:b1a::1"));
+        assert_eq!(super::map_via(7, invalid_v6).unwrap_err().to_string(), "want IPv4 CIDR with a site ID");
+        assert!(super::is_via_prefix(invalid_v6));
+
+        for (site_id, input, expected) in [
+            (7, "100.64.0.1/32", "fd7a:115c:a1e0:b1a:0:7:6440:1/128"),
+            (0x1234_5678, "192.0.2.1/24", "fd7a:115c:a1e0:b1a:1234:5678:c000:201/120"),
+            (0, "0.0.0.0/0", "fd7a:115c:a1e0:b1a::/96"),
+        ] {
+            let mapped = super::map_via(site_id, prefix(input)).unwrap();
+            assert_eq!(mapped.to_string(), expected, "MapVia for {input}");
+        }
+        let error = super::map_via(42, prefix("fd00::1/64")).unwrap_err();
+        assert_eq!(error, MapViaError);
+        assert_eq!(error.to_string(), "want IPv4 CIDR with a site ID");
+
+        for (input, expected) in [
+            ("fd7a:115c:a1e0:b1a::/64", true),
+            ("fd7a:115c:a1e0:b1a::/128", true),
+            ("fd7a:115c:a1e0:b1a::/0", true),
+            ("fd7a:115c:a1e0:b1b::/128", false),
+            ("192.0.2.1/24", false),
+        ] {
+            assert_eq!(super::is_via_prefix(prefix(input)), expected, "IsViaPrefix for {input}");
         }
     }
 
