@@ -1,14 +1,15 @@
 //! DERP slice primitives from the Tailscale fork pinned by sing-box v1.14.4.
 //!
-//! This module provides header codecs, bounded frame slice reads/writes, a
-//! server-greeting parser, ClientInfo JSON encoding and in-memory encrypted frame
-//! construction, an in-memory client key-exchange state machine, and bounded
-//! in-memory ServerInfo frame/payload parsing. Node-key box primitives live in
-//! `disco_crypto`; a streaming DERP client/server, transport lifecycle, and server
-//! authentication remain unimplemented.
+//! This module provides header codecs, bounded frame slice and blocking-stream
+//! reads/writes, a server-greeting parser, ClientInfo JSON encoding and in-memory
+//! encrypted frame construction, an in-memory client key-exchange state machine,
+//! and bounded in-memory ServerInfo frame/payload parsing. Node-key box primitives
+//! live in `disco_crypto`; a complete streaming DERP client/server, transport
+//! lifecycle, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Read, Write};
 
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -131,6 +132,103 @@ impl fmt::Display for ReadFrameError {
 
 impl Error for ReadFrameError {}
 
+/// Errors while reading a DERP frame from a blocking stream.
+#[derive(Debug)]
+pub enum StreamReadFrameError {
+    EndOfInput,
+    UnexpectedEndOfInput,
+    ExceedsLimit { frame_len: u32, max_size: u32 },
+    ShortBuffer { header: FrameHeader },
+    Io(io::Error),
+}
+
+impl fmt::Display for StreamReadFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EndOfInput => f.write_str("EOF"),
+            Self::UnexpectedEndOfInput => f.write_str("unexpected EOF"),
+            Self::ExceedsLimit { frame_len, max_size } => {
+                write!(f, "frame header size {frame_len} exceeds reader limit of {max_size}")
+            }
+            Self::ShortBuffer { .. } => f.write_str("short buffer"),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for StreamReadFrameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::EndOfInput | Self::UnexpectedEndOfInput | Self::ExceedsLimit { .. } | Self::ShortBuffer { .. } => {
+                None
+            }
+        }
+    }
+}
+
+fn read_full_from<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), StreamReadFrameError> {
+    let mut received = 0;
+    while received < buffer.len() {
+        match reader.read(&mut buffer[received..]) {
+            Ok(0) => {
+                return Err(if received == 0 {
+                    StreamReadFrameError::EndOfInput
+                } else {
+                    StreamReadFrameError::UnexpectedEndOfInput
+                });
+            }
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(StreamReadFrameError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Reads one bounded DERP frame from a blocking stream, matching the pinned
+/// fork's `readFrame` payload consumption and short-buffer behavior.
+///
+/// An over-limit frame consumes only its header. A short output buffer consumes
+/// the rest of that frame before returning `ShortBuffer`, so the next read starts
+/// at the following frame. This is synchronous `Read` I/O, not an async or
+/// buffered connection implementation.
+pub fn read_frame_from<R: Read>(
+    reader: &mut R,
+    max_size: u32,
+    output: &mut [u8],
+) -> Result<FrameHeader, StreamReadFrameError> {
+    let mut encoded_header = [0; FRAME_HEADER_LEN];
+    read_full_from(reader, &mut encoded_header)?;
+    let header = FrameHeader {
+        frame_type: FrameType(encoded_header[0]),
+        frame_len: u32::from_be_bytes([encoded_header[1], encoded_header[2], encoded_header[3], encoded_header[4]]),
+    };
+    if header.frame_len > max_size {
+        return Err(StreamReadFrameError::ExceedsLimit { frame_len: header.frame_len, max_size });
+    }
+
+    let payload_len = header.frame_len as usize;
+    let copy_len = payload_len.min(output.len());
+    read_full_from(reader, &mut output[..copy_len])?;
+
+    let mut remaining = payload_len - copy_len;
+    let mut discard = [0u8; 8192];
+    while remaining > 0 {
+        let chunk_len = remaining.min(discard.len());
+        match reader.read(&mut discard[..chunk_len]) {
+            Ok(0) => return Err(StreamReadFrameError::EndOfInput),
+            Ok(count) => remaining -= count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(StreamReadFrameError::Io(error)),
+        }
+    }
+    if payload_len > copy_len {
+        return Err(StreamReadFrameError::ShortBuffer { header });
+    }
+    Ok(header)
+}
+
 /// Failure to append a complete frame to an output buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteFrameError {
@@ -165,6 +263,47 @@ pub fn write_frame(output: &mut Vec<u8>, frame_type: FrameType, payload: &[u8]) 
     output.extend_from_slice(&header.encode());
     output.extend_from_slice(payload);
     Ok(())
+}
+
+/// Errors while writing and flushing a DERP frame to a blocking stream.
+#[derive(Debug)]
+pub enum StreamWriteFrameError {
+    UnreasonablyLarge,
+    Io(io::Error),
+}
+
+impl fmt::Display for StreamWriteFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnreasonablyLarge => f.write_str("unreasonably large frame write"),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for StreamWriteFrameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::UnreasonablyLarge => None,
+        }
+    }
+}
+
+/// Writes a DERP frame to a blocking stream and flushes it, matching the
+/// pinned fork's 10 MiB limit and `WriteFrame` flush boundary.
+pub fn write_frame_to<W: Write>(
+    writer: &mut W,
+    frame_type: FrameType,
+    payload: &[u8],
+) -> Result<(), StreamWriteFrameError> {
+    if payload.len() > MAX_FRAME_WRITE_SIZE {
+        return Err(StreamWriteFrameError::UnreasonablyLarge);
+    }
+    let header = FrameHeader { frame_type, frame_len: payload.len() as u32 }.encode();
+    writer.write_all(&header).map_err(StreamWriteFrameError::Io)?;
+    writer.write_all(payload).map_err(StreamWriteFrameError::Io)?;
+    writer.flush().map_err(StreamWriteFrameError::Io)
 }
 
 /// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
@@ -787,13 +926,58 @@ fn push_go_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_header,
-        read_frame_type_header, read_server_greeting, write_frame, ClientInfo, ClientInfoFrameError,
+        build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_from, read_frame_header,
+        read_frame_type_header, read_server_greeting, write_frame, write_frame_to, ClientInfo, ClientInfoFrameError,
         DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState, FrameHeader, FrameHeaderError,
-        FrameType, ReadFrameError, ServerGreetingError, WriteFrameError, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC,
-        MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
+        FrameType, ReadFrameError, ServerGreetingError, StreamReadFrameError, StreamWriteFrameError, WriteFrameError,
+        FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
+    use std::io::{self, Read, Write};
+
+    struct ChunkedReader {
+        bytes: Vec<u8>,
+        position: usize,
+        max_chunk: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(bytes: Vec<u8>, max_chunk: usize) -> Self {
+            Self { bytes, position: 0, max_chunk }
+        }
+
+        fn remaining(&self) -> &[u8] {
+            &self.bytes[self.position..]
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let count = output.len().min(self.max_chunk).min(self.bytes.len() - self.position);
+            output[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
+    struct ChunkedWriter {
+        bytes: Vec<u8>,
+        max_chunk: usize,
+        flushes: usize,
+    }
+
+    impl Write for ChunkedWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let count = input.len().min(self.max_chunk);
+            self.bytes.extend_from_slice(&input[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
 
     fn decode_hex(input: &str) -> Vec<u8> {
         let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
@@ -1375,5 +1559,80 @@ mod tests {
             DerpClientHandshake::new(zero_private, Some(bob_public), ClientInfo::default()).err().unwrap(),
             DerpClientHandshakeError::ZeroPrivateKey
         );
+    }
+
+    #[test]
+    fn stream_frame_reader_handles_partial_reads_and_discards_short_buffer_tail() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, FrameType(0x12), &[1, 2, 3, 4]).unwrap();
+        write_frame(&mut wire, FrameType(0x13), &[9, 8]).unwrap();
+        let mut reader = ChunkedReader::new(wire, 2);
+        let mut small = [0; 2];
+        assert!(matches!(
+            read_frame_from(&mut reader, 16, &mut small),
+            Err(StreamReadFrameError::ShortBuffer {
+                header: FrameHeader { frame_type: FrameType(0x12), frame_len: 4 }
+            })
+        ));
+        assert_eq!(small, [1, 2]);
+        let mut next = [0; 2];
+        assert_eq!(
+            read_frame_from(&mut reader, 16, &mut next).unwrap(),
+            FrameHeader { frame_type: FrameType(0x13), frame_len: 2 }
+        );
+        assert_eq!(next, [9, 8]);
+        assert!(reader.remaining().is_empty());
+    }
+
+    #[test]
+    fn stream_frame_reader_matches_go_eof_and_over_limit_boundaries() {
+        let mut empty = ChunkedReader::new(Vec::new(), 2);
+        assert!(matches!(read_frame_from(&mut empty, 10, &mut []), Err(StreamReadFrameError::EndOfInput)));
+
+        let mut partial_header = ChunkedReader::new(vec![0x12, 0, 0], 2);
+        assert!(matches!(
+            read_frame_from(&mut partial_header, 10, &mut []),
+            Err(StreamReadFrameError::UnexpectedEndOfInput)
+        ));
+
+        let mut partial_payload = ChunkedReader::new(vec![0x12, 0, 0, 0, 4, 1, 2], 2);
+        let mut output = [0; 4];
+        assert!(matches!(
+            read_frame_from(&mut partial_payload, 10, &mut output),
+            Err(StreamReadFrameError::UnexpectedEndOfInput)
+        ));
+        assert_eq!(&output[..2], &[1, 2]);
+
+        let mut discard_eof = ChunkedReader::new(vec![0x12, 0, 0, 0, 4, 1, 2, 3], 2);
+        let mut output = [0; 2];
+        assert!(matches!(read_frame_from(&mut discard_eof, 10, &mut output), Err(StreamReadFrameError::EndOfInput)));
+
+        let mut too_large_wire = FrameHeader { frame_type: FrameType(0x12), frame_len: 11 }.encode().to_vec();
+        too_large_wire.extend_from_slice(&[0xaa; 11]);
+        let mut too_large = ChunkedReader::new(too_large_wire, 3);
+        assert!(matches!(
+            read_frame_from(&mut too_large, 10, &mut [0; 4]),
+            Err(StreamReadFrameError::ExceedsLimit { frame_len: 11, max_size: 10 })
+        ));
+        assert_eq!(too_large.remaining(), &[0xaa; 11]);
+    }
+
+    #[test]
+    fn stream_frame_writer_handles_partial_writes_flushes_and_rejects_oversize() {
+        let mut writer = ChunkedWriter { bytes: Vec::new(), max_chunk: 2, flushes: 0 };
+        write_frame_to(&mut writer, FrameType(0x13), &[1, 2, 3, 4, 5]).unwrap();
+        let mut expected = Vec::new();
+        write_frame(&mut expected, FrameType(0x13), &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(writer.flushes, 1);
+
+        let oversized = vec![0; MAX_FRAME_WRITE_SIZE + 1];
+        let mut untouched = ChunkedWriter { bytes: Vec::new(), max_chunk: 3, flushes: 0 };
+        assert!(matches!(
+            write_frame_to(&mut untouched, FrameType(0x13), &oversized),
+            Err(StreamWriteFrameError::UnreasonablyLarge)
+        ));
+        assert!(untouched.bytes.is_empty());
+        assert_eq!(untouched.flushes, 0);
     }
 }
