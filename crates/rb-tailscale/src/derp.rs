@@ -358,6 +358,22 @@ pub fn write_frame_to<W: Write>(
     writer.flush().map_err(StreamWriteFrameError::Io)
 }
 
+/// Writes and flushes one Ping frame with the fixed eight-byte payload.
+///
+/// The pinned fork serializes this operation with the client's write mutex; this
+/// stateless helper does not synchronize concurrent users of the same writer.
+pub fn write_ping_to<W: Write>(writer: &mut W, data: [u8; 8]) -> Result<(), StreamWriteFrameError> {
+    write_frame_to(writer, FRAME_PING, &data)
+}
+
+/// Writes and flushes one Pong frame with the fixed eight-byte payload.
+///
+/// The pinned fork serializes this operation with the client's write mutex; this
+/// stateless helper does not synchronize concurrent users of the same writer.
+pub fn write_pong_to<W: Write>(writer: &mut W, data: [u8; 8]) -> Result<(), StreamWriteFrameError> {
+    write_frame_to(writer, FRAME_PONG, &data)
+}
+
 /// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
 /// when the output is shorter than the advertised frame, matching Go `readFrame`.
 ///
@@ -1304,11 +1320,11 @@ fn push_go_json_string(output: &mut String, value: &str) {
 mod tests {
     use super::{
         build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_from, read_frame_header,
-        read_frame_type_header, read_server_greeting, write_frame, write_frame_to, ClientInfo, ClientInfoFrameError,
-        DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState, DerpClientStreamHandshakeError,
-        FrameHeader, FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, StreamReadFrameError,
-        StreamWriteFrameError, WriteFrameError, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE,
-        PROTOCOL_VERSION,
+        read_frame_type_header, read_server_greeting, write_frame, write_frame_to, write_ping_to, write_pong_to,
+        ClientInfo, ClientInfoFrameError, DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState,
+        DerpClientStreamHandshakeError, FrameHeader, FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError,
+        StreamReadFrameError, StreamWriteFrameError, WriteFrameError, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC,
+        MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
     use std::io::{self, Read, Write};
@@ -2269,6 +2285,18 @@ mod tests {
         let server_info_error =
             super::RecvMessageError::ServerInfo(super::ServerInfoError::Box(NodeBoxError::Authentication));
         assert!(std::error::Error::source(&server_info_error).is_none());
+    }
+
+    #[test]
+    fn ping_and_pong_writers_match_pinned_go_send_oracle() {
+        let mut writer = ChunkedWriter { bytes: Vec::new(), max_chunk: 2, flushes: 0 };
+        write_ping_to(&mut writer, [0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        assert_eq!(writer.bytes, decode_hex("12000000080001020304050607"));
+        assert_eq!(writer.flushes, 1);
+
+        write_pong_to(&mut writer, [8, 7, 6, 5, 4, 3, 2, 1]).unwrap();
+        assert_eq!(writer.bytes, decode_hex("1200000008000102030405060713000000080807060504030201"));
+        assert_eq!(writer.flushes, 2);
     }
 
     #[test]
