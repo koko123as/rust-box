@@ -3,15 +3,15 @@
 //! This module gates `SendPing` and `SendPong` on caller-supplied connection state,
 //! dispatches registered Pong responses, and filters only matching Pong messages
 //! from an already-created DERP receive session. Its bounded Ping helper models a
-//! five-second maximum deadline but not arbitrary context cancellation. It does not
-//! connect or reconnect, assign connection generations, close transports, or
-//! implement the complete `derphttp.Client` lifecycle.
+//! five-second maximum deadline and an explicit cancellation token, but not Go
+//! scheduler select parity. It does not connect or reconnect, assign connection
+//! generations, close transports, or implement the complete `derphttp.Client` lifecycle.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::Write;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use rand::rand_core::OsRng;
@@ -92,11 +92,12 @@ impl Error for DerpPingSendError {
     }
 }
 
-/// Failure from the bounded, deadline-only high-level Ping helper.
+/// Failure from the bounded high-level Ping helper.
 #[derive(Debug)]
 pub enum DerphttpPingError {
     Entropy(String),
     Send(DerpPingSendError),
+    Cancelled,
     DeadlineExceeded,
     DeadlineOverflow,
 }
@@ -106,6 +107,7 @@ impl fmt::Display for DerphttpPingError {
         match self {
             Self::Entropy(error) => write!(f, "DERP Ping randomness unavailable: {error}"),
             Self::Send(error) => fmt::Display::fmt(error, f),
+            Self::Cancelled => f.write_str("context canceled"),
             Self::DeadlineExceeded => f.write_str("context deadline exceeded"),
             Self::DeadlineOverflow => f.write_str("DERP Ping deadline overflow"),
         }
@@ -116,7 +118,7 @@ impl Error for DerphttpPingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Send(error) => Some(error),
-            Self::Entropy(_) | Self::DeadlineExceeded | Self::DeadlineOverflow => None,
+            Self::Entropy(_) | Self::Cancelled | Self::DeadlineExceeded | Self::DeadlineOverflow => None,
         }
     }
 }
@@ -207,32 +209,133 @@ fn ping_deadline(start: Instant, caller_deadline: Option<Instant>) -> Option<Ins
     Some(caller_deadline.map_or(maximum, |deadline| deadline.min(maximum)))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PongSignalState {
+    Pending,
+    Pong,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PongWaitOutcome {
+    Pong,
+    Cancelled,
+    DeadlineExceeded,
+}
+
 struct PongSignal {
-    ready: Mutex<bool>,
+    state: Mutex<PongSignalState>,
     changed: Condvar,
 }
 
 impl PongSignal {
     fn new() -> Self {
-        Self { ready: Mutex::new(false), changed: Condvar::new() }
+        Self { state: Mutex::new(PongSignalState::Pending), changed: Condvar::new() }
     }
 
-    fn lock_ready(&self) -> MutexGuard<'_, bool> {
-        self.ready.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock_state(&self) -> MutexGuard<'_, PongSignalState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn signal(&self) {
+    fn transition(&self, next: PongSignalState) {
         let should_notify = {
-            let mut ready = self.lock_ready();
-            if *ready {
-                false
-            } else {
-                *ready = true;
+            let mut state = self.lock_state();
+            if *state == PongSignalState::Pending {
+                *state = next;
                 true
+            } else {
+                false
             }
         };
         if should_notify {
             self.changed.notify_one();
+        }
+    }
+
+    fn signal(&self) {
+        self.transition(PongSignalState::Pong);
+    }
+
+    fn cancel(&self) {
+        self.transition(PongSignalState::Cancelled);
+    }
+
+    fn wait_until(&self, deadline: Option<Instant>) -> PongWaitOutcome {
+        let mut state = self.lock_state();
+        loop {
+            match *state {
+                PongSignalState::Pong => return PongWaitOutcome::Pong,
+                PongSignalState::Cancelled => return PongWaitOutcome::Cancelled,
+                PongSignalState::Pending => {}
+            }
+
+            let Some(deadline) = deadline else {
+                state = self.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return PongWaitOutcome::DeadlineExceeded;
+            }
+            let (next, result) =
+                self.changed.wait_timeout(state, remaining).unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if result.timed_out() && *state == PongSignalState::Pending {
+                return PongWaitOutcome::DeadlineExceeded;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PingCancellationState {
+    cancelled: bool,
+    waiters: Vec<Weak<PongSignal>>,
+}
+
+/// A cloneable cancellation signal for a DERP Ping wait.
+///
+/// Cancelling wakes every currently subscribed Ping; it does not close or reconnect
+/// the transport. A Ping still sends its frame before observing this signal.
+#[derive(Clone, Default)]
+pub struct DerpPingCancellationToken {
+    state: Arc<Mutex<PingCancellationState>>,
+}
+
+impl DerpPingCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, PingCancellationState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Marks the token cancelled and wakes all outstanding Ping waiters.
+    pub fn cancel(&self) {
+        let mut state = self.lock_state();
+        if state.cancelled {
+            return;
+        }
+        state.cancelled = true;
+        for waiter in state.waiters.drain(..) {
+            if let Some(waiter) = waiter.upgrade() {
+                waiter.cancel();
+            }
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.lock_state().cancelled
+    }
+
+    fn register(&self, waiter: &Arc<PongSignal>) {
+        let mut state = self.lock_state();
+        state.waiters.retain(|waiter| waiter.strong_count() != 0);
+        if state.cancelled {
+            waiter.cancel();
+        } else {
+            state.waiters.push(Arc::downgrade(waiter));
         }
     }
 }
@@ -243,30 +346,7 @@ pub struct PongResponseWaiter(Arc<PongSignal>);
 impl PongResponseWaiter {
     /// Waits for the registered Pong, returning false if the duration expires.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            let mut ready = self.0.lock_ready();
-            while !*ready {
-                ready = self.0.changed.wait(ready).unwrap_or_else(|poisoned| poisoned.into_inner());
-            }
-            return true;
-        };
-
-        let mut ready = self.0.lock_ready();
-        loop {
-            if *ready {
-                return true;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let (next_ready, result) =
-                self.0.changed.wait_timeout(ready, remaining).unwrap_or_else(|poisoned| poisoned.into_inner());
-            ready = next_ready;
-            if result.timed_out() && !*ready {
-                return false;
-            }
-        }
+        self.0.wait_until(Instant::now().checked_add(timeout)) == PongWaitOutcome::Pong
     }
 }
 
@@ -352,8 +432,7 @@ impl<R, W> DerphttpPongFilter<R, W> {
     /// Creates a Ping helper sharing this receive filter's response registry.
     ///
     /// A separate receive loop must call `recv_next` while Ping is waiting, and the
-    /// supplied send gate must target the same DERP client. The helper accepts
-    /// deadlines only; it does not model context cancellation.
+    /// supplied send gate must target the same DERP client.
     pub fn ping_client<S>(&self, send_gate: Arc<DerphttpSendGate<S>>) -> DerphttpPingClient<S> {
         DerphttpPingClient { send_gate, pong_responses: Arc::clone(&self.pong_responses) }
     }
@@ -363,8 +442,8 @@ impl<R, W> DerphttpPongFilter<R, W> {
 ///
 /// `ping_until` registers an OS-random eight-byte identifier before sending, then
 /// waits until the matching Pong or the earlier of the caller deadline and the
-/// pinned five-second maximum. It does not support arbitrary cancellation, and a
-/// separate receive loop must dispatch incoming Pongs through the paired filter.
+/// pinned five-second maximum. `ping_with_cancellation` also wakes on a caller-owned
+/// cancellation token; a separate receive loop must dispatch Pongs through the filter.
 pub struct DerphttpPingClient<W> {
     send_gate: Arc<DerphttpSendGate<W>>,
     pong_responses: Arc<DerpPongResponseRegistry>,
@@ -373,17 +452,43 @@ pub struct DerphttpPingClient<W> {
 impl<W: Write> DerphttpPingClient<W> {
     /// Sends one Ping and waits for its matching Pong until the capped deadline.
     ///
-    /// This deadline-only slice does not emulate `context.Context` cancellation.
-    /// As in the pinned Go path, the connection must already be active and another
-    /// receive loop must be processing the paired Pong filter concurrently.
+    /// This convenience method does not take a cancellation token. As in the pinned
+    /// Go path, the connection must already be active and another receive loop must
+    /// process the paired filter concurrently.
     pub fn ping_until(&self, caller_deadline: Option<Instant>) -> Result<(), DerphttpPingError> {
         let mut rng = OsRng;
-        self.ping_until_with_rng(caller_deadline, &mut rng)
+        self.ping_with_context_and_rng(caller_deadline, None, &mut rng)
     }
 
+    /// Sends one Ping and waits for its Pong, caller deadline, or cancellation.
+    ///
+    /// Even an already-cancelled token is observed only after the Ping frame is
+    /// sent, matching the pinned fork's send-before-select order. A send error wins.
+    pub fn ping_with_cancellation(
+        &self,
+        caller_deadline: Option<Instant>,
+        cancellation: &DerpPingCancellationToken,
+    ) -> Result<(), DerphttpPingError> {
+        let mut rng = OsRng;
+        self.ping_with_context_and_rng(caller_deadline, Some(cancellation), &mut rng)
+    }
+
+    #[cfg(test)]
     fn ping_until_with_rng<R: TryRngCore>(
         &self,
         caller_deadline: Option<Instant>,
+        rng: &mut R,
+    ) -> Result<(), DerphttpPingError>
+    where
+        R::Error: fmt::Display,
+    {
+        self.ping_with_context_and_rng(caller_deadline, None, rng)
+    }
+
+    fn ping_with_context_and_rng<R: TryRngCore>(
+        &self,
+        caller_deadline: Option<Instant>,
+        cancellation: Option<&DerpPingCancellationToken>,
         rng: &mut R,
     ) -> Result<(), DerphttpPingError>
     where
@@ -394,14 +499,16 @@ impl<W: Write> DerphttpPingClient<W> {
         rng.try_fill_bytes(&mut data).map_err(|error| DerphttpPingError::Entropy(error.to_string()))?;
 
         let waiter = self.pong_responses.register_ping(data);
+        if let Some(cancellation) = cancellation {
+            cancellation.register(&waiter.0);
+        }
         let _registration = PingRegistrationGuard { registry: Arc::clone(&self.pong_responses), data };
         self.send_gate.send_ping(data).map_err(DerphttpPingError::Send)?;
 
-        let acknowledged = waiter.wait_timeout(deadline.saturating_duration_since(Instant::now()));
-        if acknowledged {
-            Ok(())
-        } else {
-            Err(DerphttpPingError::DeadlineExceeded)
+        match waiter.0.wait_until(Some(deadline)) {
+            PongWaitOutcome::Pong => Ok(()),
+            PongWaitOutcome::Cancelled => Err(DerphttpPingError::Cancelled),
+            PongWaitOutcome::DeadlineExceeded => Err(DerphttpPingError::DeadlineExceeded),
         }
     }
 }
@@ -433,8 +540,8 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        ping_deadline, DerpClientState, DerpPongResponseRegistry, DerphttpPingClient, DerphttpPongFilter,
-        DerphttpSendGate, DERP_PING_MAX_WAIT,
+        ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry, DerphttpPingClient,
+        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -631,9 +738,11 @@ mod tests {
         let filter = make_filter(Vec::new());
         let output = Arc::new(Mutex::new(Vec::new()));
         let ping_client = make_ping_client(&filter, DerpClientState::Disconnected, SharedWriter(Arc::clone(&output)));
+        let cancellation = DerpPingCancellationToken::new();
+        cancellation.cancel();
         let mut rng = FixedPingRng(challenge);
 
-        let error = ping_client.ping_until_with_rng(None, &mut rng).unwrap_err();
+        let error = ping_client.ping_with_context_and_rng(None, Some(&cancellation), &mut rng).unwrap_err();
         assert_eq!(error.to_string(), "client not connected");
         assert!(output.lock().unwrap().is_empty());
         assert!(!filter.pong_responses().handle_pong(challenge));
@@ -647,6 +756,48 @@ mod tests {
         assert_eq!(ping_deadline(start, Some(maximum + Duration::from_secs(1))), Some(maximum));
         let earlier = start + Duration::from_secs(3);
         assert_eq!(ping_deadline(start, Some(earlier)), Some(earlier));
+    }
+
+    #[test]
+    fn high_level_ping_cancellation_wakes_waiter_and_unregisters() {
+        let challenge = *b"fixed123";
+        let filter = make_filter(Vec::new());
+        let output = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let ping_client = make_ping_client(&filter, DerpClientState::Connected, RecordingWriter(Arc::clone(&output)));
+        let cancellation = DerpPingCancellationToken::new();
+        let task_cancellation = cancellation.clone();
+
+        let ping_task = std::thread::spawn(move || {
+            let mut rng = FixedPingRng(challenge);
+            ping_client.ping_with_context_and_rng(None, Some(&task_cancellation), &mut rng)
+        });
+        let bytes = wait_for_wire(&output, 13);
+        let mut expected = FrameHeader { frame_type: FRAME_PING, frame_len: 8 }.encode().to_vec();
+        expected.extend_from_slice(&challenge);
+        assert_eq!(bytes, expected);
+
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        assert_eq!(ping_task.join().unwrap().unwrap_err().to_string(), "context canceled");
+        assert!(!filter.pong_responses().handle_pong(challenge));
+    }
+
+    #[test]
+    fn already_cancelled_ping_still_sends_before_returning_context_error() {
+        let challenge = *b"fixed123";
+        let filter = make_filter(Vec::new());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let ping_client = make_ping_client(&filter, DerpClientState::Connected, SharedWriter(Arc::clone(&output)));
+        let cancellation = DerpPingCancellationToken::new();
+        cancellation.cancel();
+        let mut rng = FixedPingRng(challenge);
+
+        let error = ping_client.ping_with_context_and_rng(None, Some(&cancellation), &mut rng).unwrap_err();
+        assert_eq!(error.to_string(), "context canceled");
+        let mut expected = FrameHeader { frame_type: FRAME_PING, frame_len: 8 }.encode().to_vec();
+        expected.extend_from_slice(&challenge);
+        assert_eq!(*output.lock().unwrap(), expected);
+        assert!(!filter.pong_responses().handle_pong(challenge));
     }
 
     #[test]
