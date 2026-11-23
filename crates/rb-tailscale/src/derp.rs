@@ -7,9 +7,9 @@
 //! bounded blocking-stream routing for pinned-fork received-message frames. A
 //! receive-session helper requests the pinned 120-second read deadline and latches
 //! the first error. A pure Rust model of the pinned `rate.Limiter.AllowN` state
-//! transition is oracle-tested. Node-key box primitives live in `disco_crypto`;
-//! shared write serialization, `Client.Send` integration, automatic Ping replies,
-//! and server authentication remain unimplemented.
+//! transition and a bounded SendPacket writer are oracle-tested. Node-key box
+//! primitives live in `disco_crypto`; shared write serialization across methods,
+//! automatic Ping replies, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
@@ -25,6 +25,10 @@ use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
 
 /// A DERP frame header contains a type byte and a big-endian u32 payload length.
 pub const FRAME_HEADER_LEN: usize = 5;
+/// Raw node public-key length in DERP frames.
+pub const KEY_LEN: usize = 32;
+/// Maximum packet length accepted by the pinned fork's `Client.Send`.
+pub const MAX_PACKET_SIZE: usize = 64 << 10;
 /// Maximum payload length accepted by the pinned fork's `WriteFrame`.
 pub const MAX_FRAME_WRITE_SIZE: usize = 10 << 20;
 /// Maximum single frame payload accepted by the pinned fork's `Client.Recv`.
@@ -37,6 +41,8 @@ pub const FRAME_SERVER_KEY: FrameType = FrameType(0x01);
 pub const FRAME_CLIENT_INFO: FrameType = FrameType(0x02);
 /// The server-info frame type.
 pub const FRAME_SERVER_INFO: FrameType = FrameType(0x03);
+/// The client-to-server packet frame type.
+pub const FRAME_SEND_PACKET: FrameType = FrameType(0x04);
 /// The received-packet frame type.
 pub const FRAME_RECV_PACKET: FrameType = FrameType(0x05);
 /// The keep-alive frame type.
@@ -375,6 +381,85 @@ pub fn write_ping_to<W: Write>(writer: &mut W, data: [u8; 8]) -> Result<(), Stre
 /// stateless helper does not synchronize concurrent users of the same writer.
 pub fn write_pong_to<W: Write>(writer: &mut W, data: [u8; 8]) -> Result<(), StreamWriteFrameError> {
     write_frame_to(writer, FRAME_PONG, &data)
+}
+
+/// The result of attempting one pinned-fork DERP `Client.Send` packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SendPacketOutcome {
+    Sent,
+    /// The rate limiter denied the send; the Go client returns nil and writes nothing.
+    Dropped,
+}
+
+/// An error from the pinned-fork DERP `Client.Send` packet path.
+#[derive(Debug)]
+pub enum SendPacketError {
+    PacketTooBig { packet_len: usize },
+    StreamWrite(StreamWriteFrameError),
+}
+
+impl fmt::Display for SendPacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PacketTooBig { packet_len } => write!(f, "derp.Send: packet too big: {packet_len}"),
+            Self::StreamWrite(error) => write!(f, "derp.Send: {error}"),
+        }
+    }
+}
+
+impl Error for SendPacketError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StreamWrite(error) => Some(error),
+            Self::PacketTooBig { .. } => None,
+        }
+    }
+}
+
+/// Writes and flushes one packet using the pinned `Client.Send` size, rate, and
+/// wire-length rules. The limiter charge includes the five-byte frame header;
+/// the frame payload length is only the 32-byte destination key plus packet.
+///
+/// The Go client serializes this operation with every other writer method. This
+/// helper does not own that shared mutex: callers must serialize it with their
+/// Ping/Pong and other writes and pass the time sampled inside that critical section.
+/// It issues one `Write` per header/key/packet segment and treats a short write as
+/// `io.ErrShortWrite`. It does not model `bufio.Writer`'s internal
+/// `AvailableBuffer` fast/slow path or coordinate with other writers.
+pub fn send_packet_to<W: Write>(
+    writer: &mut W,
+    destination: NodePublic,
+    packet: &[u8],
+    limiter: Option<&mut DerpSendRateLimiter>,
+    now: Instant,
+) -> Result<SendPacketOutcome, SendPacketError> {
+    if packet.len() > MAX_PACKET_SIZE {
+        return Err(SendPacketError::PacketTooBig { packet_len: packet.len() });
+    }
+
+    if let Some(limiter) = limiter {
+        let charged_len = FRAME_HEADER_LEN + KEY_LEN + packet.len();
+        if !limiter.allow_n(now, charged_len) {
+            return Ok(SendPacketOutcome::Dropped);
+        }
+    }
+
+    let payload_len = KEY_LEN + packet.len();
+    let header = FrameHeader { frame_type: FRAME_SEND_PACKET, frame_len: payload_len as u32 }.encode();
+    let destination_bytes = destination.raw_bytes();
+    write_send_segment(writer, &header).map_err(SendPacketError::StreamWrite)?;
+    write_send_segment(writer, &destination_bytes).map_err(SendPacketError::StreamWrite)?;
+    write_send_segment(writer, packet).map_err(SendPacketError::StreamWrite)?;
+    writer.flush().map_err(StreamWriteFrameError::Io).map_err(SendPacketError::StreamWrite)?;
+    Ok(SendPacketOutcome::Sent)
+}
+
+fn write_send_segment<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), StreamWriteFrameError> {
+    let written = writer.write(bytes).map_err(StreamWriteFrameError::Io)?;
+    if written != bytes.len() {
+        return Err(StreamWriteFrameError::Io(io::Error::new(io::ErrorKind::WriteZero, "short write")));
+    }
+    Ok(())
 }
 
 /// Reads a bounded DERP frame into `output`, consuming discarded payload bytes
@@ -1868,6 +1953,55 @@ mod tests {
         assert!(subnanosecond.allow_n(base + Duration::from_nanos(1), 3));
         assert!(!subnanosecond.allow_n(base + Duration::from_nanos(1), 1));
         assert!(subnanosecond.allow_n(base + Duration::from_nanos(2), 1));
+    }
+
+    #[test]
+    fn send_packet_matches_fixed_go_client_send_wire_size_and_drop_oracle() {
+        use super::{DerpSendRateLimiter, SendPacketOutcome, SendRateLimiterConfig};
+
+        let base = Instant::now();
+        let destination = NodePublic::from_raw32([
+            101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
+            122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
+        ]);
+
+        let pattern = (0..=u8::MAX).collect::<Vec<_>>();
+        let max_packet = pattern.repeat(256);
+        let mut max_wire = Vec::new();
+        assert!(matches!(
+            super::send_packet_to(&mut max_wire, destination, &max_packet, None, base),
+            Ok(SendPacketOutcome::Sent)
+        ));
+        assert_eq!(max_wire.len(), super::FRAME_HEADER_LEN + super::KEY_LEN + super::MAX_PACKET_SIZE);
+        assert_eq!(&max_wire[..super::FRAME_HEADER_LEN], &[0x04, 0x00, 0x01, 0x00, 0x20]);
+        assert_eq!(
+            &max_wire[super::FRAME_HEADER_LEN..super::FRAME_HEADER_LEN + super::KEY_LEN],
+            &destination.raw_bytes()
+        );
+        assert_eq!(&max_wire[super::FRAME_HEADER_LEN + super::KEY_LEN..], max_packet.as_slice());
+
+        let packet = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut limiter = DerpSendRateLimiter::new(SendRateLimiterConfig { bytes_per_second: 1, burst: 47 });
+        let mut limited_wire = Vec::new();
+        let oversized = vec![0; super::MAX_PACKET_SIZE + 1];
+        let too_big =
+            super::send_packet_to(&mut limited_wire, destination, &oversized, Some(&mut limiter), base).unwrap_err();
+        assert_eq!(too_big.to_string(), "derp.Send: packet too big: 65537");
+        assert!(limited_wire.is_empty());
+
+        assert!(matches!(
+            super::send_packet_to(&mut limited_wire, destination, &packet, Some(&mut limiter), base),
+            Ok(SendPacketOutcome::Sent)
+        ));
+        assert!(matches!(
+            super::send_packet_to(&mut limited_wire, destination, &packet, Some(&mut limiter), base),
+            Ok(SendPacketOutcome::Dropped)
+        ));
+
+        let mut expected = vec![0x04, 0, 0, 0, 0x2a];
+        expected.extend_from_slice(&destination.raw_bytes());
+        expected.extend_from_slice(&packet);
+        assert_eq!(limited_wire, expected);
     }
 
     #[test]
