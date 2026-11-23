@@ -1,14 +1,15 @@
 //! DERP slice primitives from the Tailscale fork pinned by sing-box v1.14.4.
 //!
 //! This module provides header codecs, bounded frame slice reads/writes, a
-//! server-greeting parser, and ClientInfo plaintext JSON encoding. Node-key box
-//! primitives live in `disco_crypto`; a streaming DERP client/server, transport
-//! handshake, and server authentication remain unimplemented.
+//! server-greeting parser, ClientInfo JSON encoding, and in-memory encrypted
+//! ClientInfo frame construction. Node-key box primitives live in `disco_crypto`;
+//! a streaming DERP client/server, transport lifecycle, and server authentication
+//! remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
 
-use crate::NodePublic;
+use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
 
 /// A DERP frame header contains a type byte and a big-endian u32 payload length.
 pub const FRAME_HEADER_LEN: usize = 5;
@@ -280,6 +281,67 @@ impl ClientInfo {
     }
 }
 
+/// Failure to build a complete ClientInfo frame in memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientInfoFrameError {
+    Box(NodeBoxError),
+    Allocation,
+    Frame(WriteFrameError),
+}
+
+impl fmt::Display for ClientInfoFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Box(error) => error.fmt(f),
+            Self::Allocation => f.write_str("unable to allocate DERP ClientInfo frame buffer"),
+            Self::Frame(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for ClientInfoFrameError {}
+
+/// Builds a complete ClientInfo frame in memory using a fresh OS-CSPRNG nonce.
+///
+/// The result includes the five-byte frame header, sender's raw 32-byte node
+/// public key, and NaCl-boxed ClientInfo JSON. It does not write to or flush a
+/// stream, authenticate the server greeting, or manage a DERP connection.
+pub fn build_client_info_frame(
+    private: &NodePrivate,
+    server: &NodePublic,
+    info: &ClientInfo,
+) -> Result<Vec<u8>, ClientInfoFrameError> {
+    let sender = private.public().map_err(|_| ClientInfoFrameError::Box(NodeBoxError::ZeroPrivateKey))?;
+    let plaintext = info.to_json();
+    let sealed = private.seal_to(server, plaintext.as_bytes()).map_err(ClientInfoFrameError::Box)?;
+    encode_client_info_frame(sender, &sealed)
+}
+
+#[cfg(test)]
+fn build_client_info_frame_with_nonce(
+    private: &NodePrivate,
+    server: &NodePublic,
+    info: &ClientInfo,
+    nonce: &[u8; 24],
+) -> Result<Vec<u8>, ClientInfoFrameError> {
+    let sender = private.public().map_err(|_| ClientInfoFrameError::Box(NodeBoxError::ZeroPrivateKey))?;
+    let plaintext = info.to_json();
+    let sealed = private.seal_to_with_nonce(server, plaintext.as_bytes(), nonce).map_err(ClientInfoFrameError::Box)?;
+    encode_client_info_frame(sender, &sealed)
+}
+
+fn encode_client_info_frame(sender: NodePublic, sealed: &[u8]) -> Result<Vec<u8>, ClientInfoFrameError> {
+    let payload_len = 32usize.checked_add(sealed.len()).ok_or(ClientInfoFrameError::Allocation)?;
+    let mut payload = Vec::new();
+    payload.try_reserve_exact(payload_len).map_err(|_| ClientInfoFrameError::Allocation)?;
+    payload.extend_from_slice(&sender.raw_bytes());
+    payload.extend_from_slice(sealed);
+
+    let mut frame = Vec::new();
+    write_frame(&mut frame, FRAME_CLIENT_INFO, &payload).map_err(ClientInfoFrameError::Frame)?;
+    Ok(frame)
+}
+
 fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
     if !*first {
         output.push(',');
@@ -307,10 +369,78 @@ fn push_go_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, read_frame_header, read_frame_type_header, read_server_greeting, write_frame, ClientInfo,
-        FrameHeader, FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, WriteFrameError,
-        FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
+        build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_header,
+        read_frame_type_header, read_server_greeting, write_frame, ClientInfo, ClientInfoFrameError, FrameHeader,
+        FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError, WriteFrameError, FRAME_CLIENT_INFO,
+        FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
+    use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
+
+    fn decode_hex(input: &str) -> Vec<u8> {
+        let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        pairs.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn client_info_frame_matches_pinned_go_send_client_key_vector() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let info = ClientInfo {
+            mesh_key: std::array::from_fn(|index| index as u8),
+            version: PROTOCOL_VERSION,
+            can_ack_pings: true,
+            is_prober: true,
+            app_name: "rust-box".to_owned(),
+        };
+        let nonce = [
+            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51,
+            0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+        ];
+        let actual = build_client_info_frame_with_nonce(&alice, &bob_public, &info, &nonce).unwrap();
+        let expected = decode_hex("02000000da8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f404142434445464748494a4b4c4d4e4f5051525354555657147303b734c84218a6821b8dee24d22ac5172debbee276b1da71a1409d48486a531776a875c9d0971161c587ba67a3d2ed00c683094a625a11c10abc9d0385c219127178b0b738ea5398c692734938b6c0994ce794c17e230c9e26b5663a6b77eaa2080b9d358beef3dad000b7081fafc273be933efcaeaa98c6467c436f71cb0800f28203d5475722631274fc55ff8f67757a9331be93ca2a1f5f6bb3661f03e1d9");
+        assert_eq!(actual, expected);
+
+        let mut remaining = actual.as_slice();
+        let mut payload = vec![0; actual.len() - super::FRAME_HEADER_LEN];
+        let header = read_frame(&mut remaining, MAX_FRAME_WRITE_SIZE as u32, &mut payload).unwrap();
+        assert_eq!(header.frame_type, FRAME_CLIENT_INFO);
+        assert_eq!(header.frame_len as usize, payload.len());
+        assert!(remaining.is_empty());
+        let alice_public = alice.public().unwrap();
+        assert_eq!(&payload[..32], &alice_public.raw_bytes());
+        assert_eq!(bob.open_from(&alice_public, &payload[32..]).unwrap(), info.to_json().as_bytes());
+    }
+
+    #[test]
+    fn client_info_frame_builder_uses_fresh_nonce_and_fails_closed_on_zero_keys() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let info = ClientInfo { version: PROTOCOL_VERSION, ..ClientInfo::default() };
+        let first = build_client_info_frame(&alice, &bob_public, &info).unwrap();
+        let second = build_client_info_frame(&alice, &bob_public, &info).unwrap();
+        assert_eq!(&first[..super::FRAME_HEADER_LEN], &second[..super::FRAME_HEADER_LEN]);
+        assert_ne!(
+            &first[super::FRAME_HEADER_LEN + 32..super::FRAME_HEADER_LEN + 32 + 24],
+            &second[super::FRAME_HEADER_LEN + 32..super::FRAME_HEADER_LEN + 32 + 24]
+        );
+
+        let zero_private = NodePrivate::from_text(&format!("privkey:{}", "00".repeat(32))).unwrap();
+        assert_eq!(
+            build_client_info_frame(&zero_private, &bob_public, &info),
+            Err(ClientInfoFrameError::Box(NodeBoxError::ZeroPrivateKey))
+        );
+        assert_eq!(
+            build_client_info_frame(&alice, &NodePublic::from_raw32([0; 32]), &info),
+            Err(ClientInfoFrameError::Box(NodeBoxError::ZeroPeerPublicKey))
+        );
+    }
 
     #[test]
     fn client_info_json_matches_pinned_go_encoding_json_oracle() {

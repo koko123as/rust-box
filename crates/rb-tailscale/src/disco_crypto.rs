@@ -210,7 +210,7 @@ impl NodePrivate {
     }
 
     #[cfg(test)]
-    fn seal_to_with_nonce(
+    pub(crate) fn seal_to_with_nonce(
         &self,
         peer: &NodePublic,
         plaintext: &[u8],

@@ -5,8 +5,8 @@
 //! types 0x01 through 0x09, encrypted packet-envelope helpers, the fixed Geneve
 //! header, and source-derived magicsock packet classification, STUN binding
 //! request/response helpers, and Tailscale address classification and 4-to-6/6-to-4
-//! mapping helpers, plus bounded DERP frame slice codecs and ClientInfo plaintext
-//! JSON encoding. This crate is not a full Tailscale endpoint runtime.
+//! mapping helpers, plus bounded DERP frame slice codecs and in-memory encrypted
+//! ClientInfo frame construction. This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
 pub mod disco;
