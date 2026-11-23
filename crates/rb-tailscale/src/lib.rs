@@ -9,8 +9,10 @@
 //! staged client key-exchange state machine with stream greeting/ClientInfo
 //! support, ServerInfo parsing and send-rate configuration mapping, and bounded
 //! blocking-stream routing for the pinned fork's recognized received-message
-//! frame types. Deadline/error-latch lifecycle, Ping response, limiter execution,
-//! and complete Tailscale endpoint runtime are not yet implemented.
+//! frame types with a session helper for 120-second read-deadline requests and
+//! permanent first-error latching. Shared write locking, automatic Ping response,
+//! limiter enforcement, and complete Tailscale endpoint runtime are not yet
+//! implemented.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;

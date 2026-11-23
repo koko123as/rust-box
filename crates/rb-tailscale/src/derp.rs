@@ -4,16 +4,18 @@
 //! reads/writes, a server-greeting parser, ClientInfo JSON encoding and in-memory
 //! encrypted frame construction, a client key-exchange state machine with a
 //! blocking-stream greeting and ClientInfo write path, ServerInfo parsing, and
-//! bounded blocking-stream routing for pinned-fork received-message frames.
-//! Node-key box primitives live in `disco_crypto`; deadline/error-latch lifecycle,
-//! Ping responses, limiter execution, and server authentication remain
-//! unimplemented.
+//! bounded blocking-stream routing for pinned-fork received-message frames. A
+//! receive-session helper requests the pinned 120-second read deadline and latches
+//! the first error. Node-key box primitives live in `disco_crypto`; shared write
+//! serialization, automatic Ping replies, limiter execution, and server
+//! authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -1127,6 +1129,81 @@ impl Error for RecvMessageError {
     }
 }
 
+/// A receive-session failure retained and returned on every subsequent call.
+#[derive(Clone, Debug)]
+pub struct RecvSessionError {
+    inner: Arc<RecvMessageError>,
+}
+
+impl fmt::Display for RecvSessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.inner.as_ref(), f)
+    }
+}
+
+impl Error for RecvSessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.inner.as_ref())
+    }
+}
+
+/// Timeout requested before each read iteration by the pinned fork's `Client.Recv`.
+pub const CLIENT_RECV_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A blocking reader that can accept the absolute read deadlines used by DERP Recv.
+pub trait RecvDeadlineReader: Read {
+    /// Requests a deadline. The pinned Go client ignores errors from this call.
+    fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()>;
+}
+
+/// A stateful DERP receive session with the pinned fork's deadline requests and
+/// permanent first-error latch.
+///
+/// This owns only the read side and the keys needed to decode ServerInfo. It does
+/// not provide write serialization, a send limiter, automatic Ping replies, or a
+/// complete DERP connection lifecycle.
+pub struct DerpRecvSession<R> {
+    reader: R,
+    client_private: NodePrivate,
+    server_public: NodePublic,
+    latched_error: Option<RecvSessionError>,
+}
+
+impl<R: RecvDeadlineReader> DerpRecvSession<R> {
+    pub fn new(reader: R, client_private: NodePrivate, server_public: NodePublic) -> Self {
+        Self { reader, client_private, server_public, latched_error: None }
+    }
+
+    /// Reads the next recognized message, returning the exact stored error on all
+    /// calls after the first receive failure.
+    pub fn recv_next(&mut self) -> Result<ReceivedMessage, RecvSessionError> {
+        if let Some(error) = self.latched_error.as_ref() {
+            return Err(error.clone());
+        }
+
+        loop {
+            let _ = self.reader.set_read_deadline(Instant::now() + CLIENT_RECV_TIMEOUT);
+            match read_received_message_frame_from(&mut self.reader, &self.client_private, &self.server_public) {
+                Ok(Some(message)) => return Ok(message),
+                Ok(None) => continue,
+                Err(error) => {
+                    let error = RecvSessionError { inner: Arc::new(error) };
+                    self.latched_error = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    pub fn reader(&self) -> &R {
+        &self.reader
+    }
+
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
 /// Parses one complete ServerInfo frame from an in-memory byte slice.
 ///
 /// The returned `usize` is the number of bytes consumed, so a following frame
@@ -1208,85 +1285,93 @@ pub fn read_server_info_message_from<R: Read>(
 /// permanently, update a send limiter, or answer Ping frames. Callers must
 /// provide those connection-lifecycle behaviors separately before treating
 /// this as a full DERP client.
+fn read_received_message_frame_from<R: Read>(
+    reader: &mut R,
+    client_private: &NodePrivate,
+    server_public: &NodePublic,
+) -> Result<Option<ReceivedMessage>, RecvMessageError> {
+    let (header, payload) = match read_frame_vec_from(reader, MAX_CLIENT_RECV_FRAME_LEN as u32) {
+        Ok(frame) => frame,
+        Err(StreamReadFrameError::ExceedsLimit { frame_len, .. }) => {
+            return Err(RecvMessageError::Oversized { frame_len });
+        }
+        Err(error) => return Err(RecvMessageError::Read(error)),
+    };
+
+    let message = match header.frame_type {
+        FRAME_SERVER_INFO => {
+            let info = parse_server_info_payload(client_private, server_public, &payload)
+                .map_err(RecvMessageError::ServerInfo)?;
+            Some(ReceivedMessage::ServerInfo(info.into_message()))
+        }
+        FRAME_KEEP_ALIVE => Some(ReceivedMessage::KeepAlive),
+        FRAME_PEER_GONE if payload.len() >= 32 => {
+            let mut raw_key = [0; 32];
+            raw_key.copy_from_slice(&payload[..32]);
+            Some(ReceivedMessage::PeerGone(PeerGoneMessage {
+                peer: NodePublic::from_raw32(raw_key),
+                reason: payload.get(32).copied().unwrap_or(0),
+            }))
+        }
+        FRAME_PEER_PRESENT if payload.len() >= 32 => {
+            let mut raw_key = [0; 32];
+            raw_key.copy_from_slice(&payload[..32]);
+            let ip_port = if payload.len() >= 50 {
+                let mut raw_ip = [0; 16];
+                raw_ip.copy_from_slice(&payload[32..48]);
+                let ipv6 = Ipv6Addr::from(raw_ip);
+                let ip = ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4);
+                let port = u16::from_be_bytes([payload[48], payload[49]]);
+                Some(SocketAddr::new(ip, port))
+            } else {
+                None
+            };
+            let flags = payload.get(50).copied().unwrap_or(0);
+            Some(ReceivedMessage::PeerPresent(PeerPresentMessage {
+                key: NodePublic::from_raw32(raw_key),
+                ip_port,
+                flags,
+            }))
+        }
+        FRAME_RECV_PACKET if payload.len() >= 32 => {
+            let mut raw_key = [0; 32];
+            raw_key.copy_from_slice(&payload[..32]);
+            Some(ReceivedMessage::ReceivedPacket(ReceivedPacket {
+                source: NodePublic::from_raw32(raw_key),
+                data: payload[32..].to_vec(),
+            }))
+        }
+        FRAME_PING if payload.len() >= 8 => {
+            let mut ping = [0; 8];
+            ping.copy_from_slice(&payload[..8]);
+            Some(ReceivedMessage::Ping(ping))
+        }
+        FRAME_PONG if payload.len() >= 8 => {
+            let mut pong = [0; 8];
+            pong.copy_from_slice(&payload[..8]);
+            Some(ReceivedMessage::Pong(pong))
+        }
+        FRAME_HEALTH => Some(ReceivedMessage::Health(HealthMessage { problem: payload })),
+        FRAME_RESTARTING if payload.len() >= 8 => {
+            let reconnect_in = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let try_for = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            Some(ReceivedMessage::ServerRestarting(ServerRestartingMessage {
+                reconnect_in: Duration::from_millis(u64::from(reconnect_in)),
+                try_for: Duration::from_millis(u64::from(try_for)),
+            }))
+        }
+        _ => None,
+    };
+    Ok(message)
+}
+
 pub fn read_received_message_from<R: Read>(
     reader: &mut R,
     client_private: &NodePrivate,
     server_public: &NodePublic,
 ) -> Result<ReceivedMessage, RecvMessageError> {
     loop {
-        let (header, payload) = match read_frame_vec_from(reader, MAX_CLIENT_RECV_FRAME_LEN as u32) {
-            Ok(frame) => frame,
-            Err(StreamReadFrameError::ExceedsLimit { frame_len, .. }) => {
-                return Err(RecvMessageError::Oversized { frame_len });
-            }
-            Err(error) => return Err(RecvMessageError::Read(error)),
-        };
-
-        let message = match header.frame_type {
-            FRAME_SERVER_INFO => {
-                let info = parse_server_info_payload(client_private, server_public, &payload)
-                    .map_err(RecvMessageError::ServerInfo)?;
-                Some(ReceivedMessage::ServerInfo(info.into_message()))
-            }
-            FRAME_KEEP_ALIVE => Some(ReceivedMessage::KeepAlive),
-            FRAME_PEER_GONE if payload.len() >= 32 => {
-                let mut raw_key = [0; 32];
-                raw_key.copy_from_slice(&payload[..32]);
-                Some(ReceivedMessage::PeerGone(PeerGoneMessage {
-                    peer: NodePublic::from_raw32(raw_key),
-                    reason: payload.get(32).copied().unwrap_or(0),
-                }))
-            }
-            FRAME_PEER_PRESENT if payload.len() >= 32 => {
-                let mut raw_key = [0; 32];
-                raw_key.copy_from_slice(&payload[..32]);
-                let ip_port = if payload.len() >= 50 {
-                    let mut raw_ip = [0; 16];
-                    raw_ip.copy_from_slice(&payload[32..48]);
-                    let ipv6 = Ipv6Addr::from(raw_ip);
-                    let ip = ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4);
-                    let port = u16::from_be_bytes([payload[48], payload[49]]);
-                    Some(SocketAddr::new(ip, port))
-                } else {
-                    None
-                };
-                let flags = payload.get(50).copied().unwrap_or(0);
-                Some(ReceivedMessage::PeerPresent(PeerPresentMessage {
-                    key: NodePublic::from_raw32(raw_key),
-                    ip_port,
-                    flags,
-                }))
-            }
-            FRAME_RECV_PACKET if payload.len() >= 32 => {
-                let mut raw_key = [0; 32];
-                raw_key.copy_from_slice(&payload[..32]);
-                Some(ReceivedMessage::ReceivedPacket(ReceivedPacket {
-                    source: NodePublic::from_raw32(raw_key),
-                    data: payload[32..].to_vec(),
-                }))
-            }
-            FRAME_PING if payload.len() >= 8 => {
-                let mut ping = [0; 8];
-                ping.copy_from_slice(&payload[..8]);
-                Some(ReceivedMessage::Ping(ping))
-            }
-            FRAME_PONG if payload.len() >= 8 => {
-                let mut pong = [0; 8];
-                pong.copy_from_slice(&payload[..8]);
-                Some(ReceivedMessage::Pong(pong))
-            }
-            FRAME_HEALTH => Some(ReceivedMessage::Health(HealthMessage { problem: payload })),
-            FRAME_RESTARTING if payload.len() >= 8 => {
-                let reconnect_in = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let try_for = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                Some(ReceivedMessage::ServerRestarting(ServerRestartingMessage {
-                    reconnect_in: Duration::from_millis(u64::from(reconnect_in)),
-                    try_for: Duration::from_millis(u64::from(try_for)),
-                }))
-            }
-            _ => None,
-        };
-        if let Some(message) = message {
+        if let Some(message) = read_received_message_frame_from(reader, client_private, server_public)? {
             return Ok(message);
         }
     }
@@ -1322,12 +1407,14 @@ mod tests {
         build_client_info_frame, build_client_info_frame_with_nonce, read_frame, read_frame_from, read_frame_header,
         read_frame_type_header, read_server_greeting, write_frame, write_frame_to, write_ping_to, write_pong_to,
         ClientInfo, ClientInfoFrameError, DerpClientHandshake, DerpClientHandshakeError, DerpClientHandshakeState,
-        DerpClientStreamHandshakeError, FrameHeader, FrameHeaderError, FrameType, ReadFrameError, ServerGreetingError,
-        StreamReadFrameError, StreamWriteFrameError, WriteFrameError, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC,
-        MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
+        DerpClientStreamHandshakeError, DerpRecvSession, FrameHeader, FrameHeaderError, FrameType, ReadFrameError,
+        RecvDeadlineReader, ServerGreetingError, StreamReadFrameError, StreamWriteFrameError, WriteFrameError,
+        CLIENT_RECV_TIMEOUT, FRAME_CLIENT_INFO, FRAME_SERVER_KEY, MAGIC, MAX_FRAME_WRITE_SIZE, PROTOCOL_VERSION,
     };
     use crate::{disco_crypto::NodeBoxError, NodePrivate, NodePublic};
     use std::io::{self, Read, Write};
+    use std::sync::Arc;
+    use std::time::Instant;
 
     struct ChunkedReader {
         bytes: Vec<u8>,
@@ -1351,6 +1438,31 @@ mod tests {
             output[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
             self.position += count;
             Ok(count)
+        }
+    }
+
+    struct DeadlineReader {
+        inner: ChunkedReader,
+        deadlines: Vec<Instant>,
+        read_calls: usize,
+        fail_deadline: bool,
+    }
+
+    impl Read for DeadlineReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.read_calls += 1;
+            self.inner.read(output)
+        }
+    }
+
+    impl RecvDeadlineReader for DeadlineReader {
+        fn set_read_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+            self.deadlines.push(deadline);
+            if self.fail_deadline {
+                Err(io::Error::other("deadline unsupported"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -2285,6 +2397,47 @@ mod tests {
         let server_info_error =
             super::RecvMessageError::ServerInfo(super::ServerInfoError::Box(NodeBoxError::Authentication));
         assert!(std::error::Error::source(&server_info_error).is_none());
+    }
+
+    #[test]
+    fn recv_session_sets_per_frame_deadlines_and_latches_the_first_error() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let mut wire = Vec::new();
+        write_frame(&mut wire, FrameType(0x7f), &[0xaa]).unwrap();
+        write_frame(&mut wire, super::FRAME_PEER_GONE, &[0; 31]).unwrap();
+        write_frame(&mut wire, super::FRAME_KEEP_ALIVE, &[]).unwrap();
+        let reader = DeadlineReader {
+            inner: ChunkedReader::new(wire, 2),
+            deadlines: Vec::new(),
+            read_calls: 0,
+            fail_deadline: true,
+        };
+        let mut session = DerpRecvSession::new(reader, alice, bob.public().unwrap());
+        let started = Instant::now();
+        assert_eq!(session.recv_next().unwrap(), super::ReceivedMessage::KeepAlive);
+        let completed = Instant::now();
+
+        assert_eq!(session.reader().deadlines.len(), 3);
+        for deadline in &session.reader().deadlines {
+            assert!(*deadline >= started + CLIENT_RECV_TIMEOUT - std::time::Duration::from_secs(1));
+            assert!(*deadline <= completed + CLIENT_RECV_TIMEOUT);
+        }
+
+        let (first_error, first_inner) = {
+            let error = session.recv_next().unwrap_err();
+            (error.to_string(), Arc::clone(&error.inner))
+        };
+        assert_eq!(first_error, "derp.Recv: EOF");
+        let reads_after_error = session.reader().read_calls;
+        let deadlines_after_error = session.reader().deadlines.len();
+        let second_error = session.recv_next().unwrap_err();
+        assert_eq!(second_error.to_string(), first_error);
+        assert!(Arc::ptr_eq(&first_inner, &second_error.inner));
+        assert_eq!(session.reader().read_calls, reads_after_error);
+        assert_eq!(session.reader().deadlines.len(), deadlines_after_error);
     }
 
     #[test]
