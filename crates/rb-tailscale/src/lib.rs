@@ -23,10 +23,10 @@
 //! gates, a high-level Ping wait capped at five seconds with an explicit cancellation
 //! token, matching Pong dispatch from an existing receive session, and a narrow
 //! post-connect slot for connection generations and stale-client reconnect invalidation.
-//! Its region-derived DERP URL formatter covers the pinned scheme/default-port and
-//! host/port string branch with fail-closed input validation, but not explicit-URL
-//! parsing or network dialing; socket setup, reconnect retry handling, and Go scheduler
-//! parity are not implemented.
+//! Its region-derived DERP URL formatter and raw TLS ServerName selector cover the
+//! pinned scheme/default-port, host/port, and node-hostname branches with fail-closed
+//! input validation, but not explicit-URL parsing or network dialing; socket setup,
+//! reconnect retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
 //! endpoint compatibility or Go scheduler parity. The shared writer's ForwardPacket
 //! path now requires a connection-close handle and arms the pinned five-second

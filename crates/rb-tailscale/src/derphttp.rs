@@ -353,12 +353,7 @@ impl fmt::Display for DerpRegionUrlError {
 
 impl Error for DerpRegionUrlError {}
 
-/// Formats the region-node branch of the pinned fork's `urlString` method.
-///
-/// `use_http` corresponds to `TS_DEBUG_USE_DERP_HTTP`. This intentionally does not
-/// parse or format the separate explicit-URL client path. The input host is the raw
-/// `DERPNode.HostName`, not an authority or a URL.
-pub fn derp_region_url_string(hostname: &str, derp_port: isize, use_http: bool) -> Result<String, DerpRegionUrlError> {
+fn validate_region_hostname(hostname: &str) -> Result<(), DerpRegionUrlError> {
     if hostname.is_empty() {
         return Err(DerpRegionUrlError::EmptyHostname);
     }
@@ -367,6 +362,25 @@ pub fn derp_region_url_string(hostname: &str, derp_port: isize, use_http: bool) 
     }) {
         return Err(DerpRegionUrlError::InvalidHostname);
     }
+    Ok(())
+}
+
+/// Returns the raw region-node hostname used as the TLS ServerName.
+///
+/// This matches the region branch of the pinned fork's `tlsServerName`; the
+/// hostname is not bracketed or combined with the DERP port.
+pub fn derp_region_tls_server_name(hostname: &str) -> Result<&str, DerpRegionUrlError> {
+    validate_region_hostname(hostname)?;
+    Ok(hostname)
+}
+
+/// Formats the region-node branch of the pinned fork's `urlString` method.
+///
+/// `use_http` corresponds to `TS_DEBUG_USE_DERP_HTTP`. This intentionally does not
+/// parse or format the separate explicit-URL client path. The input host is the raw
+/// `DERPNode.HostName`, not an authority or a URL.
+pub fn derp_region_url_string(hostname: &str, derp_port: isize, use_http: bool) -> Result<String, DerpRegionUrlError> {
+    validate_region_hostname(hostname)?;
     if !(0..=u16::MAX as isize).contains(&derp_port) {
         return Err(DerpRegionUrlError::PortOutOfRange);
     }
@@ -722,9 +736,9 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_region_url_string, ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry,
-        DerpRegionUrlError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient,
-        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_region_tls_server_name, derp_region_url_string, ping_deadline, DerpClientState, DerpPingCancellationToken,
+        DerpPongResponseRegistry, DerpRegionUrlError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError,
+        DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -855,6 +869,15 @@ mod tests {
             derp_region_url_string("derp.example", u16::MAX as isize + 1, false),
             Err(DerpRegionUrlError::PortOutOfRange)
         );
+    }
+
+    #[test]
+    fn region_tls_server_name_is_the_unmodified_node_hostname() {
+        for hostname in ["derp.example", "2001:db8::7", "EXAMPLE.invalid"] {
+            assert_eq!(derp_region_tls_server_name(hostname).unwrap(), hostname);
+        }
+        assert_eq!(derp_region_tls_server_name(""), Err(DerpRegionUrlError::EmptyHostname));
+        assert_eq!(derp_region_tls_server_name("derp.example/path"), Err(DerpRegionUrlError::InvalidHostname));
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
