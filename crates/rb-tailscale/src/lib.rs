@@ -31,6 +31,8 @@
 //! override, rejecting values outside the TCP port range; it does not open sockets.
 //! A separate proxy port selector mirrors `dialNodeUsingProxy`'s exact-`https` 443
 //! versus other-scheme 80 fallback for already-parsed fields; it does not parse or dial.
+//! A proxy CONNECT helper formats only the HTTP/1.1 request text and optional auth
+//! header fragment; it does not write to a connection or parse a response.
 //! The `shouldDialProto` family decision and `startDial` target/family guard accept
 //! already-classified address fields. A limited IP-field classifier supports empty,
 //! canonical dotted IPv4 and IPv6 address parts containing ASCII hexadecimal digits,

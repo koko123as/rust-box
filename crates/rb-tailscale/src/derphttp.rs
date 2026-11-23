@@ -435,6 +435,15 @@ pub fn derp_proxy_dial_port_from_parsed_parts<'a>(proxy_scheme: &str, parsed_por
     }
 }
 
+/// Formats the pinned `dialNodeUsingProxy` HTTP/1.1 CONNECT request text.
+///
+/// `target` must already be host:port text and `auth_header` is an optional
+/// preformatted header fragment, normally empty or ending in CRLF. This does not
+/// validate or escape either input, write to a connection, or parse a response.
+pub fn derp_proxy_connect_request_text(target: &str, auth_header: &str) -> String {
+    format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth_header}\r\n")
+}
+
 /// An already-classified DERP node address field; no text parsing is performed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DerpParsedDialField {
@@ -1044,8 +1053,8 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_dial_field_from_supported_text, derp_proxy_dial_port_from_parsed_parts, derp_region_dial_port,
-        derp_region_tls_server_name, derp_region_url_string, derp_should_dial_proto_from_parsed,
+        derp_dial_field_from_supported_text, derp_proxy_connect_request_text, derp_proxy_dial_port_from_parsed_parts,
+        derp_region_dial_port, derp_region_tls_server_name, derp_region_url_string, derp_should_dial_proto_from_parsed,
         derp_should_dial_proto_from_supported_text, derp_start_dial_host_port, derp_start_dial_target_from_parsed,
         derp_url_port_from_parsed_parts, derp_use_https, ping_deadline, DerpClientState, DerpDialProtocol,
         DerpParsedDialField, DerpParsedDialTarget, DerpPingCancellationToken, DerpPongResponseRegistry,
@@ -1220,6 +1229,20 @@ mod tests {
         for (scheme, parsed_port, expected) in cases {
             assert_eq!(derp_proxy_dial_port_from_parsed_parts(scheme, parsed_port), expected);
         }
+    }
+
+    #[test]
+    fn proxy_connect_request_matches_fixed_go_http11_crlf_format() {
+        let target = "[2001:db8::7]:443";
+        let auth_header = "Proxy-Authorization: Basic abc\r\n";
+        assert_eq!(
+            derp_proxy_connect_request_text(target, auth_header),
+            "CONNECT [2001:db8::7]:443 HTTP/1.1\r\nHost: [2001:db8::7]:443\r\nProxy-Authorization: Basic abc\r\n\r\n"
+        );
+        assert_eq!(
+            derp_proxy_connect_request_text("proxy.example:80", ""),
+            "CONNECT proxy.example:80 HTTP/1.1\r\nHost: proxy.example:80\r\n\r\n"
+        );
     }
 
     #[test]
