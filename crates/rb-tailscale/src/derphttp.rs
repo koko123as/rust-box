@@ -450,6 +450,53 @@ pub fn derp_should_dial_proto_from_parsed(field: DerpParsedDialField, protocol: 
     }
 }
 
+/// The address text is invalid or outside the currently supported literal subset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DerpUnsupportedDialAddressText;
+
+impl fmt::Display for DerpUnsupportedDialAddressText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unsupported DERP dial address text")
+    }
+}
+
+impl Error for DerpUnsupportedDialAddressText {}
+
+/// Classifies a deliberately limited subset of a DERP IP address field.
+///
+/// Empty text, canonical dotted IPv4, and eight four-digit IPv6 hex groups are
+/// supported. Other forms, including compressed IPv6, zones, invalid addresses,
+/// and hostnames, return an error rather than being classified as a Go parse
+/// failure. This is not a general Go `netip.ParseAddr` replacement.
+pub fn derp_dial_field_from_supported_text(text: &str) -> Result<DerpParsedDialField, DerpUnsupportedDialAddressText> {
+    if text.is_empty() {
+        return Ok(DerpParsedDialField::Empty);
+    }
+    if let Some(address) = text.parse::<std::net::Ipv4Addr>().ok().filter(|address| address.to_string() == text) {
+        return Ok(DerpParsedDialField::Address(address.into()));
+    }
+    let mut groups = text.split(':');
+    if (0..8)
+        .all(|_| groups.next().is_some_and(|group| group.len() == 4 && group.bytes().all(|b| b.is_ascii_hexdigit())))
+        && groups.next().is_none()
+    {
+        return text
+            .parse::<std::net::Ipv6Addr>()
+            .map(|address| DerpParsedDialField::Address(address.into()))
+            .map_err(|_| DerpUnsupportedDialAddressText);
+    }
+    Err(DerpUnsupportedDialAddressText)
+}
+
+/// Applies the family decision only after supported text has been classified.
+/// Unsupported or malformed text fails closed and never reaches the selector.
+pub fn derp_should_dial_proto_from_supported_text(
+    text: &str,
+    protocol: DerpDialProtocol,
+) -> Result<bool, DerpUnsupportedDialAddressText> {
+    derp_dial_field_from_supported_text(text).map(|field| derp_should_dial_proto_from_parsed(field, protocol))
+}
+
 /// A destination paired with the caller's Go `netip.ParseAddr`-equivalent result.
 ///
 /// `None` means parsing the text failed; IPv6 zone information need not be
@@ -873,11 +920,13 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        derp_region_dial_port, derp_region_tls_server_name, derp_region_url_string, derp_should_dial_proto_from_parsed,
+        derp_dial_field_from_supported_text, derp_region_dial_port, derp_region_tls_server_name,
+        derp_region_url_string, derp_should_dial_proto_from_parsed, derp_should_dial_proto_from_supported_text,
         derp_start_dial_target_from_parsed, derp_url_port_from_parsed_parts, derp_use_https, ping_deadline,
         DerpClientState, DerpDialProtocol, DerpParsedDialField, DerpParsedDialTarget, DerpPingCancellationToken,
-        DerpPongResponseRegistry, DerpRegionUrlError, DerpUrlPortError, DerphttpConnectionRegistry,
-        DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        DerpPongResponseRegistry, DerpRegionUrlError, DerpUnsupportedDialAddressText, DerpUrlPortError,
+        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
+        DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -1073,6 +1122,47 @@ mod tests {
         ] {
             assert_eq!(derp_should_dial_proto_from_parsed(field, Tcp4), tcp4, "{field:?} tcp4");
             assert_eq!(derp_should_dial_proto_from_parsed(field, Tcp6), tcp6, "{field:?} tcp6");
+        }
+    }
+
+    #[test]
+    fn supported_dial_field_text_matches_go_family_and_rejects_other_forms() {
+        use DerpDialProtocol::{Tcp4, Tcp6};
+
+        for (text, tcp4, tcp6) in [
+            ("", true, true),
+            ("0.0.0.0", true, false),
+            ("192.0.2.1", true, false),
+            ("255.255.255.255", true, false),
+            ("0123:4567:89ab:cdef:0000:0000:0000:0001", false, true),
+            ("0123:4567:89AB:CDEF:0000:0000:0000:0001", false, true),
+            ("0000:0000:0000:0000:0000:ffff:c000:0201", false, true),
+        ] {
+            assert_eq!(derp_should_dial_proto_from_supported_text(text, Tcp4), Ok(tcp4), "{text:?}");
+            assert_eq!(derp_should_dial_proto_from_supported_text(text, Tcp6), Ok(tcp6), "{text:?}");
+        }
+        for text in [
+            "192.168.001.1",
+            "192.0.2.256",
+            "192.0.2",
+            "::1",
+            "fe80::1%eth0",
+            "fe80::1%",
+            "bad host",
+            "0000:0000:0000:0000:0000:0000:0000:000g",
+            "0000:0000:0000:0000:0000:0000:0000:0000:0000",
+        ] {
+            assert_eq!(derp_dial_field_from_supported_text(text), Err(DerpUnsupportedDialAddressText), "{text:?}");
+            assert_eq!(
+                derp_should_dial_proto_from_supported_text(text, Tcp4),
+                Err(DerpUnsupportedDialAddressText),
+                "{text:?}"
+            );
+            assert_eq!(
+                derp_should_dial_proto_from_supported_text(text, Tcp6),
+                Err(DerpUnsupportedDialAddressText),
+                "{text:?}"
+            );
         }
     }
 
