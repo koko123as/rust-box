@@ -22,8 +22,11 @@
 //! A separate `derphttp` slice implements the lower-level SendPing/SendPong state
 //! gates, a high-level Ping wait capped at five seconds with an explicit cancellation
 //! token, matching Pong dispatch from an existing receive session, and a narrow
-//! post-connect slot for connection generations and stale-client reconnect invalidation;
-//! socket setup, reconnect retry handling, and Go scheduler parity are not implemented.
+//! post-connect slot for connection generations and stale-client reconnect invalidation.
+//! Its region-derived DERP URL formatter covers the pinned scheme/default-port and
+//! host/port string branch with fail-closed input validation, but not explicit-URL
+//! parsing or network dialing; socket setup, reconnect retry handling, and Go scheduler
+//! parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
 //! endpoint compatibility or Go scheduler parity. The shared writer's ForwardPacket
 //! path now requires a connection-close handle and arms the pinned five-second

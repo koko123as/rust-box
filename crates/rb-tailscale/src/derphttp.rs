@@ -333,6 +333,57 @@ impl<C> DerphttpConnectionRegistry<C> {
     }
 }
 
+/// Invalid input to the region-derived `derphttp.Client.urlString` slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpRegionUrlError {
+    EmptyHostname,
+    InvalidHostname,
+    PortOutOfRange,
+}
+
+impl fmt::Display for DerpRegionUrlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyHostname => f.write_str("DERP region hostname is empty"),
+            Self::InvalidHostname => f.write_str("invalid DERP region hostname"),
+            Self::PortOutOfRange => f.write_str("DERP region port is out of range"),
+        }
+    }
+}
+
+impl Error for DerpRegionUrlError {}
+
+/// Formats the region-node branch of the pinned fork's `urlString` method.
+///
+/// `use_http` corresponds to `TS_DEBUG_USE_DERP_HTTP`. This intentionally does not
+/// parse or format the separate explicit-URL client path. The input host is the raw
+/// `DERPNode.HostName`, not an authority or a URL.
+pub fn derp_region_url_string(hostname: &str, derp_port: isize, use_http: bool) -> Result<String, DerpRegionUrlError> {
+    if hostname.is_empty() {
+        return Err(DerpRegionUrlError::EmptyHostname);
+    }
+    if hostname.bytes().any(|byte| {
+        byte.is_ascii_control() || byte.is_ascii_whitespace() || matches!(byte, b'/' | b'?' | b'#' | b'@' | b'\\')
+    }) {
+        return Err(DerpRegionUrlError::InvalidHostname);
+    }
+    if !(0..=u16::MAX as isize).contains(&derp_port) {
+        return Err(DerpRegionUrlError::PortOutOfRange);
+    }
+
+    let (scheme, default_port) = if use_http { ("http", 80) } else { ("https", 443) };
+    let authority = if derp_port != 0 && derp_port != default_port {
+        if hostname.contains(':') {
+            format!("[{hostname}]:{derp_port}")
+        } else {
+            format!("{hostname}:{derp_port}")
+        }
+    } else {
+        hostname.to_owned()
+    };
+    Ok(format!("{scheme}://{authority}/derp"))
+}
+
 /// Computes the high-level Ping deadline: the earlier of the caller deadline and
 /// the pinned fork's fixed five-second maximum.
 fn ping_deadline(start: Instant, caller_deadline: Option<Instant>) -> Option<Instant> {
@@ -671,9 +722,9 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry,
-        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
-        DerphttpSendGate, DERP_PING_MAX_WAIT,
+        derp_region_url_string, ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry,
+        DerpRegionUrlError, DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient,
+        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -774,6 +825,36 @@ mod tests {
         assert_eq!(error, DerphttpConnectionRegistryError::GenerationOverflow);
         assert_eq!(*candidate_closes.lock().unwrap(), 1);
         assert!(registry.current().is_none());
+    }
+
+    #[test]
+    fn region_url_matches_pinned_scheme_default_port_and_join_host_port_rules() {
+        let cases = [
+            ("derp.example", 0, false, "https://derp.example/derp"),
+            ("derp.example", 443, false, "https://derp.example/derp"),
+            ("derp.example", 8443, false, "https://derp.example:8443/derp"),
+            ("derp.example", 80, false, "https://derp.example:80/derp"),
+            ("derp.example", 0, true, "http://derp.example/derp"),
+            ("derp.example", 80, true, "http://derp.example/derp"),
+            ("derp.example", 443, true, "http://derp.example:443/derp"),
+            ("2001:db8::7", 8443, false, "https://[2001:db8::7]:8443/derp"),
+            ("2001:db8::7", 443, false, "https://2001:db8::7/derp"),
+        ];
+
+        for (hostname, port, use_http, expected) in cases {
+            assert_eq!(derp_region_url_string(hostname, port, use_http).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn region_url_rejects_empty_or_url_injection_hosts_and_out_of_range_ports() {
+        assert_eq!(derp_region_url_string("", 0, false), Err(DerpRegionUrlError::EmptyHostname));
+        assert_eq!(derp_region_url_string("derp.example/path", 0, false), Err(DerpRegionUrlError::InvalidHostname));
+        assert_eq!(derp_region_url_string("derp.example", -1, false), Err(DerpRegionUrlError::PortOutOfRange));
+        assert_eq!(
+            derp_region_url_string("derp.example", u16::MAX as isize + 1, false),
+            Err(DerpRegionUrlError::PortOutOfRange)
+        );
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
