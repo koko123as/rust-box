@@ -1,12 +1,12 @@
 //! Pure Rust primitives ported from the Tailscale fork pinned by sing-box v1.14.4.
 //!
 //! This crate implements machine, node, and disco X25519 key primitives, DiscoShared
-//! encryption, Go-oracle-tested plaintext codecs for disco types 0x01 through 0x09,
-//! encrypted packet-envelope helpers, the fixed Geneve header, and source-derived
-//! magicsock packet classification, STUN binding request/response helpers, and
-//! Tailscale address classification and 4-to-6/6-to-4 mapping helpers, plus
-//! bounded DERP frame slice codecs and ClientInfo plaintext JSON encoding. This
-//! crate is not a full Tailscale endpoint runtime.
+//! and NodePrivate NaCl box encryption, Go-oracle-tested plaintext codecs for disco
+//! types 0x01 through 0x09, encrypted packet-envelope helpers, the fixed Geneve
+//! header, and source-derived magicsock packet classification, STUN binding
+//! request/response helpers, and Tailscale address classification and 4-to-6/6-to-4
+//! mapping helpers, plus bounded DERP frame slice codecs and ClientInfo plaintext
+//! JSON encoding. This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
 pub mod disco;

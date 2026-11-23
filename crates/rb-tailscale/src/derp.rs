@@ -1,8 +1,9 @@
 //! DERP slice primitives from the Tailscale fork pinned by sing-box v1.14.4.
 //!
 //! This module provides header codecs, bounded frame slice reads/writes, a
-//! server-greeting parser, and ClientInfo plaintext JSON encoding. It does not
-//! provide a streaming DERP client/server, NaCl box handshake, or authentication.
+//! server-greeting parser, and ClientInfo plaintext JSON encoding. Node-key box
+//! primitives live in `disco_crypto`; a streaming DERP client/server, transport
+//! handshake, and server authentication remain unimplemented.
 
 use std::error::Error;
 use std::fmt;

@@ -1,4 +1,4 @@
-//! Pure-Rust NaCl box-compatible encryption for Tailscale disco messages.
+//! Pure-Rust NaCl box-compatible encryption for Tailscale Disco and node-key DERP messages.
 //!
 //! The pinned Go fork encodes a packet as `nonce || tag || ciphertext`, with
 //! the Poly1305 tag before the XSalsa20 ciphertext. RustCrypto's
@@ -19,7 +19,7 @@ use salsa20::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{DiscoPrivate, DiscoPublic};
+use crate::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
@@ -57,6 +57,36 @@ impl fmt::Display for Error {
 }
 
 impl StdError for Error {}
+
+/// Errors from sealing or opening a NaCl box with a node key.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum NodeBoxError {
+    ZeroPrivateKey,
+    ZeroPeerPublicKey,
+    NonContributoryPeer,
+    Entropy(String),
+    ShortCiphertext { got: usize, want: usize },
+    Authentication,
+    Resource,
+}
+
+impl fmt::Display for NodeBoxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroPrivateKey => f.write_str("cannot use NaCl box with a zero node private key"),
+            Self::ZeroPeerPublicKey => f.write_str("cannot use NaCl box with a zero node public key"),
+            Self::NonContributoryPeer => f.write_str("refusing non-contributory X25519 peer key"),
+            Self::Entropy(error) => write!(f, "OS cryptographic random number generation failed: {error}"),
+            Self::ShortCiphertext { got, want } => {
+                write!(f, "short NaCl box ciphertext: got {got}, want at least {want}")
+            }
+            Self::Authentication => f.write_str("NaCl box authentication failed"),
+            Self::Resource => f.write_str("NaCl box message size or allocation failure"),
+        }
+    }
+}
+
+impl StdError for NodeBoxError {}
 
 /// A precomputed XSalsa20-Poly1305 key for one local and one peer Disco key.
 /// Debug output is redacted; the underlying cipher erases its key on drop.
@@ -145,17 +175,106 @@ impl DiscoShared {
     }
 }
 
+impl NodePrivate {
+    /// Seals to `peer` as `nonce || NaCl box ciphertext`, matching the pinned
+    /// fork's `NodePrivate.SealTo` layout. A fresh OS-CSPRNG nonce is mandatory;
+    /// entropy failure returns an error without fallback.
+    pub fn seal_to(&self, peer: &NodePublic, plaintext: &[u8]) -> Result<Vec<u8>, NodeBoxError> {
+        let mut rng = OsRng;
+        self.seal_to_with_rng(peer, plaintext, &mut rng)
+    }
+
+    /// Opens an authenticated `nonce || box ciphertext` packet from `peer`.
+    /// No plaintext is returned unless Poly1305 authentication succeeds.
+    pub fn open_from(&self, peer: &NodePublic, packet: &[u8]) -> Result<Vec<u8>, NodeBoxError> {
+        let cipher = node_box_cipher(self, peer)?;
+        if packet.len() < NONCE_LEN {
+            return Err(NodeBoxError::ShortCiphertext { got: packet.len(), want: NONCE_LEN });
+        }
+        let nonce = Nonce::from_slice(&packet[..NONCE_LEN]);
+        cipher.decrypt(nonce, &packet[NONCE_LEN..]).map_err(|_| NodeBoxError::Authentication)
+    }
+
+    fn seal_to_with_rng<R>(&self, peer: &NodePublic, plaintext: &[u8], rng: &mut R) -> Result<Vec<u8>, NodeBoxError>
+    where
+        R: TryCryptoRng,
+        R::Error: fmt::Display,
+    {
+        let cipher = node_box_cipher(self, peer)?;
+        let mut nonce = [0u8; NONCE_LEN];
+        if let Err(error) = rng.try_fill_bytes(&mut nonce) {
+            nonce.zeroize();
+            return Err(NodeBoxError::Entropy(error.to_string()));
+        }
+        self.seal_to_with_cipher_and_nonce(&cipher, plaintext, &nonce)
+    }
+
+    #[cfg(test)]
+    fn seal_to_with_nonce(
+        &self,
+        peer: &NodePublic,
+        plaintext: &[u8],
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<Vec<u8>, NodeBoxError> {
+        let cipher = node_box_cipher(self, peer)?;
+        self.seal_to_with_cipher_and_nonce(&cipher, plaintext, nonce)
+    }
+
+    fn seal_to_with_cipher_and_nonce(
+        &self,
+        cipher: &XSalsa20Poly1305,
+        plaintext: &[u8],
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<Vec<u8>, NodeBoxError> {
+        let encrypted_len = plaintext.len().checked_add(TAG_LEN).ok_or(NodeBoxError::Resource)?;
+        let total_len = NONCE_LEN.checked_add(encrypted_len).ok_or(NodeBoxError::Resource)?;
+        let mut packet = Vec::new();
+        packet.try_reserve_exact(total_len).map_err(|_| NodeBoxError::Resource)?;
+        let encrypted = cipher.encrypt(Nonce::from_slice(nonce), plaintext).map_err(|_| NodeBoxError::Resource)?;
+        packet.extend_from_slice(nonce);
+        packet.extend_from_slice(&encrypted);
+        Ok(packet)
+    }
+}
+
+fn node_box_cipher(private: &NodePrivate, peer: &NodePublic) -> Result<XSalsa20Poly1305, NodeBoxError> {
+    if private.is_zero() {
+        return Err(NodeBoxError::ZeroPrivateKey);
+    }
+    if peer.is_zero() {
+        return Err(NodeBoxError::ZeroPeerPublicKey);
+    }
+    let peer_x25519 = X25519PublicKey::from(peer.raw_bytes());
+    let dh = private.0.diffie_hellman(&peer_x25519);
+    if !dh.was_contributory() {
+        return Err(NodeBoxError::NonContributoryPeer);
+    }
+    let mut dh_bytes = dh.to_bytes();
+    let zero_nonce: GenericArray<u8, U16> = GenericArray::default();
+    let hsalsa_key = Zeroizing::new(hsalsa::<U10>(salsa20::Key::from_slice(&dh_bytes), &zero_nonce));
+    dh_bytes.zeroize();
+    Ok(XSalsa20Poly1305::new(crypto_secretbox::Key::from_slice(&hsalsa_key)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
 
     use rand::{TryCryptoRng, TryRngCore};
 
-    use super::{DiscoShared, Error, NONCE_LEN};
-    use crate::{DiscoPrivate, DiscoPublic};
+    use super::{DiscoShared, Error, NodeBoxError, NONCE_LEN};
+    use crate::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
 
     const ALICE_PRIVATE: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
     const BOB_PUBLIC: &str = "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466";
+    const NODE_ALICE_PRIVATE: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const NODE_BOB_PRIVATE: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+    const NODE_ALICE_PUBLIC: &str = "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f";
+    const NODE_BOB_PUBLIC: &str = "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254";
+    const NODE_NONCE: [u8; NONCE_LEN] = [
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51,
+        0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+    ];
     const NONCE: [u8; NONCE_LEN] = [
         0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
         0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21,
@@ -184,6 +303,68 @@ mod tests {
         let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
         assert!(remainder.is_empty());
         pairs.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn node_private_seal_open_match_fixed_go_box_vector() {
+        let alice = NodePrivate::from_text(&format!("privkey:{NODE_ALICE_PRIVATE}")).unwrap();
+        let bob = NodePrivate::from_text(&format!("privkey:{NODE_BOB_PRIVATE}")).unwrap();
+        let alice_public = alice.public().unwrap();
+        let bob_public = bob.public().unwrap();
+        assert_eq!(alice_public.raw_bytes(), decode_hex(NODE_ALICE_PUBLIC));
+        assert_eq!(bob_public.raw_bytes(), decode_hex(NODE_BOB_PUBLIC));
+
+        let plaintext = b"{\"version\":2,\"CanAckPings\":false}";
+        let go_wire = decode_wire(
+            "404142434445464748494a4b4c4d4e4f50515253545556574967ed374b28c33fc5736ccb6d0bd713c51736ebbff954bbcd71a150815a3b3a0d6425f015948ec55275cfd6eb33e08ea0",
+        );
+        assert_eq!(alice.seal_to_with_nonce(&bob_public, plaintext, &NODE_NONCE).unwrap(), go_wire,);
+        assert_eq!(bob.open_from(&alice_public, &go_wire).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn node_private_box_rejects_invalid_keys_short_packets_and_tampering() {
+        let alice = NodePrivate::from_text(&format!("privkey:{NODE_ALICE_PRIVATE}")).unwrap();
+        let bob = NodePrivate::from_text(&format!("privkey:{NODE_BOB_PRIVATE}")).unwrap();
+        let alice_public = alice.public().unwrap();
+        let bob_public = bob.public().unwrap();
+
+        assert_eq!(bob.open_from(&alice_public, &[]), Err(NodeBoxError::ShortCiphertext { got: 0, want: NONCE_LEN }));
+        let mut packet = alice.seal_to_with_nonce(&bob_public, b"authenticated", &NODE_NONCE).unwrap();
+        for index in [0, NONCE_LEN, NONCE_LEN + 16] {
+            let mut tampered = packet.clone();
+            tampered[index] ^= 1;
+            assert_eq!(bob.open_from(&alice_public, &tampered), Err(NodeBoxError::Authentication), "byte {index}");
+        }
+        packet.truncate(NONCE_LEN + 15);
+        assert_eq!(bob.open_from(&alice_public, &packet), Err(NodeBoxError::Authentication));
+
+        let zero_private = NodePrivate::from_text(&format!("privkey:{}", "00".repeat(32))).unwrap();
+        assert_eq!(zero_private.seal_to(&bob_public, b"x"), Err(NodeBoxError::ZeroPrivateKey));
+        assert_eq!(zero_private.open_from(&bob_public, &[]), Err(NodeBoxError::ZeroPrivateKey));
+        assert_eq!(alice.seal_to(&NodePublic::from_raw32([0; 32]), b"x"), Err(NodeBoxError::ZeroPeerPublicKey));
+        let low_order = NodePublic::from_raw32([
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        assert_eq!(alice.seal_to(&low_order, b"x"), Err(NodeBoxError::NonContributoryPeer));
+    }
+
+    #[test]
+    fn node_private_box_uses_fresh_os_nonce_and_fails_closed_on_entropy_error() {
+        let alice = NodePrivate::from_text(&format!("privkey:{NODE_ALICE_PRIVATE}")).unwrap();
+        let bob = NodePrivate::from_text(&format!("privkey:{NODE_BOB_PRIVATE}")).unwrap();
+        let bob_public = bob.public().unwrap();
+        let first = alice.seal_to(&bob_public, b"fresh nonce").unwrap();
+        let second = alice.seal_to(&bob_public, b"fresh nonce").unwrap();
+        assert_eq!(bob.open_from(&alice.public().unwrap(), &first).unwrap(), b"fresh nonce");
+        assert_eq!(bob.open_from(&alice.public().unwrap(), &second).unwrap(), b"fresh nonce");
+        assert_ne!(&first[..NONCE_LEN], &second[..NONCE_LEN]);
+
+        let mut failed_rng = FailingRng;
+        assert_eq!(
+            alice.seal_to_with_rng(&bob_public, b"no fallback", &mut failed_rng).unwrap_err(),
+            NodeBoxError::Entropy("test entropy unavailable".to_owned()),
+        );
     }
 
     #[test]
