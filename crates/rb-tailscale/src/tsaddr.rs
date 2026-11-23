@@ -112,6 +112,34 @@ pub fn prefix_is6(prefix: IpPrefix) -> bool {
     prefix.is_ipv6()
 }
 
+/// Sorts in place by address bit length, prefix length, then address, as in
+/// the pinned fork's `netipx.ComparePrefix`. Invalid prefixes retain their
+/// address for ordering; the invalid zero value sorts before either family.
+pub fn sort_prefixes(prefixes: &mut [IpPrefix]) {
+    fn address_bits(prefix: IpPrefix) -> u8 {
+        match prefix.address() {
+            None => 0,
+            Some(IpAddr::V4(_)) => 32,
+            Some(IpAddr::V6(_)) => 128,
+        }
+    }
+    prefixes.sort_unstable_by(|a, b| {
+        address_bits(*a)
+            .cmp(&address_bits(*b))
+            .then_with(|| a.prefix_len().cmp(&b.prefix_len()))
+            .then_with(|| a.address().cmp(&b.address()))
+    });
+}
+
+/// Returns an independent copy of the prefixes accepted by `predicate`, in
+/// input order. Rust's empty `Vec` does not distinguish Go's nil result.
+pub fn filter_prefixes_copy<F>(prefixes: &[IpPrefix], mut predicate: F) -> Vec<IpPrefix>
+where
+    F: FnMut(IpPrefix) -> bool,
+{
+    prefixes.iter().copied().filter(|prefix| predicate(*prefix)).collect()
+}
+
 /// Returns the canonical IPv4 default route `0.0.0.0/0`.
 pub fn all_ipv4() -> IpPrefix {
     IpPrefix::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
@@ -542,6 +570,63 @@ mod tests {
                 "PrefixesContainsIP for {address}"
             );
         }
+    }
+
+    #[test]
+    fn sort_prefixes_matches_pinned_go_oracle() {
+        let invalid_v4_1 = IpPrefix::new(ip("192.0.2.1"), -1);
+        let invalid_v4_2 = IpPrefix::new(ip("192.0.2.2"), 33);
+        let invalid_v6 = IpPrefix::new(ip("fd00::3"), 129);
+        let mut prefixes = [
+            prefix("fd00::2/64"),
+            prefix("10.1.0.1/24"),
+            prefix("::ffff:192.0.2.1/120"),
+            invalid_v4_2,
+            prefix("10.0.0.2/24"),
+            IpPrefix::invalid(),
+            prefix("2001:db8::1/0"),
+            prefix("10.0.0.1/24"),
+            prefix("192.0.2.1/0"),
+            invalid_v6,
+            prefix("fd00::1/64"),
+            invalid_v4_1,
+            prefix("10.0.0.1/24"),
+        ];
+        super::sort_prefixes(&mut prefixes);
+        assert_eq!(
+            prefixes,
+            [
+                IpPrefix::invalid(),
+                invalid_v4_1,
+                invalid_v4_2,
+                prefix("192.0.2.1/0"),
+                prefix("10.0.0.1/24"),
+                prefix("10.0.0.1/24"),
+                prefix("10.0.0.2/24"),
+                prefix("10.1.0.1/24"),
+                invalid_v6,
+                prefix("2001:db8::1/0"),
+                prefix("fd00::1/64"),
+                prefix("fd00::2/64"),
+                prefix("::ffff:192.0.2.1/120"),
+            ]
+        );
+        super::sort_prefixes(&mut []);
+    }
+
+    #[test]
+    fn filter_prefixes_copy_matches_pinned_go_oracle() {
+        let mut input = [prefix("10.0.0.1/24"), IpPrefix::invalid(), prefix("fd00::1/64"), prefix("10.0.0.2/24")];
+        let mut visited = Vec::new();
+        let filtered = super::filter_prefixes_copy(&input, |p| {
+            visited.push(p);
+            super::prefix_is4(p)
+        });
+        assert_eq!(visited, input);
+        input[0] = prefix("192.0.2.1/32");
+        assert_eq!(filtered, [prefix("10.0.0.1/24"), prefix("10.0.0.2/24")]);
+        assert!(super::filter_prefixes_copy(&input, |_| false).is_empty());
+        assert!(super::filter_prefixes_copy(&[], |_| true).is_empty());
     }
 
     #[test]
