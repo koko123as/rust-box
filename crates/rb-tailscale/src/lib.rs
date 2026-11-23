@@ -21,15 +21,16 @@
 //! close the transport, and callers must synchronize its state with their lifecycle.
 //! A separate `derphttp` slice implements the lower-level SendPing/SendPong state
 //! gates, a high-level Ping wait capped at five seconds with an explicit cancellation
-//! token, and matching Pong dispatch from an existing receive session; connection
-//! setup, generation tracking, reconnect handling, and Go scheduler parity are not
-//! implemented.
+//! token, matching Pong dispatch from an existing receive session, and a narrow
+//! post-connect slot for connection generations and stale-client reconnect invalidation;
+//! socket setup, reconnect retry handling, and Go scheduler parity are not implemented.
 //! Targeted tests cover individual protocol slices; they do not constitute full
 //! endpoint compatibility or Go scheduler parity. The shared writer's ForwardPacket
 //! path now requires a connection-close handle and arms the pinned five-second
-//! watchdog; the stateless codec does not. Transport close/reconnect,
-//! the rest of the `derphttp` lifecycle, and the complete Tailscale endpoint runtime
-//! remain unimplemented. This crate is not a full Tailscale endpoint runtime.
+//! watchdog; the stateless codec does not. The slot supplies only an identity-guarded
+//! invalidation primitive; the full transport close/reconnect lifecycle, the rest of
+//! `derphttp.Client`, and the complete Tailscale endpoint runtime remain unimplemented.
+//! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
 pub mod derphttp;

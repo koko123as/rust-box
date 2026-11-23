@@ -4,8 +4,9 @@
 //! dispatches registered Pong responses, and filters only matching Pong messages
 //! from an already-created DERP receive session. Its bounded Ping helper models a
 //! five-second maximum deadline and an explicit cancellation token, but not Go
-//! scheduler select parity. It does not connect or reconnect, assign connection
-//! generations, close transports, or implement the complete `derphttp.Client` lifecycle.
+//! scheduler select parity. A narrow post-connect slot assigns generations and guards
+//! reconnect invalidation by client identity; it does not establish sockets or own the
+//! complete `derphttp.Client` lifecycle.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -18,7 +19,8 @@ use rand::rand_core::OsRng;
 use rand::TryRngCore;
 
 use crate::derp::{
-    DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError, StreamWriteFrameError,
+    DerpClientRecvSession, DerpConnectionCloser, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError,
+    StreamWriteFrameError,
 };
 
 /// Maximum wait in the pinned fork's high-level `derphttp.Client.Ping` operation.
@@ -201,6 +203,135 @@ impl<W: Write> DerphttpSendGate<W> {
 
 /// Compatibility alias for the previously introduced SendPong-only gate.
 pub type DerpPongSendGate<W> = DerphttpSendGate<W>;
+
+/// Errors while publishing a completed DERP connection into the client slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerphttpConnectionRegistryError {
+    AlreadyConnected,
+    GenerationOverflow,
+}
+
+impl fmt::Display for DerphttpConnectionRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyConnected => f.write_str("derphttp.Client already has a connection"),
+            Self::GenerationOverflow => f.write_str("derphttp.Client connection generation overflow"),
+        }
+    }
+}
+
+impl Error for DerphttpConnectionRegistryError {}
+
+/// A snapshot of the current DERP client and its successful-connection generation.
+#[derive(Debug)]
+pub struct DerphttpConnectionSnapshot<C> {
+    client: Arc<C>,
+    generation: usize,
+}
+
+impl<C> DerphttpConnectionSnapshot<C> {
+    pub fn client(&self) -> &Arc<C> {
+        &self.client
+    }
+
+    pub fn generation(&self) -> usize {
+        self.generation
+    }
+}
+
+struct DerphttpConnectionRegistryState<C> {
+    generation: usize,
+    client: Option<Arc<C>>,
+    close_connection: Option<DerpConnectionCloser>,
+}
+
+impl<C> Default for DerphttpConnectionRegistryState<C> {
+    fn default() -> Self {
+        Self { generation: 0, client: None, close_connection: None }
+    }
+}
+
+/// Tracks published DERP client identity and `RecvDetail` connection generations.
+///
+/// The caller performs DNS/TCP/TLS/HTTP and DERP setup before publishing a connection.
+/// This slot only models successful generation assignment and `closeForReconnect`'s
+/// current-client identity guard; it is not a dialer or a complete client lifecycle.
+pub struct DerphttpConnectionRegistry<C> {
+    state: Mutex<DerphttpConnectionRegistryState<C>>,
+}
+
+impl<C> Default for DerphttpConnectionRegistry<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> DerphttpConnectionRegistry<C> {
+    pub fn new() -> Self {
+        Self { state: Mutex::new(DerphttpConnectionRegistryState::default()) }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, DerphttpConnectionRegistryState<C>> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Publishes a fully established client and assigns its next nonzero generation.
+    ///
+    /// If this slot is occupied or the counter is exhausted, the rejected candidate's
+    /// connection closer is invoked so a caller cannot accidentally leak its transport.
+    pub fn publish_connection(
+        &self,
+        client: Arc<C>,
+        close_connection: DerpConnectionCloser,
+    ) -> Result<DerphttpConnectionSnapshot<C>, DerphttpConnectionRegistryError> {
+        let mut state = self.lock_state();
+        if state.client.is_some() {
+            drop(state);
+            close_connection();
+            return Err(DerphttpConnectionRegistryError::AlreadyConnected);
+        }
+        let Some(generation) = state.generation.checked_add(1) else {
+            drop(state);
+            close_connection();
+            return Err(DerphttpConnectionRegistryError::GenerationOverflow);
+        };
+        state.generation = generation;
+        state.client = Some(Arc::clone(&client));
+        state.close_connection = Some(close_connection);
+        Ok(DerphttpConnectionSnapshot { client, generation })
+    }
+
+    /// Returns the current client snapshot, if a connection is published.
+    pub fn current(&self) -> Option<DerphttpConnectionSnapshot<C>> {
+        let state = self.lock_state();
+        state
+            .client
+            .as_ref()
+            .map(|client| DerphttpConnectionSnapshot { client: Arc::clone(client), generation: state.generation })
+    }
+
+    /// Closes and forgets the current connection only if `broken_client` is still current.
+    ///
+    /// This identity check prevents a late error from an older receive/send task from
+    /// tearing down a newer connection. The generation counter is retained for the next
+    /// successful publication. The stored close callback runs while the slot is locked
+    /// and must not re-enter this registry.
+    pub fn close_for_reconnect(&self, broken_client: &Arc<C>) -> bool {
+        let mut state = self.lock_state();
+        let Some(current) = state.client.as_ref() else {
+            return false;
+        };
+        if !Arc::ptr_eq(current, broken_client) {
+            return false;
+        }
+        if let Some(close_connection) = state.close_connection.as_ref() {
+            close_connection();
+        }
+        state.close_connection = None;
+        state.client = None;
+        true
+    }
+}
 
 /// Computes the high-level Ping deadline: the earlier of the caller deadline and
 /// the pinned fork's fixed five-second maximum.
@@ -540,8 +671,9 @@ mod tests {
     use crate::{NodePrivate, NodePublic};
 
     use super::{
-        ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry, DerphttpPingClient,
-        DerphttpPongFilter, DerphttpSendGate, DERP_PING_MAX_WAIT,
+        ping_deadline, DerpClientState, DerpPingCancellationToken, DerpPongResponseRegistry,
+        DerphttpConnectionRegistry, DerphttpConnectionRegistryError, DerphttpPingClient, DerphttpPongFilter,
+        DerphttpSendGate, DERP_PING_MAX_WAIT,
     };
 
     struct MemoryReader(Cursor<Vec<u8>>);
@@ -574,6 +706,74 @@ mod tests {
             Arc::new(DerpSendWriter::new(Vec::new(), None)),
         );
         DerphttpPongFilter::new(receiver)
+    }
+
+    #[test]
+    fn connection_registry_advances_generation_and_ignores_stale_client_errors() {
+        let registry = DerphttpConnectionRegistry::<u8>::new();
+        let first_client = Arc::new(1);
+        let first_closes = Arc::new(Mutex::new(0));
+        let first_close_count = Arc::clone(&first_closes);
+        let first = registry
+            .publish_connection(Arc::clone(&first_client), Arc::new(move || *first_close_count.lock().unwrap() += 1))
+            .unwrap();
+        assert_eq!(first.generation(), 1);
+        assert!(Arc::ptr_eq(first.client(), &first_client));
+        assert!(registry.current().is_some());
+
+        assert!(!registry.close_for_reconnect(&Arc::new(99)));
+        assert_eq!(*first_closes.lock().unwrap(), 0);
+        assert!(registry.close_for_reconnect(&first_client));
+        assert_eq!(*first_closes.lock().unwrap(), 1);
+        assert!(registry.current().is_none());
+
+        let second_client = Arc::new(2);
+        let second_closes = Arc::new(Mutex::new(0));
+        let second_close_count = Arc::clone(&second_closes);
+        let second = registry
+            .publish_connection(Arc::clone(&second_client), Arc::new(move || *second_close_count.lock().unwrap() += 1))
+            .unwrap();
+        assert_eq!(second.generation(), 2);
+        assert!(!registry.close_for_reconnect(&first_client));
+        assert_eq!(*second_closes.lock().unwrap(), 0);
+        let current = registry.current().unwrap();
+        assert_eq!(current.generation(), 2);
+        assert!(Arc::ptr_eq(current.client(), &second_client));
+        assert!(registry.close_for_reconnect(&second_client));
+        assert_eq!(*second_closes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn connection_registry_closes_candidate_rejected_while_occupied() {
+        let registry = DerphttpConnectionRegistry::<u8>::new();
+        let current_client = Arc::new(1);
+        registry.publish_connection(Arc::clone(&current_client), Arc::new(|| {})).unwrap();
+        let rejected_closes = Arc::new(Mutex::new(0));
+        let rejected_close_count = Arc::clone(&rejected_closes);
+
+        let error = registry
+            .publish_connection(Arc::new(2), Arc::new(move || *rejected_close_count.lock().unwrap() += 1))
+            .unwrap_err();
+        assert_eq!(error, DerphttpConnectionRegistryError::AlreadyConnected);
+        assert_eq!(*rejected_closes.lock().unwrap(), 1);
+        let current = registry.current().unwrap();
+        assert_eq!(current.generation(), 1);
+        assert!(Arc::ptr_eq(current.client(), &current_client));
+    }
+
+    #[test]
+    fn connection_registry_fails_closed_when_generation_is_exhausted() {
+        let registry = DerphttpConnectionRegistry::<u8>::new();
+        registry.lock_state().generation = usize::MAX;
+        let candidate_closes = Arc::new(Mutex::new(0));
+        let candidate_close_count = Arc::clone(&candidate_closes);
+
+        let error = registry
+            .publish_connection(Arc::new(3), Arc::new(move || *candidate_close_count.lock().unwrap() += 1))
+            .unwrap_err();
+        assert_eq!(error, DerphttpConnectionRegistryError::GenerationOverflow);
+        assert_eq!(*candidate_closes.lock().unwrap(), 1);
+        assert!(registry.current().is_none());
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
