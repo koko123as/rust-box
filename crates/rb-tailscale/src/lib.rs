@@ -7,8 +7,10 @@
 //! request/response helpers, and Tailscale address classification and 4-to-6/6-to-4
 //! mapping helpers, plus bounded DERP slice and blocking-stream frame codecs, a
 //! staged client key-exchange state machine with stream greeting/ClientInfo
-//! support, and bounded in-memory ServerInfo frame/payload parsing with message
-//! and send-rate configuration mapping.
+//! support, ServerInfo parsing and send-rate configuration mapping, and bounded
+//! blocking-stream routing for the pinned fork's recognized received-message
+//! frame types. Deadline/error-latch lifecycle, Ping response, limiter execution,
+//! and complete Tailscale endpoint runtime are not yet implemented.
 //! This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;

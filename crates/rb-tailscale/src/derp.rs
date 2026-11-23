@@ -3,14 +3,17 @@
 //! This module provides header codecs, bounded frame slice and blocking-stream
 //! reads/writes, a server-greeting parser, ClientInfo JSON encoding and in-memory
 //! encrypted frame construction, a client key-exchange state machine with a
-//! blocking-stream greeting and ClientInfo write path, and bounded in-memory
-//! ServerInfo frame/payload parsing. Node-key box primitives live in
-//! `disco_crypto`; ongoing DERP message processing, complete connection lifecycle,
-//! and server authentication remain unimplemented.
+//! blocking-stream greeting and ClientInfo write path, ServerInfo parsing, and
+//! bounded blocking-stream routing for pinned-fork received-message frames.
+//! Node-key box primitives live in `disco_crypto`; deadline/error-latch lifecycle,
+//! Ping responses, limiter execution, and server authentication remain
+//! unimplemented.
 
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -31,6 +34,22 @@ pub const FRAME_SERVER_KEY: FrameType = FrameType(0x01);
 pub const FRAME_CLIENT_INFO: FrameType = FrameType(0x02);
 /// The server-info frame type.
 pub const FRAME_SERVER_INFO: FrameType = FrameType(0x03);
+/// The received-packet frame type.
+pub const FRAME_RECV_PACKET: FrameType = FrameType(0x05);
+/// The keep-alive frame type.
+pub const FRAME_KEEP_ALIVE: FrameType = FrameType(0x06);
+/// The peer-gone frame type.
+pub const FRAME_PEER_GONE: FrameType = FrameType(0x08);
+/// The peer-present frame type.
+pub const FRAME_PEER_PRESENT: FrameType = FrameType(0x09);
+/// The ping frame type.
+pub const FRAME_PING: FrameType = FrameType(0x12);
+/// The pong frame type.
+pub const FRAME_PONG: FrameType = FrameType(0x13);
+/// The health frame type.
+pub const FRAME_HEALTH: FrameType = FrameType(0x14);
+/// The server-restarting frame type.
+pub const FRAME_RESTARTING: FrameType = FrameType(0x15);
 /// DERP protocol version advertised by the pinned fork.
 pub const PROTOCOL_VERSION: isize = 2;
 
@@ -836,6 +855,59 @@ impl ServerInfoMessage {
     }
 }
 
+/// A DERP PeerGone message returned by the pinned fork's `Client.Recv`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerGoneMessage {
+    pub peer: NodePublic,
+    /// The first optional reason byte; absent wire values map to zero.
+    pub reason: u8,
+}
+
+/// A DERP PeerPresent message returned by the pinned fork's `Client.Recv`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerPresentMessage {
+    pub key: NodePublic,
+    /// `None` represents Go's invalid zero-value `netip.AddrPort` when omitted.
+    pub ip_port: Option<SocketAddr>,
+    /// The optional first flags byte; absent wire values map to zero.
+    pub flags: u8,
+}
+
+/// An incoming packet from a DERP peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceivedPacket {
+    pub source: NodePublic,
+    pub data: Vec<u8>,
+}
+
+/// The raw Health frame body. Bytes are preserved, including invalid UTF-8 that
+/// the Go implementation can retain in its string value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthMessage {
+    pub problem: Vec<u8>,
+}
+
+/// Advisory reconnect timing announced by a DERP server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServerRestartingMessage {
+    pub reconnect_in: Duration,
+    pub try_for: Duration,
+}
+
+/// One message type routed by the pinned fork's `Client.Recv`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReceivedMessage {
+    ServerInfo(ServerInfoMessage),
+    KeepAlive,
+    PeerGone(PeerGoneMessage),
+    PeerPresent(PeerPresentMessage),
+    ReceivedPacket(ReceivedPacket),
+    Ping([u8; 8]),
+    Pong([u8; 8]),
+    Health(HealthMessage),
+    ServerRestarting(ServerRestartingMessage),
+}
+
 impl<'de> Deserialize<'de> for ServerInfo {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1010,6 +1082,35 @@ impl Error for StreamServerInfoError {
     }
 }
 
+/// Errors while reading and routing a DERP `Client.Recv` message.
+#[derive(Debug)]
+pub enum RecvMessageError {
+    Read(StreamReadFrameError),
+    Oversized { frame_len: u32 },
+    ServerInfo(ServerInfoError),
+}
+
+impl fmt::Display for RecvMessageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => write!(f, "derp.Recv: {error}"),
+            Self::Oversized { frame_len } => {
+                write!(f, "derp.Recv: unexpectedly large frame of {frame_len} bytes returned")
+            }
+            Self::ServerInfo(error) => write!(f, "derp.Recv: invalid server info frame: {error}"),
+        }
+    }
+}
+
+impl Error for RecvMessageError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::ServerInfo(_) | Self::Oversized { .. } => None,
+        }
+    }
+}
+
 /// Parses one complete ServerInfo frame from an in-memory byte slice.
 ///
 /// The returned `usize` is the number of bytes consumed, so a following frame
@@ -1081,6 +1182,98 @@ pub fn read_server_info_message_from<R: Read>(
     let info =
         parse_server_info_payload(client_private, server_public, &payload).map_err(StreamServerInfoError::Payload)?;
     Ok(info.into_message())
+}
+
+/// Reads and routes the next message recognized by the pinned fork's
+/// `Client.Recv`, skipping unknown frame types and malformed short fixed-size
+/// messages as that implementation does.
+///
+/// This generic `Read` helper does not set a 120-second deadline, latch errors
+/// permanently, update a send limiter, or answer Ping frames. Callers must
+/// provide those connection-lifecycle behaviors separately before treating
+/// this as a full DERP client.
+pub fn read_received_message_from<R: Read>(
+    reader: &mut R,
+    client_private: &NodePrivate,
+    server_public: &NodePublic,
+) -> Result<ReceivedMessage, RecvMessageError> {
+    loop {
+        let (header, payload) = match read_frame_vec_from(reader, MAX_CLIENT_RECV_FRAME_LEN as u32) {
+            Ok(frame) => frame,
+            Err(StreamReadFrameError::ExceedsLimit { frame_len, .. }) => {
+                return Err(RecvMessageError::Oversized { frame_len });
+            }
+            Err(error) => return Err(RecvMessageError::Read(error)),
+        };
+
+        let message = match header.frame_type {
+            FRAME_SERVER_INFO => {
+                let info = parse_server_info_payload(client_private, server_public, &payload)
+                    .map_err(RecvMessageError::ServerInfo)?;
+                Some(ReceivedMessage::ServerInfo(info.into_message()))
+            }
+            FRAME_KEEP_ALIVE => Some(ReceivedMessage::KeepAlive),
+            FRAME_PEER_GONE if payload.len() >= 32 => {
+                let mut raw_key = [0; 32];
+                raw_key.copy_from_slice(&payload[..32]);
+                Some(ReceivedMessage::PeerGone(PeerGoneMessage {
+                    peer: NodePublic::from_raw32(raw_key),
+                    reason: payload.get(32).copied().unwrap_or(0),
+                }))
+            }
+            FRAME_PEER_PRESENT if payload.len() >= 32 => {
+                let mut raw_key = [0; 32];
+                raw_key.copy_from_slice(&payload[..32]);
+                let ip_port = if payload.len() >= 50 {
+                    let mut raw_ip = [0; 16];
+                    raw_ip.copy_from_slice(&payload[32..48]);
+                    let ipv6 = Ipv6Addr::from(raw_ip);
+                    let ip = ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4);
+                    let port = u16::from_be_bytes([payload[48], payload[49]]);
+                    Some(SocketAddr::new(ip, port))
+                } else {
+                    None
+                };
+                let flags = payload.get(50).copied().unwrap_or(0);
+                Some(ReceivedMessage::PeerPresent(PeerPresentMessage {
+                    key: NodePublic::from_raw32(raw_key),
+                    ip_port,
+                    flags,
+                }))
+            }
+            FRAME_RECV_PACKET if payload.len() >= 32 => {
+                let mut raw_key = [0; 32];
+                raw_key.copy_from_slice(&payload[..32]);
+                Some(ReceivedMessage::ReceivedPacket(ReceivedPacket {
+                    source: NodePublic::from_raw32(raw_key),
+                    data: payload[32..].to_vec(),
+                }))
+            }
+            FRAME_PING if payload.len() >= 8 => {
+                let mut ping = [0; 8];
+                ping.copy_from_slice(&payload[..8]);
+                Some(ReceivedMessage::Ping(ping))
+            }
+            FRAME_PONG if payload.len() >= 8 => {
+                let mut pong = [0; 8];
+                pong.copy_from_slice(&payload[..8]);
+                Some(ReceivedMessage::Pong(pong))
+            }
+            FRAME_HEALTH => Some(ReceivedMessage::Health(HealthMessage { problem: payload })),
+            FRAME_RESTARTING if payload.len() >= 8 => {
+                let reconnect_in = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let try_for = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                Some(ReceivedMessage::ServerRestarting(ServerRestartingMessage {
+                    reconnect_in: Duration::from_millis(u64::from(reconnect_in)),
+                    try_for: Duration::from_millis(u64::from(try_for)),
+                }))
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Ok(message);
+        }
+    }
 }
 
 fn push_json_field_name(output: &mut String, first: &mut bool, name: &str) {
@@ -1903,6 +2096,179 @@ mod tests {
             super::read_server_info_message_from(&mut wrong_type, &alice, &bob_public),
             Err(super::StreamServerInfoError::UnexpectedType { got: FrameType(0x12) })
         ));
+    }
+
+    #[test]
+    fn received_message_routing_matches_pinned_go_client_recv_oracle() {
+        let alice =
+            NodePrivate::from_text("privkey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
+        let bob =
+            NodePrivate::from_text("privkey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        let bob_public = bob.public().unwrap();
+        let peer_gone = [0x11; 32];
+        let peer_present = [0x22; 32];
+        let packet_source = [0x33; 32];
+
+        let mut peer_gone_with_reason = peer_gone.to_vec();
+        peer_gone_with_reason.extend_from_slice(&[0x7a, 0x99]);
+        let mut peer_present_short_ip = peer_present.to_vec();
+        peer_present_short_ip.extend_from_slice(&[0xaa; 17]);
+        let mut peer_present_mapped = peer_present.to_vec();
+        peer_present_mapped.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1]);
+        peer_present_mapped.extend_from_slice(&[0x1f, 0x90, 0x0d, 0xee]);
+        let mut packet = packet_source.to_vec();
+        packet.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut restarting = [0; 10];
+        restarting[..4].copy_from_slice(&123u32.to_be_bytes());
+        restarting[4..8].copy_from_slice(&456u32.to_be_bytes());
+        restarting[8..].copy_from_slice(&[0xaa, 0xbb]);
+
+        let info_payload = decode_hex("808182838485868788898a8b8c8d8e8f90919293949596972a5043cecfb67d977e3a71109462311a38a15b673d7b2bf55da90ef8f0d0c5313f73665a84fefee88e79c04d9f28b8eedadcd657528c5f0c7a08671cf92cd641f0e77fae5c0817566ac2b69be71d61523ec54dd49e137aaa9e0e19cb487e0f7557d9");
+        let cases = [
+            ("keepalive-extra", super::FRAME_KEEP_ALIVE, vec![1, 2], super::ReceivedMessage::KeepAlive),
+            (
+                "peergone-default",
+                super::FRAME_PEER_GONE,
+                peer_gone.to_vec(),
+                super::ReceivedMessage::PeerGone(super::PeerGoneMessage {
+                    peer: NodePublic::from_raw32(peer_gone),
+                    reason: 0,
+                }),
+            ),
+            (
+                "peergone-reason",
+                super::FRAME_PEER_GONE,
+                peer_gone_with_reason,
+                super::ReceivedMessage::PeerGone(super::PeerGoneMessage {
+                    peer: NodePublic::from_raw32(peer_gone),
+                    reason: 0x7a,
+                }),
+            ),
+            (
+                "peerpresent-empty",
+                super::FRAME_PEER_PRESENT,
+                peer_present.to_vec(),
+                super::ReceivedMessage::PeerPresent(super::PeerPresentMessage {
+                    key: NodePublic::from_raw32(peer_present),
+                    ip_port: None,
+                    flags: 0,
+                }),
+            ),
+            (
+                "peerpresent-short-ip",
+                super::FRAME_PEER_PRESENT,
+                peer_present_short_ip,
+                super::ReceivedMessage::PeerPresent(super::PeerPresentMessage {
+                    key: NodePublic::from_raw32(peer_present),
+                    ip_port: None,
+                    flags: 0,
+                }),
+            ),
+            (
+                "peerpresent-mapped",
+                super::FRAME_PEER_PRESENT,
+                peer_present_mapped,
+                super::ReceivedMessage::PeerPresent(super::PeerPresentMessage {
+                    key: NodePublic::from_raw32(peer_present),
+                    ip_port: Some("192.0.2.1:8080".parse().unwrap()),
+                    flags: 0x0d,
+                }),
+            ),
+            (
+                "recv-packet",
+                super::FRAME_RECV_PACKET,
+                packet,
+                super::ReceivedMessage::ReceivedPacket(super::ReceivedPacket {
+                    source: NodePublic::from_raw32(packet_source),
+                    data: vec![0xde, 0xad, 0xbe, 0xef],
+                }),
+            ),
+            (
+                "ping-extra",
+                super::FRAME_PING,
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                super::ReceivedMessage::Ping([0, 1, 2, 3, 4, 5, 6, 7]),
+            ),
+            (
+                "pong",
+                super::FRAME_PONG,
+                vec![8, 7, 6, 5, 4, 3, 2, 1],
+                super::ReceivedMessage::Pong([8, 7, 6, 5, 4, 3, 2, 1]),
+            ),
+            (
+                "health-invalid-utf8",
+                super::FRAME_HEALTH,
+                vec![b'h', b'i', 0xff],
+                super::ReceivedMessage::Health(super::HealthMessage { problem: vec![b'h', b'i', 0xff] }),
+            ),
+            (
+                "restarting-extra",
+                super::FRAME_RESTARTING,
+                restarting.to_vec(),
+                super::ReceivedMessage::ServerRestarting(super::ServerRestartingMessage {
+                    reconnect_in: std::time::Duration::from_millis(123),
+                    try_for: std::time::Duration::from_millis(456),
+                }),
+            ),
+            (
+                "serverinfo",
+                super::FRAME_SERVER_INFO,
+                info_payload,
+                super::ReceivedMessage::ServerInfo(super::ServerInfoMessage {
+                    token_bucket_bytes_per_second: 16_777_216,
+                    token_bucket_bytes_burst: 4_194_304,
+                }),
+            ),
+        ];
+
+        for (name, frame_type, payload, expected) in cases {
+            let mut wire = Vec::new();
+            write_frame(&mut wire, frame_type, &payload).unwrap();
+            let mut reader = ChunkedReader::new(wire, 3);
+            assert_eq!(
+                super::read_received_message_from(&mut reader, &alice, &bob_public).unwrap(),
+                expected,
+                "{name}"
+            );
+            assert!(reader.remaining().is_empty(), "{name}");
+        }
+
+        let mut skipped = Vec::new();
+        for (frame_type, payload) in [
+            (super::FRAME_PEER_GONE, vec![0; 31]),
+            (super::FRAME_PEER_PRESENT, vec![0; 31]),
+            (super::FRAME_RECV_PACKET, vec![0; 31]),
+            (super::FRAME_PING, vec![0; 7]),
+            (super::FRAME_PONG, vec![0; 7]),
+            (super::FRAME_RESTARTING, vec![0; 7]),
+            (FrameType(0x7f), Vec::new()),
+            (super::FRAME_KEEP_ALIVE, vec![1, 2]),
+        ] {
+            write_frame(&mut skipped, frame_type, &payload).unwrap();
+        }
+        let mut skipped = ChunkedReader::new(skipped, 2);
+        assert_eq!(
+            super::read_received_message_from(&mut skipped, &alice, &bob_public).unwrap(),
+            super::ReceivedMessage::KeepAlive
+        );
+        assert!(skipped.remaining().is_empty());
+
+        let too_large_header = FrameHeader {
+            frame_type: super::FRAME_KEEP_ALIVE,
+            frame_len: (super::MAX_CLIENT_RECV_FRAME_LEN + 1) as u32,
+        }
+        .encode();
+        let mut too_large_wire = too_large_header.to_vec();
+        too_large_wire.push(0xee);
+        let mut too_large = ChunkedReader::new(too_large_wire, 2);
+        let error = super::read_received_message_from(&mut too_large, &alice, &bob_public).unwrap_err();
+        assert_eq!(error.to_string(), "derp.Recv: unexpectedly large frame of 1048577 bytes returned");
+        assert!(matches!(error, super::RecvMessageError::Oversized { frame_len: 1_048_577 }));
+        assert_eq!(too_large.remaining(), &[0xee]);
+
+        let server_info_error =
+            super::RecvMessageError::ServerInfo(super::ServerInfoError::Box(NodeBoxError::Authentication));
+        assert!(std::error::Error::source(&server_info_error).is_none());
     }
 
     #[test]
