@@ -16,12 +16,15 @@
 //! magicsock receive-loop slice consumes DERP Ping messages, schedules best-effort
 //! Pong writes through an injected asynchronous task spawner (using detached Rust
 //! threads by default), reports failures through a caller-provided logger, and
-//! continues receiving. Targeted tests cover individual protocol slices; they do
-//! not constitute full endpoint compatibility or Go scheduler parity. The shared
-//! writer's ForwardPacket path now requires a connection-close handle and arms the
-//! pinned five-second watchdog; the stateless codec does not. `derphttp` closed-state
-//! behavior and the complete Tailscale endpoint runtime remain unimplemented.
-//! This crate is not a full Tailscale endpoint runtime.
+//! continues receiving. Its narrow SendPong gate models caller-supplied connected,
+//! disconnected, and closed states without implicit reconnect; it does not own or
+//! close the transport, and callers must synchronize its state with their lifecycle.
+//! Targeted tests cover individual protocol slices; they do not constitute full
+//! endpoint compatibility or Go scheduler parity. The shared writer's ForwardPacket
+//! path now requires a connection-close handle and arms the pinned five-second
+//! watchdog; the stateless codec does not. Transport close/cancellation/reconnect,
+//! the rest of the `derphttp` lifecycle, and the complete Tailscale endpoint runtime
+//! remain unimplemented. This crate is not a full Tailscale endpoint runtime.
 
 pub mod derp;
 pub mod disco;

@@ -2,18 +2,24 @@
 //!
 //! The low-level DERP receiver continues to return Ping messages unchanged. This
 //! wrapper models the higher-level magicsock branch: asynchronously schedule
-//! `SendPong`, report write errors through the caller's logging hook, and continue
-//! receiving without returning Ping to the caller. A task-spawner interface keeps
-//! this protocol layer independent of a particular executor; the included default
-//! uses one Rust standard-library thread per reply and does not claim Go scheduler
-//! equivalence. This module does not implement the rest of magicsock,
-//! `derphttp.Client` closed-state behavior, or the complete Tailscale endpoint
-//! runtime.
+//! `SendPong`, gate it on the caller-supplied connected/closed state without
+//! implicit reconnect, report errors through the caller's logging hook, and
+//! continue receiving without returning Ping to the caller. The narrow gate models
+//! only `derphttp.Client.SendPong`; it does not own or close the transport. A
+//! task-spawner interface keeps this protocol layer independent of a particular
+//! executor; the included default uses one Rust standard-library thread per reply
+//! and does not claim Go scheduler equivalence. This module does not implement the
+//! rest of magicsock, the full `derphttp.Client` lifecycle, or the complete Tailscale
+//! endpoint runtime.
 
+use std::error::Error;
+use std::fmt;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::derp::{DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError};
+use crate::derp::{
+    DerpClientRecvSession, DerpSendWriter, ReceivedMessage, RecvDeadlineReader, RecvSessionError, StreamWriteFrameError,
+};
 
 /// A detached task scheduled for a best-effort DERP Pong reply.
 pub type MagicsockTask = Box<dyn FnOnce() + Send + 'static>;
@@ -41,9 +47,123 @@ impl MagicsockTaskSpawner for StdThreadPongSpawner {
     }
 }
 
+/// The caller-owned connection state relevant to `derphttp.Client.SendPong`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerpPongClientState {
+    /// A current DERP client is available for a best-effort Pong write.
+    Connected,
+    /// No current DERP client is available; sending does not connect or reconnect.
+    Disconnected,
+    /// The higher-level client was permanently closed.
+    Closed,
+}
+
+/// A `SendPong` availability or frame-write failure.
+#[derive(Debug)]
+pub enum DerpPongSendError {
+    /// The higher-level DERP client has been closed.
+    ClientClosed,
+    /// No current DERP client is connected; `SendPong` will not reconnect it.
+    NotConnected,
+    /// The underlying DERP Pong frame write failed.
+    Write(StreamWriteFrameError),
+}
+
+impl fmt::Display for DerpPongSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientClosed => f.write_str("derphttp.Client closed"),
+            Self::NotConnected => f.write_str("not connected"),
+            Self::Write(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for DerpPongSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            Self::ClientClosed | Self::NotConnected => None,
+        }
+    }
+}
+
+/// A narrow gate for the pinned fork's `derphttp.Client.SendPong` state checks.
+///
+/// It never dials or reconnects. The owner supplies the initial state and must
+/// update it as its connection lifecycle changes. `mark_closed` only changes this
+/// gate; the owner remains responsible for canceling work and closing the actual
+/// transport, which this slice does not own.
+pub struct DerpPongSendGate<W> {
+    writer: Arc<DerpSendWriter<W>>,
+    state: Mutex<DerpPongClientState>,
+}
+
+impl<W> DerpPongSendGate<W> {
+    /// Wraps a shared DERP writer and the owner's current connection state.
+    pub fn new(writer: Arc<DerpSendWriter<W>>, state: DerpPongClientState) -> Self {
+        Self { writer, state: Mutex::new(state) }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, DerpPongClientState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns the current state used for best-effort Pong gating.
+    pub fn state(&self) -> DerpPongClientState {
+        *self.lock_state()
+    }
+
+    /// Marks a live connection available, unless the client was permanently closed.
+    pub fn mark_connected(&self) -> Result<(), DerpPongSendError> {
+        let mut state = self.lock_state();
+        if *state == DerpPongClientState::Closed {
+            return Err(DerpPongSendError::ClientClosed);
+        }
+        *state = DerpPongClientState::Connected;
+        Ok(())
+    }
+
+    /// Marks the current connection unavailable without implicitly reconnecting.
+    pub fn mark_disconnected(&self) {
+        let mut state = self.lock_state();
+        if *state != DerpPongClientState::Closed {
+            *state = DerpPongClientState::Disconnected;
+        }
+    }
+
+    /// Permanently closes this gate; repeated close attempts report the fork error.
+    pub fn mark_closed(&self) -> Result<(), DerpPongSendError> {
+        let mut state = self.lock_state();
+        if *state == DerpPongClientState::Closed {
+            return Err(DerpPongSendError::ClientClosed);
+        }
+        *state = DerpPongClientState::Closed;
+        Ok(())
+    }
+}
+
+impl<W: Write> DerpPongSendGate<W> {
+    /// Sends a Pong only when a current client is connected and not closed.
+    ///
+    /// The state lock is released before writing, matching the pinned fork's
+    /// `SendPong` critical-section boundary.
+    pub fn send_pong(&self, data: [u8; 8]) -> Result<(), DerpPongSendError> {
+        let state = self.lock_state();
+        match *state {
+            DerpPongClientState::Connected => {}
+            DerpPongClientState::Disconnected => return Err(DerpPongSendError::NotConnected),
+            DerpPongClientState::Closed => return Err(DerpPongSendError::ClientClosed),
+        }
+        drop(state);
+        self.writer.send_pong(data).map_err(DerpPongSendError::Write)
+    }
+}
+
 /// A magicsock-level DERP receive-loop slice for asynchronous Ping replies.
 pub struct MagicsockDerpRecvLoop<R, W, S = StdThreadPongSpawner> {
     receiver: DerpClientRecvSession<R, W>,
+    pong_sender: Arc<DerpPongSendGate<W>>,
     region_id: usize,
     spawner: S,
     log_pong_error: Arc<dyn Fn(String) + Send + Sync + 'static>,
@@ -54,9 +174,10 @@ impl<R, W> MagicsockDerpRecvLoop<R, W, StdThreadPongSpawner> {
     pub fn new(
         receiver: DerpClientRecvSession<R, W>,
         region_id: usize,
+        initial_pong_state: DerpPongClientState,
         log_pong_error: impl Fn(String) + Send + Sync + 'static,
     ) -> Self {
-        Self::with_spawner(receiver, region_id, StdThreadPongSpawner, log_pong_error)
+        Self::with_spawner(receiver, region_id, initial_pong_state, StdThreadPongSpawner, log_pong_error)
     }
 }
 
@@ -65,10 +186,17 @@ impl<R, W, S> MagicsockDerpRecvLoop<R, W, S> {
     pub fn with_spawner(
         receiver: DerpClientRecvSession<R, W>,
         region_id: usize,
+        initial_pong_state: DerpPongClientState,
         spawner: S,
         log_pong_error: impl Fn(String) + Send + Sync + 'static,
     ) -> Self {
-        Self { receiver, region_id, spawner, log_pong_error: Arc::new(log_pong_error) }
+        let pong_sender = Arc::new(DerpPongSendGate::new(Arc::clone(receiver.send_writer()), initial_pong_state));
+        Self { receiver, pong_sender, region_id, spawner, log_pong_error: Arc::new(log_pong_error) }
+    }
+
+    /// Returns the gate the owner updates when connection state changes.
+    pub fn pong_send_gate(&self) -> &DerpPongSendGate<W> {
+        &self.pong_sender
     }
 }
 
@@ -81,13 +209,20 @@ impl<R: RecvDeadlineReader, W: Write + Send + 'static, S: MagicsockTaskSpawner> 
     /// continues without a synchronous fallback.
     pub fn recv_next(&mut self) -> Result<ReceivedMessage, RecvSessionError> {
         loop {
-            match self.receiver.recv_next()? {
+            let message = match self.receiver.recv_next() {
+                Ok(message) => message,
+                Err(error) => {
+                    self.pong_sender.mark_disconnected();
+                    return Err(error);
+                }
+            };
+            match message {
                 ReceivedMessage::Ping(data) => {
-                    let writer: Arc<DerpSendWriter<W>> = Arc::clone(self.receiver.send_writer());
+                    let pong_sender = Arc::clone(&self.pong_sender);
                     let log_pong_error = Arc::clone(&self.log_pong_error);
                     let region_id = self.region_id;
                     let task: MagicsockTask = Box::new(move || {
-                        if let Err(error) = writer.send_pong(data) {
+                        if let Err(error) = pong_sender.send_pong(data) {
                             log_pong_error(format!("magicsock: derp-{region_id} SendPong error: {error}"));
                         }
                     });
@@ -116,7 +251,10 @@ mod tests {
     };
     use crate::{NodePrivate, NodePublic};
 
-    use super::{MagicsockDerpRecvLoop, MagicsockTask, MagicsockTaskSpawner, StdThreadPongSpawner};
+    use super::{
+        DerpPongClientState, DerpPongSendGate, MagicsockDerpRecvLoop, MagicsockTask, MagicsockTaskSpawner,
+        StdThreadPongSpawner,
+    };
 
     struct MemoryReader(Cursor<Vec<u8>>);
 
@@ -142,6 +280,7 @@ mod tests {
     fn new_loop_with_spawner<W: Write + Send + 'static, S: MagicsockTaskSpawner>(
         wire: Vec<u8>,
         writer: W,
+        initial_pong_state: DerpPongClientState,
         spawner: S,
         log_error: impl Fn(String) + Send + Sync + 'static,
     ) -> MagicsockDerpRecvLoop<MemoryReader, W, S> {
@@ -153,7 +292,16 @@ mod tests {
             NodePublic::from_raw32([0x42; 32]),
             Arc::new(DerpSendWriter::new(writer, None)),
         );
-        MagicsockDerpRecvLoop::with_spawner(receiver, 7, spawner, log_error)
+        MagicsockDerpRecvLoop::with_spawner(receiver, 7, initial_pong_state, spawner, log_error)
+    }
+
+    fn new_loop_with_initial_state<W: Write + Send + 'static>(
+        wire: Vec<u8>,
+        writer: W,
+        initial_pong_state: DerpPongClientState,
+        log_error: impl Fn(String) + Send + Sync + 'static,
+    ) -> MagicsockDerpRecvLoop<MemoryReader, W> {
+        new_loop_with_spawner(wire, writer, initial_pong_state, StdThreadPongSpawner, log_error)
     }
 
     fn new_loop<W: Write + Send + 'static>(
@@ -161,7 +309,7 @@ mod tests {
         writer: W,
         log_error: impl Fn(String) + Send + Sync + 'static,
     ) -> MagicsockDerpRecvLoop<MemoryReader, W> {
-        new_loop_with_spawner(wire, writer, StdThreadPongSpawner, log_error)
+        new_loop_with_initial_state(wire, writer, DerpPongClientState::Connected, log_error)
     }
 
     struct BlockingWriter {
@@ -195,6 +343,21 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("write failed"))
+        }
+    }
+
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -255,6 +418,7 @@ mod tests {
         let mut receive_loop = new_loop_with_spawner(
             incoming_ping_then_keepalive(*b"pingdata"),
             FailingWriter,
+            DerpPongClientState::Connected,
             FailingSpawner,
             move |error| {
                 error_tx.send(error).unwrap();
@@ -263,5 +427,59 @@ mod tests {
 
         assert_eq!(receive_loop.recv_next().unwrap(), ReceivedMessage::KeepAlive);
         assert_eq!(error_rx.try_recv().unwrap(), "magicsock: derp-7 SendPong scheduling error: spawn unavailable");
+    }
+
+    #[test]
+    fn disconnected_pong_gate_does_not_write_or_reconnect_and_receive_continues() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (error_tx, error_rx) = mpsc::channel();
+        let mut receive_loop = new_loop_with_initial_state(
+            incoming_ping_then_keepalive(*b"pingdata"),
+            RecordingWriter { bytes: Arc::clone(&bytes) },
+            DerpPongClientState::Disconnected,
+            move |error| error_tx.send(error).unwrap(),
+        );
+
+        assert_eq!(receive_loop.recv_next().unwrap(), ReceivedMessage::KeepAlive);
+        assert_eq!(receive_loop.pong_send_gate().state(), DerpPongClientState::Disconnected);
+        assert_eq!(
+            error_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "magicsock: derp-7 SendPong error: not connected"
+        );
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closed_pong_gate_is_terminal_and_does_not_write() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::new(DerpSendWriter::new(RecordingWriter { bytes: Arc::clone(&bytes) }, None));
+        let gate = DerpPongSendGate::new(writer, DerpPongClientState::Connected);
+
+        gate.mark_closed().unwrap();
+        assert_eq!(gate.send_pong(*b"pingdata").unwrap_err().to_string(), "derphttp.Client closed");
+        assert_eq!(gate.mark_connected().unwrap_err().to_string(), "derphttp.Client closed");
+        assert_eq!(gate.mark_closed().unwrap_err().to_string(), "derphttp.Client closed");
+        assert_eq!(gate.state(), DerpPongClientState::Closed);
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receive_error_marks_pong_gate_disconnected() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut receive_loop =
+            new_loop_with_initial_state(Vec::new(), RecordingWriter { bytes }, DerpPongClientState::Connected, |_| {});
+
+        assert_eq!(receive_loop.recv_next().unwrap_err().to_string(), "derp.Recv: EOF");
+        assert_eq!(receive_loop.pong_send_gate().state(), DerpPongClientState::Disconnected);
+    }
+
+    #[test]
+    fn connected_pong_gate_preserves_writer_error_source() {
+        let writer = Arc::new(DerpSendWriter::new(FailingWriter, None));
+        let gate = DerpPongSendGate::new(writer, DerpPongClientState::Connected);
+        let error = gate.send_pong(*b"pingdata").unwrap_err();
+
+        assert_eq!(error.to_string(), "write failed");
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
